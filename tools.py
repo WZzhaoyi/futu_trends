@@ -24,6 +24,7 @@ import yfinance as yf
 import configparser
 import os
 from telegram_bot import TelegramBotEngine
+from email_engine import EmailEngine
 
 
 def futu_code_to_yfinance_code(futu_code: str) -> str:
@@ -172,8 +173,17 @@ if __name__ == "__main__":
     host = config.get("CONFIG", "FUTU_HOST")
     port = config.get("CONFIG", "FUTU_PORT")
     group = config.get("CONFIG", "FUTU_GROUP")
-    
-    telebot = TelegramBotEngine()
+    telegram = config.get("CONFIG", "TELEGRAM_BOT_TOKEN")
+    emails = config.get("CONFIG", "EMAIL_SUBSCRIBTION").split(',')
+
     ls = codeInFutuGroup(group,host,int(port))
     trends = checkTrends(ls)
-    telebot.send_telegram_message('{} {}:\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group, '\n'.join(trends)),'https://www.futunn.com/')
+    
+    if telegram is not None:
+        telebot = TelegramBotEngine()
+        telebot.send_telegram_message('{} {}:\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group, '\n'.join(trends)),'https://www.futunn.com/')
+
+    if len(emails):
+        emailWorker = EmailEngine()
+        for address in emails:
+            emailWorker.send_email(address,group,'<p>{} {}:<br>{}</p>'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group, '<br>'.join(trends)))

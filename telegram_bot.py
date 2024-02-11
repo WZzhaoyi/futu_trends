@@ -51,8 +51,9 @@ class TelegramBotEngine:
         url = f'https://api.telegram.org/bot{self.TELEGRAM_BOT_TOKEN}/sendMessage'
         try:
             self.SESSION.post(url, headers=headers, data=data.encode('utf-8'), proxies=self.PROXIES)
+            self.plog(f'Telegram Sent: {self.TELEGRAM_CHAT_ID}')
         except:
-            print('    |-网络代理错误，请检查确认后关闭本程序重试')
+            self.plog(f'网络代理错误，请检查确认后关闭本程序重试')
             time.sleep(99999)
     
     def send_telegram_photo(self, img_url):
@@ -63,6 +64,7 @@ class TelegramBotEngine:
         data = dict(chat_id=f"{self.TELEGRAM_CHAT_ID}&", photo=img_url)
 
         self.SESSION.post(url, data=data, proxies=self.PROXIES)
+        self.plog(f'Telegram Sent: {self.TELEGRAM_CHAT_ID}')
 
     def send_telegram_photos(self, pic_urls):
         url = f'https://api.telegram.org/bot{self.TELEGRAM_BOT_TOKEN}/sendMediaGroup'
