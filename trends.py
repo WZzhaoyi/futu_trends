@@ -5,13 +5,15 @@ import os
 from telegram_bot import TelegramBotEngine
 from email_engine import EmailEngine
 
-def isReverse(high, low, close)->str|None:# 最近一根K线创新高/低 收盘价位于K线下半部/上半部 RSI超买/超卖
+def isReverse(high, low, close)->str|None:# 最近一根K线创新高/低 收盘价位于K线下半部/上半部
     last_index = close.size - 1
     last_close = close[last_index]
-    last_ave = (high[last_index]+low[last_index])/2
-    if last_close < close[last_index-1] and last_close < close[last_index-2] and last_ave < last_close and last_close < close[last_index-3]:
+    last_low = low[last_index]
+    last_high = high[last_index]
+    last_ave = (last_high+last_low)/2
+    if last_low < low[last_index-1] and last_low < low[last_index-2] and last_ave < last_close and last_low < low[last_index-3]:
          return '下跌可能反转'
-    if last_close > close[last_index-1] and last_close > close[last_index-2] and last_ave > last_close and last_close > close[last_index-3]:
+    if last_high > high[last_index-1] and last_high > high[last_index-2] and last_ave > last_close and last_high > high[last_index-3]:
          return '上涨可能反转'
     return None
 
