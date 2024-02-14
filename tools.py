@@ -21,10 +21,6 @@ import numpy as np
 import datetime
 import re
 import yfinance as yf
-import configparser
-import os
-from telegram_bot import TelegramBotEngine
-from email_engine import EmailEngine
 
 
 def futu_code_to_yfinance_code(futu_code: str) -> str:
@@ -66,7 +62,7 @@ def codeInFutuGroup(group_name:str, host='127.0.0.1', port=11111):
     else:
         print('error:', data)
 
-def kline(code:str, period:str="1y"):
+def kline(code:str, period:str="1y", host='127.0.0.1', port=11111):
     
     if 'US' in code:
         stock_code = futu_code_to_yfinance_code(code)
@@ -81,12 +77,15 @@ def kline(code:str, period:str="1y"):
         return df.High, df.Low, df.Close
     
     if 'HK' in code or 'SH' in code or 'SZ' in code:
+
+        if period == '1y':
+            period = 365
          
         today = datetime.datetime.now()
-        one_year = today - datetime.timedelta(days=365)
+        one_year = today - datetime.timedelta(days=period)
         start = one_year.strftime('%Y-%m-%d')
         end = today.strftime('%Y-%m-%d')
-        quote_ctx = ft.OpenQuoteContext(host='127.0.0.1', port=11111)
+        quote_ctx = ft.OpenQuoteContext(host=host, port=port)
         kline = quote_ctx.request_history_kline(code, end=end, start=start)
 
         high = kline[1]['high']
@@ -128,62 +127,10 @@ def RSI(CLOSE, N=24):
     DIF = CLOSE-REF(CLOSE,1) 
     return RD(SMA(MAX(DIF,0), N) / SMA(ABS(DIF), N) * 100)  
 
-def isReverse(high, low, close):# 最近一根K线创新高/低 收盘价位于K线下半部/上半部 RSI超买/超卖
-    last_index = close.size - 1
-    last_close = close[last_index]
-    last_rsi = RSI(close)[last_index]
-    last_ave = (high[last_index]+low[last_index])/2
-    if last_close < close[last_index-1] and last_close < close[last_index-2] and last_ave < last_close and last_rsi < 25.0:
-         return True
-    if last_close > close[last_index-1] and last_close > close[last_index-2] and last_ave > last_close and last_rsi > 75.0:
-         return True
-    return False
-
-def isContinue(high, low):# 取倒数5根AO柱 近3根趋势与之前相反
-    ao = AO(high, low)
-    [a1, a2, a3, a4, a5] = ao[-5:]
-    if a3 < 0 and a1 > a2 and  a2 < a3 and a3 < a4 and a4 < a5:
-         return True
-    if a3 > 0 and a1 < a2 and a2 > a3 and a3 > a4 and a4 > a5:
-         return True
-    return False
-
-def checkTrends(code_in_group):
-
-    trends = []
-    if code_in_group.size:
-         print('----{} check trends for {}----'.format(datetime.datetime.now(), group))
-         print(datetime.datetime.now())
-         name_list = code_in_group['name']
-         for idx, futu_code in enumerate(code_in_group['code'].values):
-            high, low, close = kline(futu_code)
-            rev = isReverse(high,low,close) # 趋势反转
-            co = isContinue(high,low) # 趋势延续
-            name = name_list[idx]
-            if rev:
-                trends.append('{} {} 趋势反转'.format(futu_code, name, rev))
-            if co:
-                trends.append('{} {} 趋势延续'.format(futu_code, name, co))
-    return trends
-
 if __name__ == "__main__":
-    BASE_DIR = os.path.split(os.path.realpath(__file__))[0]
-    config = configparser.ConfigParser()
-    config.read(os.path.join(BASE_DIR, 'config.ini'), encoding='utf-8')
-    host = config.get("CONFIG", "FUTU_HOST")
-    port = config.get("CONFIG", "FUTU_PORT")
-    group = config.get("CONFIG", "FUTU_GROUP")
-    telegram = config.get("CONFIG", "TELEGRAM_BOT_TOKEN")
-    emails = config.get("CONFIG", "EMAIL_SUBSCRIBTION").split(',')
-
-    ls = codeInFutuGroup(group,host,int(port))
-    trends = checkTrends(ls)
+    code = 'SH.000922'
     
-    if telegram is not None:
-        telebot = TelegramBotEngine()
-        telebot.send_telegram_message('{} {}:\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group, '\n'.join(trends)),'https://www.futunn.com/')
+    high, low, close = kline(code)
 
-    if len(emails):
-        emailWorker = EmailEngine()
-        for address in emails:
-            emailWorker.send_email(address,group,'<p>{} {}:<br>{}</p>'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group, '<br>'.join(trends)))
+    print(RSI(close))
+    print(AO(high,low))
