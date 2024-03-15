@@ -54,7 +54,6 @@ class TelegramBotEngine:
             self.plog(f'Telegram Sent: {self.TELEGRAM_CHAT_ID}')
         except:
             self.plog(f'网络代理错误，请检查确认后关闭本程序重试')
-            time.sleep(99999)
     
     def send_telegram_photo(self, img_url):
         """

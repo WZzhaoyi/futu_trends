@@ -5,12 +5,28 @@ import os
 from telegram_bot import TelegramBotEngine
 from email_engine import EmailEngine
 
+def insideMA(close, last_low, last_high): # 计算MA5,10,15中的最小值和最大值 对比是否区间重叠
+    last_index = close.size - 1
+    ma5 = MA(close,5)[last_index]
+    ma10 = MA(close,10)[last_index]
+    ma15 = MA(close,15)[last_index]
+
+    min_ma = min(ma5, ma10, ma15)
+    max_ma = max(ma5, ma10, ma15)
+
+    if max_ma < last_low or min_ma > last_high: # 如果第一个区间的结束小于第二个区间的开始，或者第一个区间的开始大于第二个区间的结束，说明不重叠
+        return False
+    else:
+        return True
+
 def isReverse(high, low, close)->str|None:# 最近一根K线创新高/低 收盘价位于K线下半部/上半部
     last_index = close.size - 1
     last_close = close[last_index]
     last_low = low[last_index]
     last_high = high[last_index]
     last_ave = (last_high+last_low)/2
+    if insideMA(close, last_low, last_high):
+        return None
     if last_low < low[last_index-1] and last_low < low[last_index-2] and last_ave < last_close and last_low < low[last_index-3]:
          return '下跌可能反转'
     if last_high > high[last_index-1] and last_high > high[last_index-2] and last_ave > last_close and last_high > high[last_index-3]:
