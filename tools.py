@@ -22,6 +22,8 @@ import datetime
 import re
 import yfinance as yf
 
+def get_kline_seconds(k_type:str): #根据K_1M,K_5M,K_15M,K_30M,K_60M时间含义输出秒数
+    return int(k_type.split('_')[1][:-1]) * 60
 
 def futu_code_to_yfinance_code(futu_code: str) -> str:
     """
@@ -50,6 +52,67 @@ def yfinance_code_to_futu_code(yfinance_code: str) -> str:
     else:
         return '.'.join(reversed((yfinance_code).split('.')))
 
+def map_history_params(period=None, interval=None, start=None, end=None):
+    # 映射 period
+    futu_period_map = {
+        '1d': 1, '5d': 5, '1mo': 30, '3mo': 90, '6mo': 180, '1y': 365,
+        '2y': 730, '5y': 1825, '10y': 3650, 'ytd': None, 'max': None
+    }
+    
+    # 映射 interval
+    futu_interval_map = {
+        '1m': 'K_1M', '2m': 'K_3M', '5m': 'K_5M', '15m': 'K_15M',
+        '30m': 'K_30M', '60m': 'K_60M', '90m': 'K_60M', '1h': 'K_60M',
+        '1d': 'K_DAY', '5d': 'K_WEEK', '1wk': 'K_WEEK', '1mo': 'K_MON',
+        '3mo': 'K_QUARTER'
+    }
+
+    futu_params = {}
+
+    if period:
+        futu_params['max_count'] = futu_period_map.get(period)
+    
+    if interval:
+        futu_params['ktype'] = futu_interval_map.get(interval, 'K_DAY')
+    
+    if start:
+       futu_params['start'] = start.strftime('%Y-%m-%d')
+    
+    if end:
+        futu_params['end'] = end.strftime('%Y-%m-%d')
+
+    return futu_params 
+
+def map_futu_to_yfinance_params(ktype=None, start=None, end=None, max_count=None):
+    # 映射 ktype 到 interval
+    yf_interval_map = {
+        'K_1M': '1m', 'K_3M': '2m', 'K_5M': '5m', 'K_15M': '15m',
+        'K_30M': '30m', 'K_60M': '60m', 'K_DAY': '1d', 'K_WEEK': '1wk',
+        'K_MON': '1mo', 'K_QUARTER': '3mo'
+    }
+
+    # 映射 max_count 到 period
+    yf_period_map = {
+        1: '1d', 5: '5d', 30: '1mo', 90: '3mo', 180: 'ytd', 365: 'ytd',
+        730: 'max', 1825: 'max', 3650: 'max'
+    }
+
+    yf_params = {}
+
+    if ktype:
+        yf_params['interval'] = yf_interval_map.get(ktype, '1d')
+
+    if start:
+        yf_params['start'] = datetime.datetime.strptime(start, '%Y-%m-%d')
+
+    if end:
+        yf_params['end'] = datetime.datetime.strptime(end, '%Y-%m-%d')
+    if max_count and not (start and end):
+        # 如果没有指定 start 和 end，则使用 period
+        yf_params['period'] = yf_period_map.get(max_count, '1y')
+
+    return yf_params
+
 def codeInFutuGroup(group_name:str, host='127.0.0.1', port=11111):
     quote_ctx = ft.OpenQuoteContext(host=host, port=port)
 
@@ -62,11 +125,18 @@ def codeInFutuGroup(group_name:str, host='127.0.0.1', port=11111):
     else:
         print('error:', data)
 
-def kline(code:str, period:str="1y", host='127.0.0.1', port=11111):
+def kline(code:str, max_count:int=365, ktype=ft.KLType.K_DAY, host='127.0.0.1', port=11111):
     
     if 'US' in code:
+        if ktype == ft.KLType.K_DAY:
+            max_count = 90
+
         stock_code = futu_code_to_yfinance_code(code)
-        history = yf.Ticker(stock_code).history(period=period)
+        param = map_futu_to_yfinance_params(ktype=ktype, max_count=max_count)
+        history = yf.Ticker(stock_code).history(**param)
+
+        if history.empty:
+            return pd.Series(), pd.Series(), pd.Series()
 
         df = history[['Open', 'Close', 'Volume', 'High', 'Low']]
         # Create a Date column
@@ -77,21 +147,18 @@ def kline(code:str, period:str="1y", host='127.0.0.1', port=11111):
         return df.High, df.Low, df.Close
     
     if 'HK' in code or 'SH' in code or 'SZ' in code:
-
-        if period == '1y':
-            period = 365
          
-        today = datetime.datetime.now()
-        one_year = today - datetime.timedelta(days=period)
-        start = one_year.strftime('%Y-%m-%d')
-        end = today.strftime('%Y-%m-%d')
         quote_ctx = ft.OpenQuoteContext(host=host, port=port)
-        kline = quote_ctx.request_history_kline(code, end=end, start=start)
+        kline = quote_ctx.request_history_kline(code, ktype=ktype, max_count=max_count)
+
+        quote_ctx.close()
+
+        if kline[0] != ft.RET_OK:
+            return pd.Series(), pd.Series(), pd.Series()
 
         high = kline[1]['high']
         low = kline[1]['low']
         close = kline[1]['close']
-        quote_ctx.close()
 
         return high, low, close
 

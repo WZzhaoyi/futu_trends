@@ -27,10 +27,10 @@ class TelegramBotEngine:
     def plog(self,content):
         print('{} {}'.format(time.strftime("%Y-%m-%d %H:%M:%S",time.localtime(time.time())), content))
 
-    def __init__(self):
-        self.BASE_DIR = os.path.split(os.path.realpath(__file__))[0]
-        config = configparser.ConfigParser()
-        config.read(os.path.join(self.BASE_DIR, 'config.ini'), encoding='utf-8')
+    def __init__(self, config:configparser.ConfigParser):
+        # self.BASE_DIR = os.path.split(os.path.realpath(__file__))[0]
+        # config = configparser.ConfigParser()
+        # config.read(os.path.join(self.BASE_DIR, 'config.ini'), encoding='utf-8')
         self.TELEGRAM_BOT_TOKEN = config.get("CONFIG", "TELEGRAM_BOT_TOKEN")
         self.TELEGRAM_CHAT_ID = config.get("CONFIG", "TELEGRAM_CHAT_ID")
         self.SESSION = HTMLSession()
@@ -80,5 +80,8 @@ class TelegramBotEngine:
                 self.send_telegram_photo(pic)
 
 if __name__ == "__main__":
-    telebot = TelegramBotEngine()
+    BASE_DIR = os.path.split(os.path.realpath(__file__))[0]
+    config = configparser.ConfigParser()
+    config.read(os.path.join(BASE_DIR, 'config.ini'), encoding='utf-8')
+    telebot = TelegramBotEngine(config)
     telebot.send_telegram_message('{} test'.format(time.strftime("%Y-%m-%d %H:%M:%S",time.localtime(time.time()))))
