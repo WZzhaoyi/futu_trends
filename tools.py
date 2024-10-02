@@ -23,7 +23,21 @@ import re
 import yfinance as yf
 
 def get_kline_seconds(k_type:str): #根据K_1M,K_5M,K_15M,K_30M,K_60M时间含义输出秒数
-    return int(k_type.split('_')[1][:-1]) * 60
+    if k_type == 'K_DAY':
+        return 24 * 60 * 60  # 一天的秒数
+    elif k_type == 'K_WEEK':
+        return 7 * 24 * 60 * 60  # 一周的秒数
+    elif k_type == 'K_MON':
+        return 30 * 24 * 60 * 60  # 约一个月的秒数（这是一个近似值）
+    elif k_type == 'K_QUARTER':
+        return 91 * 24 * 60 * 60  # 约一个季度的秒数（这是一个近似值）
+    elif k_type == 'K_YEAR':
+        return 365 * 24 * 60 * 60  # 约一年的秒数（这是一个近似值）
+    else:
+        try:
+            return int(k_type.split('_')[1][:-1]) * 60
+        except ValueError:
+            raise ValueError(f"Unsupported k_type: {k_type}")
 
 def futu_code_to_yfinance_code(futu_code: str) -> str:
     """

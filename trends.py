@@ -66,7 +66,8 @@ def checkTrends(code_in_group, config: configparser.ConfigParser):
     type = config.get("CONFIG", "FUTU_PUSH_TYPE")
     host = config.get("CONFIG", "FUTU_HOST")
     port = int(config.get("CONFIG", "FUTU_PORT"))
-    if code_in_group.size:
+    trend_type = config.get("CONFIG", "TREND_TYPE").split(',')
+    if code_in_group.size and len(trend_type):
          name_list = code_in_group['name']
          for idx, futu_code in enumerate(code_in_group['code'].values):
             high, low, close = kline(futu_code, ktype=type, host=host, port=port)
@@ -75,16 +76,20 @@ def checkTrends(code_in_group, config: configparser.ConfigParser):
                 print(f"Warning: No data for {futu_code}")
                 continue
 
-            rev = isReverse(high,low,close) # 趋势反转
-            co = isContinue(high,low) # 趋势延续
-            bo = isBreakout(high,low,close) # 突破/跌破EMA60日均线
+            for i in trend_type:
+                if i.lower() == 'breakout':
+                    bo = isBreakout(high,low,close) # 突破/跌破EMA60日均线
+                    if bo is not None:
+                        trends.append('{} {} {}'.format(futu_code, name, bo))
+                elif i.lower() == 'reverse':
+                    rev = isReverse(high,low,close) # 趋势反转
+                    if rev is not None:
+                        trends.append('{} {} {}'.format(futu_code, name, rev))
+                elif i.lower() == 'continue':
+                    co = isContinue(high,low) # 趋势延续
+                    if co is not None:
+                        trends.append('{} {} {}'.format(futu_code, name, co))
             name = name_list[idx]
-            if rev is not None:
-                trends.append('{} {} {}'.format(futu_code, name, rev))
-            if co is not None:
-                trends.append('{} {} {}'.format(futu_code, name, co))
-            if bo is not None:
-                trends.append('{} {} {}'.format(futu_code, name, bo))
     return trends
 
 if __name__ == "__main__":
