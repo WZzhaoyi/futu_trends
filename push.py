@@ -42,7 +42,8 @@ def create_callback(config: configparser.ConfigParser):
         
         if len(trends) >= 1:
             current_time = datetime.datetime.now()
-            message = '{}:\n{} {}'.format(current_time.strftime('%Y-%m-%d %H:%M:%S'), data['name'][0], '\n'.join(trends))
+            message = '{}:\n{}'.format(current_time.strftime('%Y-%m-%d %H:%M:%S'), '\n'.join(trends))
+            print(message)
             telebot.send_telegram_message(message, 'https://www.futunn.com/')
         return ft.RET_OK, data
     return send_message

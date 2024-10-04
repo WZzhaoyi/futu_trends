@@ -4,12 +4,21 @@ import configparser
 import os
 from telegram_engine import TelegramBotEngine
 from email_engine import EmailEngine
+from decimal import Decimal, ROUND_HALF_UP
+
+def round_decimal(value, places=2):
+    """
+    将浮点数转换为 Decimal 并四舍五入到指定小数位数
+    """
+    if isinstance(value, float):
+        value = str(value)  # 将 float 转换为字符串以避免精度损失
+    return Decimal(value).quantize(Decimal(f'0.{"0" * places}'), rounding=ROUND_HALF_UP)
 
 def insideMA(close, last_low, last_high): # 计算MA5,10,15中的最小值和最大值 对比是否区间重叠
     last_index = close.size - 1
-    ma5 = MA(close,5)[last_index]
-    ma10 = MA(close,10)[last_index]
-    ma15 = MA(close,15)[last_index]
+    ma5 = round_decimal(MA(close,5)[last_index])
+    ma10 = round_decimal(MA(close,10)[last_index])
+    ma15 = round_decimal(MA(close,15)[last_index])
 
     min_ma = min(ma5, ma10, ma15)
     max_ma = max(ma5, ma10, ma15)
@@ -41,22 +50,32 @@ def isReverse(high, low, close)->str|None:# 最近一根K线创新高/低 收盘
 
 def isContinue(high, low)->str|None:# 取倒数5根AO柱 近3根趋势与之前相反
     ao = AO(high, low)
-    [a1, a2, a3, a4, a5] = ao[-5:]
-    if a3 < 0 and a1 > a2 and  a2 < a3 and a3 < a4 and a4 < a5:
-         return '上涨可能延续'
-    if a3 > 0 and a1 < a2 and a2 > a3 and a3 > a4 and a4 > a5:
-         return '下跌可能延续'
+    if len(ao) < 5:
+        return None
+    
+    # 使用 round_decimal 处理 AO 中的每个元素
+    last_five = [round_decimal(x) for x in ao[-5:]]
+    
+    [a1, a2, a3, a4, a5] = last_five  # 解包最后五个元素以便于比较
+
+    if a3 < a4 < a5 and a1 > a2 < a3 and a3 < 0:
+        return '上涨可能延续'
+    if a3 > a4 > a5 and a1 < a2 > a3 and a3 > 0:
+        return '下跌可能延续'
+    
     return None
 
-def isBreakout(high, low, close)->str|None:# 最近一根K线突破/跌破EMA60日均线
+def isBreakout(close)->str|None:# 最近一根K线突破/跌破MA60日均线
     ma60 = MA(close, 60)
     last_index = close.size - 1
-    last_close = close[last_index]
-    prev_close = close[last_index-1]
-    last_ma60 = ma60[last_index]
-    if last_close > ma60[last_index] and prev_close <= last_ma60:
+    prev_index = last_index - 1
+    last_close = round_decimal(close[last_index])
+    prev_close = round_decimal(close[prev_index])
+    prev_ma60 = round_decimal(ma60[prev_index])
+    last_ma60 = round_decimal(ma60[last_index])
+    if last_close >= last_ma60 and prev_close <= prev_ma60:
         return '突破60日均线'
-    if last_close < ma60[last_index] and prev_close >= last_ma60:
+    if last_close <= last_ma60 and prev_close >= prev_ma60:
         return '跌破60日均线'
     return None
 
@@ -71,6 +90,7 @@ def checkTrends(code_in_group, config: configparser.ConfigParser):
          name_list = code_in_group['name']
          for idx, futu_code in enumerate(code_in_group['code'].values):
             high, low, close = kline(futu_code, ktype=type, host=host, port=port)
+            name = name_list[idx]
 
             if len(high) == 0 or len(low) == 0 or len(close) == 0:
                 print(f"Warning: No data for {futu_code}")
@@ -78,7 +98,7 @@ def checkTrends(code_in_group, config: configparser.ConfigParser):
 
             for i in trend_type:
                 if i.lower() == 'breakout':
-                    bo = isBreakout(high,low,close) # 突破/跌破EMA60日均线
+                    bo = isBreakout(close) # 突破/跌破EMA60日均线
                     if bo is not None:
                         trends.append('{} {} {}'.format(futu_code, name, bo))
                 elif i.lower() == 'reverse':
@@ -89,7 +109,6 @@ def checkTrends(code_in_group, config: configparser.ConfigParser):
                     co = isContinue(high,low) # 趋势延续
                     if co is not None:
                         trends.append('{} {} {}'.format(futu_code, name, co))
-            name = name_list[idx]
     return trends
 
 if __name__ == "__main__":

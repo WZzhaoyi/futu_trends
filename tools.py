@@ -18,7 +18,7 @@
 import futu as ft
 import pandas as pd
 import numpy as np
-import datetime
+from datetime import datetime, timedelta
 import re
 import yfinance as yf
 
@@ -97,7 +97,7 @@ def map_history_params(period=None, interval=None, start=None, end=None):
 
     return futu_params 
 
-def map_futu_to_yfinance_params(ktype=None, start=None, end=None, max_count=None):
+def map_futu_to_yfinance_params(ktype=None, start:datetime=None, end:datetime=None, max_count=None):
     # 映射 ktype 到 interval
     yf_interval_map = {
         'K_1M': '1m', 'K_3M': '2m', 'K_5M': '5m', 'K_15M': '15m',
@@ -117,10 +117,10 @@ def map_futu_to_yfinance_params(ktype=None, start=None, end=None, max_count=None
         yf_params['interval'] = yf_interval_map.get(ktype, '1d')
 
     if start:
-        yf_params['start'] = datetime.datetime.strptime(start, '%Y-%m-%d')
+        yf_params['start'] = datetime.strptime(start, '%Y-%m-%d')
 
     if end:
-        yf_params['end'] = datetime.datetime.strptime(end, '%Y-%m-%d')
+        yf_params['end'] = datetime.strptime(end, '%Y-%m-%d')
     if max_count and not (start and end):
         # 如果没有指定 start 和 end，则使用 period
         yf_params['period'] = yf_period_map.get(max_count, '1y')
@@ -144,9 +144,15 @@ def kline(code:str, max_count:int=365, ktype=ft.KLType.K_DAY, host='127.0.0.1', 
     if 'US' in code:
         if ktype == ft.KLType.K_DAY:
             max_count = 90
+        
+        kline_seconds = get_kline_seconds(ktype)
+
+        end = datetime.now()
+        delta_days = kline_seconds*max_count // (7*60*60)
+        start = end - timedelta(days=delta_days)
 
         stock_code = futu_code_to_yfinance_code(code)
-        param = map_futu_to_yfinance_params(ktype=ktype, max_count=max_count)
+        param = map_futu_to_yfinance_params(ktype=ktype, start=start_str, end=end_str)
         history = yf.Ticker(stock_code).history(**param)
 
         if history.empty:
@@ -161,9 +167,17 @@ def kline(code:str, max_count:int=365, ktype=ft.KLType.K_DAY, host='127.0.0.1', 
         return df.High, df.Low, df.Close
     
     if 'HK' in code or 'SH' in code or 'SZ' in code:
+
+        kline_seconds = get_kline_seconds(ktype)
+
+        end = datetime.now()
+        delta_days = kline_seconds*max_count // (5*60*60)
+        start = end - timedelta(days=delta_days)
+        start_str = start.strftime('%Y-%m-%d')
+        end_str = end.strftime('%Y-%m-%d')
          
         quote_ctx = ft.OpenQuoteContext(host=host, port=port)
-        kline = quote_ctx.request_history_kline(code, ktype=ktype, max_count=max_count)
+        kline = quote_ctx.request_history_kline(code, ktype=ktype, max_count=max_count, start=start_str, end=end_str)
 
         quote_ctx.close()
 
