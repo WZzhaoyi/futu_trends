@@ -4,6 +4,7 @@ import os
 import time
 import futu as ft
 import pandas as pd
+from config import get_config
 from telegram_engine import TelegramBotEngine
 
 from tools import codeInFutuGroup, get_kline_seconds
@@ -50,9 +51,7 @@ def create_callback(config: configparser.ConfigParser):
 
 
 if __name__ == '__main__':
-    BASE_DIR = os.path.split(os.path.realpath(__file__))[0]
-    config = configparser.ConfigParser()
-    config.read(os.path.join(BASE_DIR, 'config.ini'), encoding='utf-8')
+    config = get_config()
     host = config.get("CONFIG", "FUTU_HOST")
     port = int(config.get("CONFIG", "FUTU_PORT"))
     group = config.get("CONFIG", "FUTU_GROUP")

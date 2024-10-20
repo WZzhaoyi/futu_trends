@@ -16,7 +16,7 @@
 #  Copyright (c)  Joey - All Rights Reserved
 
 from futu import *
-from telegram_bot import TelegramBotEngine
+from telegram_engine import TelegramBotEngine
 
 def divide():
     upper_limit = 1.1

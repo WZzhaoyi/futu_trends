@@ -1,3 +1,4 @@
+from config import get_config
 from tools import *
 import datetime
 import configparser
@@ -73,10 +74,10 @@ def isBreakout(close)->str|None:# 最近一根K线突破/跌破MA60日均线
     prev_close = round_decimal(close[prev_index])
     prev_ma60 = round_decimal(ma60[prev_index])
     last_ma60 = round_decimal(ma60[last_index])
-    if last_close >= last_ma60 and prev_close <= prev_ma60:
-        return '突破60日均线'
-    if last_close <= last_ma60 and prev_close >= prev_ma60:
-        return '跌破60日均线'
+    if last_close > last_ma60 and prev_close <= prev_ma60:
+        return '突破60均线'
+    if last_close < last_ma60 and prev_close >= prev_ma60:
+        return '跌破60均线'
     return None
 
 def checkTrends(code_in_group, config: configparser.ConfigParser):
@@ -112,9 +113,7 @@ def checkTrends(code_in_group, config: configparser.ConfigParser):
     return trends
 
 if __name__ == "__main__":
-    BASE_DIR = os.path.split(os.path.realpath(__file__))[0]
-    config = configparser.ConfigParser()
-    config.read(os.path.join(BASE_DIR, 'config.ini'), encoding='utf-8')
+    config = get_config()
     host = config.get("CONFIG", "FUTU_HOST")
     port = int(config.get("CONFIG", "FUTU_PORT"))
     group = config.get("CONFIG", "FUTU_GROUP")
