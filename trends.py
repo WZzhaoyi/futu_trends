@@ -2,7 +2,7 @@ from config import get_config
 from tools import *
 import datetime
 import configparser
-import os
+import numpy as np
 from telegram_engine import TelegramBotEngine
 from email_engine import EmailEngine
 from decimal import Decimal, ROUND_HALF_UP
@@ -69,17 +69,18 @@ def isContinue(high, low)->str|None:# 取倒数5根AO柱 近3根趋势与之前�
 def isBreakout(high, low, close, N:int=55)->str|None:# 最近一根K线突破/跌破均线
     high_ema = EMA(high, N)
     low_ema = EMA(low, N)
-    last_index = len(close)
+    last_index = len(close) - 1
     prev_index = last_index - 1
-    last_close = round_decimal(close[last_index])
-    prev_close = round_decimal(close[prev_index])
+    last_close = round_decimal(close.iloc[last_index])
+    prev_close = round_decimal(close.iloc[prev_index])
     last_high_ema = round_decimal(high_ema[last_index])
     last_low_ema = round_decimal(low_ema[last_index])
-    if last_close < last_high_ema and last_close > last_low_ema:
+    points = np.array([last_close,high.iloc[last_index],low.iloc[last_index]])
+    if ((last_low_ema<=points) & (points<=last_high_ema)).any():
         return '触及均线'
-    if last_close > last_high_ema and prev_close <= round_decimal(high_ema[prev_close]):
+    if last_close > last_high_ema and prev_close <= round_decimal(high_ema[prev_index]):
         return '突破均线'
-    if last_close < last_low_ema and prev_close >= round_decimal(low_ema[prev_close]):
+    if last_close < last_low_ema and prev_close >= round_decimal(low_ema[prev_index]):
         return '跌破均线'
     return None
 
@@ -128,7 +129,7 @@ def checkTrends(code_in_group, config: configparser.ConfigParser):
 
             for i in trend_type:
                 if i.lower() == 'breakout':
-                    bo = isBreakout(close) # 突破/跌破EMA60日均线
+                    bo = isBreakout(high,low,close) # 突破/跌破EMA均线
                     if bo is not None:
                         trends.append('{} {} {}'.format(futu_code, name, bo))
                 elif i.lower() == 'reverse':
