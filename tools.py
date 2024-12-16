@@ -18,6 +18,8 @@
 import futu as ft
 import pandas as pd
 import numpy as np
+from typing import Union
+from scipy import stats
 from datetime import datetime, timedelta
 import re
 import yfinance as yf
@@ -48,8 +50,10 @@ def futu_code_to_yfinance_code(futu_code: str) -> str:
     if futu_code.startswith("HK"):
         assert re.match(r'^[A-Z]{2}.\d{5}$', futu_code)
         return '.'.join(reversed(futu_code.split('.')))[1:]
-    elif futu_code.startswith('US'):
+    elif futu_code.startswith('US.'):
         return futu_code.replace('US.', '')
+    elif futu_code.startswith('SH.'):
+        return '.'.join(reversed(futu_code.split('.'))).replace('SH', 'SS')
     else:
         assert re.match(r'^[A-Z]{2}.\d{6}$', futu_code)
         return '.'.join(reversed(futu_code.split('.')))
@@ -60,9 +64,10 @@ def yfinance_code_to_futu_code(yfinance_code: str) -> str:
         E.g., 9988.HK -> HK.09988
     :param yfinance_code: Stock code used in Yahoo Finance (e.g., 9988.HK)
     """
-    assert re.match(r'^\d{4}.[A-Z]{2}$', yfinance_code)
     if 'HK' in yfinance_code:
         return '.'.join(reversed(('0' + yfinance_code).split('.')))
+    if 'SS' in yfinance_code:
+        return '.'.join(reversed((yfinance_code).split('.'))).replace('SS','SH')
     else:
         return '.'.join(reversed((yfinance_code).split('.')))
 
@@ -101,7 +106,7 @@ def map_futu_to_yfinance_params(ktype=None, start:datetime=None, end:datetime=No
     # 映射 ktype 到 interval
     yf_interval_map = {
         'K_1M': '1m', 'K_3M': '2m', 'K_5M': '5m', 'K_15M': '15m',
-        'K_30M': '30m', 'K_60M': '60m', 'K_DAY': '1d', 'K_WEEK': '1wk',
+        'K_30M': '30m', 'K_60M': '60m', 'K_240M': '60m', 'K_240M': '60m', 'K_DAY': '1d', 'K_WEEK': '1wk',
         'K_MON': '1mo', 'K_QUARTER': '3mo'
     }
 
@@ -117,11 +122,11 @@ def map_futu_to_yfinance_params(ktype=None, start:datetime=None, end:datetime=No
         yf_params['interval'] = yf_interval_map.get(ktype, '1d')
 
     if start:
-        yf_params['start'] = datetime.strptime(start, '%Y-%m-%d')
+        yf_params['start'] = start
 
     if end:
-        yf_params['end'] = datetime.strptime(end, '%Y-%m-%d')
-    if max_count and not (start and end):
+        yf_params['end'] = end
+    if max_count:
         # 如果没有指定 start 和 end，则使用 period
         yf_params['period'] = yf_period_map.get(max_count, '1y')
 
@@ -139,11 +144,45 @@ def codeInFutuGroup(group_name:str, host='127.0.0.1', port=11111):
     else:
         print('error:', data)
 
-def kline(code:str, max_count:int=365, ktype=ft.KLType.K_DAY, host='127.0.0.1', port=11111):
-    
+def convert_to_4h(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    将 60m 数据转换为 4h 数据
+
+    Args:
+        df (pd.DataFrame): 包含 60m 数据的 DataFrame，必须包含 'open', 'high', 'low', 'close', 'volume' 列
+
+    Returns:
+        pd.DataFrame: 转换后的 4h 数据
+    """
+    # 确保索引是时间类型
+    df.index = pd.to_datetime(df.index)
+
+    # 确保数据长度是4的倍数
+    if len(df) % 4 != 0:
+        df = df.iloc[(len(df) % 4)-len(df):]  # 截断到4的倍数
+
+    # 初始化一个空的 DataFrame 用于存储 4h 数据
+    df_4h = pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
+
+    # 使用 for 循环遍历每一行
+    for i in range(0, len(df), 4):
+        index = df.index[i+3]
+        df_4h.loc[index, 'open'] = df.iloc[i]['open']  # 4h 开盘价
+        df_4h.loc[index, 'high'] = df.iloc[i:i+4]['high'].max()  # 4h 最高价
+        df_4h.loc[index, 'low'] = df.iloc[i:i+4]['low'].min()  # 4h 最低价
+        df_4h.loc[index, 'close'] = df.iloc[i+3]['close']  # 4h 收盘价
+        df_4h.loc[index, 'volume'] = df.iloc[i:i+4]['volume'].sum()  # 4h 成交量
+
+    # 复制索引为新的一列 time_key
+    df_4h['time_key'] = df_4h.index
+
+    return df_4h
+
+def kline(code:str, max_count:int=365, ktype=ft.KLType.K_DAY, host='127.0.0.1', port=11111, autype=ft.AuType.QFQ):
+    if ktype == ft.KLType.K_DAY:
+        max_count = 90
+
     if 'US' in code:
-        if ktype == ft.KLType.K_DAY:
-            max_count = 90
         
         kline_seconds = get_kline_seconds(ktype)
 
@@ -152,23 +191,40 @@ def kline(code:str, max_count:int=365, ktype=ft.KLType.K_DAY, host='127.0.0.1', 
         start = end - timedelta(days=delta_days)
 
         stock_code = futu_code_to_yfinance_code(code)
-        param = map_futu_to_yfinance_params(ktype=ktype, start=start_str, end=end_str)
+        param = map_futu_to_yfinance_params(ktype=ktype, start=start, end=end)
         history = yf.Ticker(stock_code).history(**param)
 
         if history.empty:
-            return pd.Series(), pd.Series(), pd.Series()
+            return None
 
-        df = history[['Open', 'Close', 'Volume', 'High', 'Low']]
+        df = history[['Open', 'Close', 'Volume', 'High', 'Low']].copy()
+
         # Create a Date column
-        # df['Date'] = df.index
+        df['time_key'] = df.index
         # Drop the Date as index
-        df.reset_index(drop=True, inplace=True)
+        # df.reset_index(drop=True, inplace=True)
 
-        return df.High, df.Low, df.Close
+        df.rename(columns={
+            "High": "high",
+            "Low": "low",
+            "Close": "close",
+            "Open": "open",
+            "Volume": "volume"
+        }, inplace=True)
+
+        if ktype == 'K_240M':
+            df = convert_to_4h(df).dropna()
+
+        return df
     
     if 'HK' in code or 'SH' in code or 'SZ' in code:
 
-        kline_seconds = get_kline_seconds(ktype)
+        if ktype == 'K_240M':
+            _ktype = ft.KLType.K_60M
+        else:
+            _ktype = ktype
+
+        kline_seconds = get_kline_seconds(_ktype)
 
         end = datetime.now()
         delta_days = kline_seconds*max_count // (5*60*60)
@@ -177,18 +233,18 @@ def kline(code:str, max_count:int=365, ktype=ft.KLType.K_DAY, host='127.0.0.1', 
         end_str = end.strftime('%Y-%m-%d')
          
         quote_ctx = ft.OpenQuoteContext(host=host, port=port)
-        kline = quote_ctx.request_history_kline(code, ktype=ktype, max_count=max_count, start=start_str, end=end_str)
+        kline = quote_ctx.request_history_kline(code, ktype=_ktype, start=start_str, end=end_str,autype=autype)
 
         quote_ctx.close()
 
         if kline[0] != ft.RET_OK:
-            return pd.Series(), pd.Series(), pd.Series()
+            print(kline[1])
+            return None
+        
+        if ktype == 'K_240M':
+            return convert_to_4h(kline[1])
 
-        high = kline[1]['high']
-        low = kline[1]['low']
-        close = kline[1]['close']
-
-        return high, low, close
+        return kline[1]
 
 def RD(N,D=3):   
 	return np.round(N,D)
@@ -222,10 +278,68 @@ def RSI(CLOSE, N=24):
     DIF = CLOSE-REF(CLOSE,1) 
     return RD(SMA(MAX(DIF,0), N) / SMA(ABS(DIF), N) * 100)  
 
+def KDJ(close: pd.Series, high: pd.Series, low: pd.Series, N=15, M1=5, M2=5) -> pd.DataFrame:
+    """
+    计算 KDJ 指标
+
+    Args:
+        close (pd.Series): 收盘价序列
+        high (pd.Series): 最高价序列
+        low (pd.Series): 最低价序列
+        N (int): 计算 K 和 D 的周期
+        M1 (int): K 的平滑周期
+        M2 (int): D 的平滑周期
+
+    Returns:
+        pd.DataFrame: 包含 K, D, J 的 DataFrame
+    """
+    low_min = low.rolling(window=N).min()
+    high_max = high.rolling(window=N).max()
+    
+    RSV = 100 * (close - low_min) / (high_max - low_min)
+    
+    K = SMA(RSV,M1)
+    D = SMA(K,M2)
+    J = 3 * K - 2 * D
+    
+    return pd.DataFrame({'K': K, 'D': D, 'J': J})
+
+def siegelslopes_ma(price_ser: Union[pd.Series, np.ndarray],method:str="hierarchical") -> float:
+    """Repeated Median (Siegel 1982)
+
+    Args:
+        price_ser (Union[pd.Series, np.ndarray]): index-date values-price or values-price
+
+    Returns:
+        float: float
+    """
+    n: int = len(price_ser)
+    res = stats.siegelslopes(price_ser, np.arange(n), method=method)
+    return res.intercept + res.slope * (n-1)
+
+def calc_icu_ma(price:pd.Series,N:int)->pd.Series:
+    """计算ICU均线
+
+    Args:
+        price (pd.Series): index-date values-price
+        N (int): 计算窗口
+    Returns:
+        pd.Series: index-date values-icu_ma
+    """
+    if len(price) <= N:
+        raise ValueError("price length must be greater than N")
+    
+    return price.rolling(N).apply(siegelslopes_ma,raw=True)
+
 if __name__ == "__main__":
     code = 'SH.000922'
     
-    high, low, close = kline(code)
+    df = kline(code)
+
+    high = df['high']  # 从 DataFrame 中提取 high 列
+    low = df['low']    # 从 DataFrame 中提取 low 列
+    close = df['close']  # 从 DataFrame 中提取 close 列
 
     print(RSI(close))
     print(AO(high,low))
+    print(KDJ(close,high,low,))

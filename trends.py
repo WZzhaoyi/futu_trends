@@ -66,19 +66,45 @@ def isContinue(high, low)->str|None:# 取倒数5根AO柱 近3根趋势与之前�
     
     return None
 
-def isBreakout(close)->str|None:# 最近一根K线突破/跌破MA60日均线
-    ma60 = MA(close, 60)
-    last_index = close.size - 1
+def isBreakout(high, low, close, N:int=55)->str|None:# 最近一根K线突破/跌破均线
+    high_ema = EMA(high, N)
+    low_ema = EMA(low, N)
+    last_index = len(close)
     prev_index = last_index - 1
     last_close = round_decimal(close[last_index])
     prev_close = round_decimal(close[prev_index])
-    prev_ma60 = round_decimal(ma60[prev_index])
-    last_ma60 = round_decimal(ma60[last_index])
-    if last_close > last_ma60 and prev_close <= prev_ma60:
-        return '突破60均线'
-    if last_close < last_ma60 and prev_close >= prev_ma60:
-        return '跌破60均线'
+    last_high_ema = round_decimal(high_ema[last_index])
+    last_low_ema = round_decimal(low_ema[last_index])
+    if last_close < last_high_ema and last_close > last_low_ema:
+        return '触及均线'
+    if last_close > last_high_ema and prev_close <= round_decimal(high_ema[prev_close]):
+        return '突破均线'
+    if last_close < last_low_ema and prev_close >= round_decimal(low_ema[prev_close]):
+        return '跌破均线'
     return None
+
+def isTopDown(high, low, close) -> str|None:# 判别 KDJ 指标的最新顶部和底部信号
+    kdj_df = KDJ(close, high, low)
+
+    assert len(kdj_df) >= 6
+
+    j_values = kdj_df['J'].iloc[-6:]  # 获取最后6个周期的 J 值
+    last_j = round_decimal(j_values.iloc[-1],1)  # 获取最后一个 J 值
+
+    # 顶部信号
+    if all(j > 90 for j in j_values[-5:]) and j_values.iloc[-6] <= 90:
+        return f'顶部{last_j}'
+    # 底部信号
+    elif all(j < 10 for j in j_values[-2:]) and j_values.iloc[-4] >= 10:
+        return f'底部{last_j}'
+    # 顶消失信号
+    elif last_j <= 90 and all(j > 90 for j in j_values[-6:-2]):
+        return f'顶消失{last_j}'
+    # 底消失信号
+    elif last_j >= 10 and all(j < 10 for j in j_values[-4:-2]):
+        return f'底消失{last_j}'
+    
+    return last_j
 
 def checkTrends(code_in_group, config: configparser.ConfigParser):
      
@@ -90,7 +116,10 @@ def checkTrends(code_in_group, config: configparser.ConfigParser):
     if code_in_group.size and len(trend_type):
          name_list = code_in_group['name']
          for idx, futu_code in enumerate(code_in_group['code'].values):
-            high, low, close = kline(futu_code, ktype=type, host=host, port=port)
+            df = kline(futu_code, ktype=type, host=host, port=port)  # 获取 DataFrame
+            high = df['high']  # 从 DataFrame 中提取 high 列
+            low = df['low']    # 从 DataFrame 中提取 low 列
+            close = df['close']  # 从 DataFrame 中提取 close 列
             name = name_list[idx]
 
             if len(high) == 0 or len(low) == 0 or len(close) == 0:
@@ -110,6 +139,10 @@ def checkTrends(code_in_group, config: configparser.ConfigParser):
                     co = isContinue(high,low) # 趋势延续
                     if co is not None:
                         trends.append('{} {} {}'.format(futu_code, name, co))
+                elif i.lower() == 'topdown':
+                    td = isTopDown(high,low,close) # 顶底结构
+                    if td is not None:
+                        trends.append('{} {} {}'.format(futu_code, name, td))
     return trends
 
 if __name__ == "__main__":
@@ -123,11 +156,11 @@ if __name__ == "__main__":
     ls = codeInFutuGroup(group,host,port)
     trends = checkTrends(ls,config)
     
-    if telegram is not None:
+    if telegram:
         telebot = TelegramBotEngine(config)
         telebot.send_telegram_message('{} {}:\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group, '\n'.join(trends)),'https://www.futunn.com/')
 
-    if emails is not None and len(emails):
-        emailWorker = EmailEngine()
+    if emails[0]:
+        emailWorker = EmailEngine(config)
         for address in emails:
             emailWorker.send_email(address,group,'<p>{} {}:<br>{}</p>'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group, '<br>'.join(trends)))

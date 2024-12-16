@@ -32,13 +32,10 @@ class EmailEngine:
     def plog(self,content):
         print('{} {}'.format(time.strftime("%Y-%m-%d %H:%M:%S",time.localtime(time.time())), content))
 
-    def __init__(self):
+    def __init__(self, config:configparser.ConfigParser):
         """
             Email Engine Constructor
         """
-        self.BASE_DIR = os.path.split(os.path.realpath(__file__))[0]
-        config = configparser.ConfigParser()
-        config.read(os.path.join(self.BASE_DIR, 'config.ini'), encoding='utf-8')
         self.EMAIL_PORT = config.get("CONFIG", "EMAIL_PORT")
         self.EMAIL_SERVER = config.get("CONFIG", "EMAIL_SERVER")
         self.EMAIL_SENDER = config.get("CONFIG", "EMAIL_SENDER")
