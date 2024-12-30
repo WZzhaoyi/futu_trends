@@ -106,7 +106,7 @@ def map_futu_to_yfinance_params(ktype=None, start:datetime=None, end:datetime=No
     # 映射 ktype 到 interval
     yf_interval_map = {
         'K_1M': '1m', 'K_3M': '2m', 'K_5M': '5m', 'K_15M': '15m',
-        'K_30M': '30m', 'K_60M': '60m', 'K_240M': '60m', 'K_240M': '60m', 'K_DAY': '1d', 'K_WEEK': '1wk',
+        'K_30M': '30m', 'K_60M': '60m', 'K_120M': '60m', 'K_240M': '60m', 'K_DAY': '1d', 'K_WEEK': '1wk',
         'K_MON': '1mo', 'K_QUARTER': '3mo'
     }
 
@@ -144,39 +144,39 @@ def codeInFutuGroup(group_name:str, host='127.0.0.1', port=11111):
     else:
         print('error:', data)
 
-def convert_to_4h(df: pd.DataFrame) -> pd.DataFrame:
+def convert_to_4h(df: pd.DataFrame,hour:2|4=4) -> pd.DataFrame:
     """
-    将 60m 数据转换为 4h 数据
+    将 60m 数据转换为 2h/4h 数据
 
     Args:
         df (pd.DataFrame): 包含 60m 数据的 DataFrame，必须包含 'open', 'high', 'low', 'close', 'volume' 列
 
     Returns:
-        pd.DataFrame: 转换后的 4h 数据
+        pd.DataFrame: 转换后的 2h/4h 数据
     """
     # 确保索引是时间类型
     df.index = pd.to_datetime(df.index)
 
-    # 确保数据长度是4的倍数
-    if len(df) % 4 != 0:
-        df = df.iloc[(len(df) % 4)-len(df):]  # 截断到4的倍数
+    # 确保数据长度是hour的倍数
+    if len(df) % hour != 0:
+        df = df.iloc[(len(df) % hour)-len(df):]  # 截断到4的倍数
 
-    # 初始化一个空的 DataFrame 用于存储 4h 数据
-    df_4h = pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
+    # 初始化一个空的 DataFrame 用于存储数据
+    _df = pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
 
     # 使用 for 循环遍历每一行
-    for i in range(0, len(df), 4):
-        index = df.index[i+3]
-        df_4h.loc[index, 'open'] = df.iloc[i]['open']  # 4h 开盘价
-        df_4h.loc[index, 'high'] = df.iloc[i:i+4]['high'].max()  # 4h 最高价
-        df_4h.loc[index, 'low'] = df.iloc[i:i+4]['low'].min()  # 4h 最低价
-        df_4h.loc[index, 'close'] = df.iloc[i+3]['close']  # 4h 收盘价
-        df_4h.loc[index, 'volume'] = df.iloc[i:i+4]['volume'].sum()  # 4h 成交量
+    for i in range(0, len(df), hour):
+        index = df.index[i+hour-1]
+        _df.loc[index, 'open'] = df.iloc[i]['open']  # 开盘价
+        _df.loc[index, 'high'] = df.iloc[i:i+hour]['high'].max()  # 最高价
+        _df.loc[index, 'low'] = df.iloc[i:i+hour]['low'].min()  # 最低价
+        _df.loc[index, 'close'] = df.iloc[i+hour-1]['close']  # 收盘价
+        _df.loc[index, 'volume'] = df.iloc[i:i+hour]['volume'].sum()  # 成交量
 
     # 复制索引为新的一列 time_key
-    df_4h['time_key'] = df_4h.index
+    _df['time_key'] = _df.index
 
-    return df_4h
+    return _df
 
 def kline(code:str, max_count:int=365, ktype=ft.KLType.K_DAY, host='127.0.0.1', port=11111, autype=ft.AuType.QFQ):
     if ktype == ft.KLType.K_DAY:
@@ -214,12 +214,14 @@ def kline(code:str, max_count:int=365, ktype=ft.KLType.K_DAY, host='127.0.0.1', 
 
         if ktype == 'K_240M':
             df = convert_to_4h(df).dropna()
+        elif ktype == 'K_120M':
+            df = convert_to_4h(df,2).dropna()
 
         return df
     
     if 'HK' in code or 'SH' in code or 'SZ' in code:
 
-        if ktype == 'K_240M':
+        if ktype == 'K_240M' or ktype == 'K_120M':
             _ktype = ft.KLType.K_60M
         else:
             _ktype = ktype
@@ -243,6 +245,8 @@ def kline(code:str, max_count:int=365, ktype=ft.KLType.K_DAY, host='127.0.0.1', 
         
         if ktype == 'K_240M':
             return convert_to_4h(kline[1])
+        elif ktype == 'K_120M':
+            df = convert_to_4h(kline[1],2).dropna()
 
         return kline[1]
 

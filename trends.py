@@ -105,10 +105,13 @@ def isTopDown(high, low, close) -> str|None:# 判别 KDJ 指标的最新顶部�
     elif last_j >= 10 and all(j < 10 for j in j_values[-4:-2]):
         return f'底消失{last_j}'
     
-    return last_j
+    if kdj_df['D'].iloc[-1] > kdj_df['D'].iloc[-2]:
+        return f'↑{last_j}'
+    else:
+        return f'↓{last_j}'
 
 def checkTrends(code_in_group, config: configparser.ConfigParser):
-     
+    
     trends = []
     type = config.get("CONFIG", "FUTU_PUSH_TYPE")
     host = config.get("CONFIG", "FUTU_HOST")
