@@ -23,6 +23,7 @@ from scipy import stats
 from datetime import datetime, timedelta
 import re
 import yfinance as yf
+from longport.openapi import Period
 
 def get_kline_seconds(k_type:str): #根据K_1M,K_5M,K_15M,K_30M,K_60M时间含义输出秒数
     if k_type == 'K_DAY':
@@ -57,6 +58,14 @@ def futu_code_to_yfinance_code(futu_code: str) -> str:
     else:
         assert re.match(r'^[A-Z]{2}.\d{6}$', futu_code)
         return '.'.join(reversed(futu_code.split('.')))
+    
+def futu_code_to_longport_code(futu_code: str) -> str:
+    """
+        Convert Futu Stock Code to Longport Stock Code format
+        E.g., HK.09988 -> 9988.HK; US.SOHO -> SOHO.US
+    :param futu_code: Stock code used in Futu (e.g., HK.09988)
+    """
+    return '.'.join(reversed(futu_code.split('.')))
 
 def yfinance_code_to_futu_code(yfinance_code: str) -> str:
     """
@@ -102,7 +111,7 @@ def map_history_params(period=None, interval=None, start=None, end=None):
 
     return futu_params 
 
-def map_futu_to_yfinance_params(ktype=None, start:datetime=None, end:datetime=None, max_count=None):
+def map_futu_to_yfinance_params(ktype:ft.KLType=None, start:datetime=None, end:datetime=None, max_count=None):
     # 映射 ktype 到 interval
     yf_interval_map = {
         'K_1M': '1m', 'K_3M': '2m', 'K_5M': '5m', 'K_15M': '15m',
@@ -116,21 +125,56 @@ def map_futu_to_yfinance_params(ktype=None, start:datetime=None, end:datetime=No
         730: 'max', 1825: 'max', 3650: 'max'
     }
 
-    yf_params = {}
+    yf_params = {'back_adjust':True}
 
     if ktype:
-        yf_params['interval'] = yf_interval_map.get(ktype, '1d')
+        yf_params['interval'] = yf_interval_map.get(ktype, None)
 
     if start:
         yf_params['start'] = start
 
     if end:
         yf_params['end'] = end
+
     if max_count:
         # 如果没有指定 start 和 end，则使用 period
-        yf_params['period'] = yf_period_map.get(max_count, '1y')
+        yf_params['period'] = yf_period_map.get(max_count, None)
 
     return yf_params
+
+def map_futu_to_longport_params(ktype:ft.KLType=None, start:datetime=None, end:datetime=None, count:int=None, direction=None):
+    """
+    将 Futu 参数映射到 Longport 的历史 K 线查询参数
+
+    :param ktype: K 线类型
+    :param start: 开始日期
+    :param end: 结束日期
+    :param count: 查询数量
+    :param direction: 查询方向
+    :return: Longport 查询参数字典
+    """
+    # 映射 ktype 到 period
+    longport_period_map = {
+        'K_1M': Period.Min_1, 'K_5M': Period.Min_5, 'K_15M': Period.Min_15,
+        'K_30M': Period.Min_30, 'K_60M': Period.Min_60, 'K_120M': Period.Min_60, 'K_240M': Period.Min_60, 'K_DAY': Period.Day, 'K_WEEK': Period.Week,
+        'K_MON': Period.Month
+    }
+
+    longport_params = {}
+
+    if ktype:
+        longport_params['period'] = longport_period_map.get(ktype, None)  # 直接映射 K 线类型
+
+    if start:
+        longport_params['start'] = start
+
+    if end:
+        longport_params['end'] = end
+
+    if count:
+        longport_params['count'] = count
+
+    return longport_params
 
 def codeInFutuGroup(group_name:str, host='127.0.0.1', port=11111):
     quote_ctx = ft.OpenQuoteContext(host=host, port=port)
@@ -144,7 +188,7 @@ def codeInFutuGroup(group_name:str, host='127.0.0.1', port=11111):
     else:
         print('error:', data)
 
-def convert_to_4h(df: pd.DataFrame,hour:2|4=4) -> pd.DataFrame:
+def convert_to_Nhour(df: pd.DataFrame,hour:2|4=4) -> pd.DataFrame:
     """
     将 60m 数据转换为 2h/4h 数据
 
@@ -213,9 +257,9 @@ def kline(code:str, max_count:int=365, ktype=ft.KLType.K_DAY, host='127.0.0.1', 
         }, inplace=True)
 
         if ktype == 'K_240M':
-            df = convert_to_4h(df).dropna()
+            df = convert_to_Nhour(df).dropna()
         elif ktype == 'K_120M':
-            df = convert_to_4h(df,2).dropna()
+            df = convert_to_Nhour(df,2).dropna()
 
         return df
     
@@ -244,9 +288,9 @@ def kline(code:str, max_count:int=365, ktype=ft.KLType.K_DAY, host='127.0.0.1', 
             return None
         
         if ktype == 'K_240M':
-            return convert_to_4h(kline[1])
+            return convert_to_Nhour(kline[1])
         elif ktype == 'K_120M':
-            df = convert_to_4h(kline[1],2).dropna()
+            df = convert_to_Nhour(kline[1],2).dropna()
 
         return kline[1]
 

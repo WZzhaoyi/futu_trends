@@ -1,4 +1,5 @@
 from config import get_config
+from data import get_kline
 from tools import *
 import datetime
 import configparser
@@ -84,43 +85,43 @@ def isBreakout(high, low, close, N:int=55)->str|None:# 最近一根K线突破/�
         return '跌破均线'
     return None
 
-def isTopDown(high, low, close) -> str|None:# 判别 KDJ 指标的最新顶部和底部信号
+def isTopDown(high, low, close) -> str|None:# 判别 KDJ 指标的顶部和底部信号
     kdj_df = KDJ(close, high, low)
 
     assert len(kdj_df) >= 6
 
     j_values = kdj_df['J'].iloc[-6:]  # 获取最后6个周期的 J 值
     last_j = round_decimal(j_values.iloc[-1],1)  # 获取最后一个 J 值
+    msg = u'🚨'+str(last_j) if last_j>90 or last_j<10 else str(last_j)
 
     # 顶部信号
     if all(j > 90 for j in j_values[-5:]) and j_values.iloc[-6] <= 90:
-        return f'顶部{last_j}'
+        msg += f'顶部'
     # 底部信号
     elif all(j < 10 for j in j_values[-2:]) and j_values.iloc[-4] >= 10:
-        return f'底部{last_j}'
+        msg += f'底部'
     # 顶消失信号
     elif last_j <= 90 and all(j > 90 for j in j_values[-6:-2]):
-        return f'顶消失{last_j}'
+        msg += f'顶消失'
     # 底消失信号
     elif last_j >= 10 and all(j < 10 for j in j_values[-4:-2]):
-        return f'底消失{last_j}'
+        msg += f'底消失'
     
     if kdj_df['D'].iloc[-1] > kdj_df['D'].iloc[-2]:
-        return f'↑{last_j}'
+        msg += '↑'
     else:
-        return f'↓{last_j}'
+        msg += '↓'
+    
+    return  msg
 
 def checkTrends(code_in_group, config: configparser.ConfigParser):
     
     trends = []
-    type = config.get("CONFIG", "FUTU_PUSH_TYPE")
-    host = config.get("CONFIG", "FUTU_HOST")
-    port = int(config.get("CONFIG", "FUTU_PORT"))
     trend_type = config.get("CONFIG", "TREND_TYPE").split(',')
     if code_in_group.size and len(trend_type):
          name_list = code_in_group['name']
          for idx, futu_code in enumerate(code_in_group['code'].values):
-            df = kline(futu_code, ktype=type, host=host, port=port)  # 获取 DataFrame
+            df = get_kline(futu_code, config)  # 获取 DataFrame
             high = df['high']  # 从 DataFrame 中提取 high 列
             low = df['low']    # 从 DataFrame 中提取 low 列
             close = df['close']  # 从 DataFrame 中提取 close 列
