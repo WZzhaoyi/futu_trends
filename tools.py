@@ -15,6 +15,7 @@
 #  Written by Joey <wzzhaoyi@outlook.com>, 2023
 #  Copyright (c)  Joey - All Rights Reserved
 
+import math
 import futu as ft
 import pandas as pd
 import numpy as np
@@ -176,7 +177,7 @@ def map_futu_to_longport_params(ktype:ft.KLType=None, start:datetime=None, end:d
 
     return longport_params
 
-def codeInFutuGroup(group_name:str, host='127.0.0.1', port=11111):
+def code_in_futu_group(group_name:str, host='127.0.0.1', port=11111):
     quote_ctx = ft.OpenQuoteContext(host=host, port=port)
 
     ret, data = quote_ctx.get_user_security(group_name)
@@ -379,6 +380,31 @@ def calc_icu_ma(price:pd.Series,N:int)->pd.Series:
     
     return price.rolling(N).apply(siegelslopes_ma,raw=True)
 
+# 动量因子
+def calc_momentum(close: pd.Series, N=21, method='linear'):
+    price = close.iloc[-N:].tolist()
+    y = np.log(price)
+    x = np.arange(len(y))
+    if method == 'linear':
+        slope, intercept = np.polyfit(x, y, 1)
+        annualized_returns = math.pow(math.exp(slope), 250) - 1
+        r_squared = 1 - (sum((y - (slope * x + intercept))**2) / ((len(y) - 1) * np.var(y, ddof=1)))
+        score = annualized_returns * r_squared
+    elif method == 'polynomial':
+      slope_list = np.polyfit(x, y, 2)
+      annualized_returns = math.pow(math.exp(slope_list[1]), 250) - 1
+      y_predict = np.polyval(slope_list,x)
+      r_squared = 1 - (sum((y-y_predict)**2) / ((len(y) - 1) * np.var(y, ddof=1)))
+      score = annualized_returns * r_squared
+    elif method == 'ma':
+        ma_short = df.close.rolling(window=10).mean().iloc[-1]
+        ma_long = df.close.rolling(window=50).mean().iloc[-1]
+        score = ma_short - ma_long
+    elif method == 'kendall':
+        tau, _ = stats.kendalltau(x, y)
+        score = tau
+    return score
+
 if __name__ == "__main__":
     code = 'SH.000922'
     
@@ -391,3 +417,4 @@ if __name__ == "__main__":
     print(RSI(close))
     print(AO(high,low))
     print(KDJ(close,high,low,))
+    print(calc_momentum(close))
