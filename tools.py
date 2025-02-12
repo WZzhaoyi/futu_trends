@@ -295,6 +295,37 @@ def kline(code:str, max_count:int=365, ktype=ft.KLType.K_DAY, host='127.0.0.1', 
 
         return kline[1]
 
+def crossover_status(series_a: pd.Series, series_b: pd.Series) -> list:
+    """
+    判断两个等长的 pd.Series 之间的上穿、下穿或不相交的状态。
+    
+    参数:
+    series_a: 第一个 pd.Series（被判断的系列）
+    series_b: 第二个 pd.Series（参考系列）
+    
+    返回:
+    一个列表，标识每个索引的状态：
+    - 1 表示 series_a 上穿 series_b
+    - -1 表示 series_a 下穿 series_b
+    - 0 表示不相交
+    """
+    if len(series_a) != len(series_b):
+        raise ValueError("两个 Series 必须等长")
+
+    status = []
+    for i in range(1, len(series_a)):
+        if series_a.iloc[i-1] < series_b.iloc[i-1] and series_a.iloc[i] > series_b.iloc[i]:
+            status.append(1)  # series_a 上穿 series_b
+        elif series_a.iloc[i-1] > series_b.iloc[i-1] and series_a.iloc[i] < series_b.iloc[i]:
+            status.append(-1)  # series_a 下穿 series_b
+        else:
+            status.append(0)  # 不相交
+
+    # 在第一个索引位置填充 0，因为没有前一个值进行比较
+    status.insert(0, 0)
+
+    return status
+
 def RD(N,D=3):   
 	return np.round(N,D)
 

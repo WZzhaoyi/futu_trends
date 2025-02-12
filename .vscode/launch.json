@@ -5,12 +5,20 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Trends",
+            "name": "tkdj_us",
             "type": "debugpy",
             "request": "launch",
             "program": "./trends.py",
             "console": "integratedTerminal",
             "args": ["--config","./env/tkdj_us.ini"]
+        },
+        {
+            "name": "tkdj_cn",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "./trends.py",
+            "console": "integratedTerminal",
+            "args": ["--config","./env/tkdj_cn.ini"]
         }
     ]
 }

@@ -88,24 +88,46 @@ def is_breakout(high, low, close, N:int=55)->str|None:# 最近一根K线突破/�
 def is_top_down(high, low, close) -> str|None:# 判别 KDJ 指标的顶部和底部信号
     kdj_df = KDJ(close, high, low)
 
-    assert len(kdj_df) >= 6
+    assert len(kdj_df) >= 40
 
-    j_values = kdj_df['J'].iloc[-6:]  # 获取最后6个周期的 J 值
+    j_values = kdj_df['J']  # 获取最后周期的 J 值
+    d_values = kdj_df['D']  # 获取最后周期的 D 值
     last_j = round_decimal(j_values.iloc[-1],1)  # 获取最后一个 J 值
-    msg = u'🚨'+str(last_j) if last_j>90 or last_j<10 else str(last_j)
+    msg = u'🚨'+str(last_j) if last_j>100 or last_j<0 else str(last_j)
 
-    # 顶部信号
-    if all(j > 90 for j in j_values[-5:]) and j_values.iloc[-6] <= 90:
-        msg += f'顶部'
-    # 底部信号
-    elif all(j < 10 for j in j_values[-2:]) and j_values.iloc[-4] >= 10:
-        msg += f'底部'
+    # # 顶部信号
+    # if all(j > 100 for j in j_values[-2:]) and j_values.iloc[-4] <= 100:
+    #     msg += f'顶部'
+    # # 底部信号
+    # elif all(j < 0 for j in j_values[-2:]) and j_values.iloc[-4] >= 0:
+    #     msg += f'底部'
     # 顶消失信号
-    elif last_j <= 90 and all(j > 90 for j in j_values[-6:-2]):
+    if last_j <= 100 and all(j > 100 for j in j_values[-4:-2]):
         msg += f'顶消失'
     # 底消失信号
-    elif last_j >= 10 and all(j < 10 for j in j_values[-4:-2]):
+    elif last_j >= 0 and all(j < 0 for j in j_values[-4:-2]):
         msg += f'底消失'
+
+    # 使用 crossover_status 判断 J 和 D 的交叉情况
+    crossover_results = crossover_status(j_values, d_values)
+    # 遍历 crossover_results 判断底背离和顶背离
+    for i in range(1, len(crossover_results)-1):
+        if crossover_results[-i] == 1:  # J 上穿 D
+            for j in range(i + 1, len(crossover_results)):
+                if crossover_results[-j] == 1:  # 上一次 J 上穿 D
+                    bd = (d_values.iloc[-i] > d_values.iloc[-j]) and (low.iloc[-i] < low.iloc[-j])
+                    if bd:
+                        msg += '底背离'
+                break
+            break  # 找到后退出内层循环
+        elif crossover_results[-i] == -1:  # D 上穿 J
+            for j in range(i + 1, len(crossover_results)):
+                if crossover_results[-j] == -1:  # 上一次 D 上穿 J
+                    td = (d_values.iloc[-i] < d_values.iloc[-j]) and (high.iloc[-i] > high.iloc[-j])
+                    if td:
+                        msg += '顶背离'
+                break
+            break  # 找到后退出内层循环
     
     if kdj_df['J'].iloc[-1] > kdj_df['J'].iloc[-2]:
         msg += '↑'
