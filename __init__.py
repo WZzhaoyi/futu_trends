@@ -19,3 +19,4 @@ from .telegram_engine import TelegramBotEngine
 from .email_engine import EmailEngine
 from .tools import *
 from .data import *
+from .ft_config import *

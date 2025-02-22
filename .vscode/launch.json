@@ -19,6 +19,14 @@
             "program": "./trends.py",
             "console": "integratedTerminal",
             "args": ["--config","./env/tkdj_cn.ini"]
+        },
+        {
+            "name": "alpha_filters",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "./run_analysis.py",
+            "console": "integratedTerminal",
+            "args": ["--config","./env/alpha.ini"]
         }
     ]
 }

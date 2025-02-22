@@ -1,4 +1,4 @@
-from config import get_config
+from ft_config import get_config
 from data import get_kline
 from tools import *
 import datetime

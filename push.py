@@ -4,7 +4,7 @@ import os
 import time
 import futu as ft
 import pandas as pd
-from config import get_config
+from ft_config import get_config
 from telegram_engine import TelegramBotEngine
 
 from tools import codeInFutuGroup, get_kline_seconds
