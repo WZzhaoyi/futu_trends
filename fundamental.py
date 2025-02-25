@@ -1,4 +1,4 @@
-from fundamental_analysis.run_filters import StockAnalyzer
+from run_filters import StockAnalyzer
 from ft_config import get_config
 
 def main():

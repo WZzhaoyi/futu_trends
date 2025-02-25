@@ -27,6 +27,14 @@
             "program": "./run_analysis.py",
             "console": "integratedTerminal",
             "args": ["--config","./env/alpha.ini"]
+        },
+        {
+            "name": "signal",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "./detect.py",
+            "console": "integratedTerminal",
+            "args": ["--config","./env/signal.ini"]
         }
     ]
 }

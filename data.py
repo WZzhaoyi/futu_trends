@@ -16,6 +16,7 @@
 #  Copyright (c)  Joey - All Rights Reserved
 
 import configparser
+from time import sleep
 import futu as ft
 import pandas as pd
 import numpy as np
@@ -25,21 +26,23 @@ from datetime import datetime
 from longport.openapi import QuoteContext, Config, AdjustType
 from tools import convert_to_Nhour, futu_code_to_longport_code, futu_code_to_yfinance_code, get_kline_seconds, map_futu_to_longport_params, map_futu_to_yfinance_params\
 
-def get_kline(code:str, config: configparser.ConfigParser, max_count:int=250, autype=ft.AuType.HFQ):
+def get_kline(code:str, config: configparser.ConfigParser, max_count:int=90, autype=ft.AuType.HFQ):
     data_source = config.get("CONFIG", "DATA_SOURCE")
     ktype = config.get("CONFIG", "FUTU_PUSH_TYPE")
-    
-    if ktype == ft.KLType.K_DAY:
-        max_count = 90
+
+    end = datetime.now()
+    kline_seconds = get_kline_seconds(ktype)
+    if kline_seconds < 24 * 60 * 60:
+        # Convert calendar days to business days (approximately)
+        bdays = kline_seconds*max_count // (5*60*60)
+        # Use pandas bdate_range to get the start date by counting back business days
+        start = pd.bdate_range(end=end, periods=bdays, freq='B')[0]
+    else:
+        # For daily or above periods, calculate business days directly
+        start = pd.bdate_range(end=end, periods=max_count, freq='B')[0]
 
     if data_source == 'yfinance':
         
-        kline_seconds = get_kline_seconds(ktype)
-
-        end = datetime.now()
-        delta_days = kline_seconds*max_count // (7*60*60)
-        start = end - timedelta(days=delta_days)
-
         stock_code = futu_code_to_yfinance_code(code)
         param = map_futu_to_yfinance_params(ktype=ktype, start=start, end=end)
         history = yf.Ticker(stock_code).history(**param)
@@ -67,6 +70,8 @@ def get_kline(code:str, config: configparser.ConfigParser, max_count:int=250, au
         elif ktype == 'K_120M':
             df = convert_to_Nhour(df,2).dropna()
 
+        sleep(1)
+
         return df
     
     elif data_source == 'futu':
@@ -79,11 +84,6 @@ def get_kline(code:str, config: configparser.ConfigParser, max_count:int=250, au
         else:
             _ktype = ktype
 
-        kline_seconds = get_kline_seconds(_ktype)
-
-        end = datetime.now()
-        delta_days = kline_seconds*max_count // (5*60*60)
-        start = end - timedelta(days=delta_days)
         start_str = start.strftime('%Y-%m-%d')
         end_str = end.strftime('%Y-%m-%d')
          
@@ -96,10 +96,14 @@ def get_kline(code:str, config: configparser.ConfigParser, max_count:int=250, au
             print(kline[1])
             return None
         
+        # 将time_key列转换为DatetimeIndex
+        kline[1]['time_key'] = pd.to_datetime(kline[1]['time_key'])
+        kline[1].set_index(pd.DatetimeIndex(kline[1]['time_key']), inplace=True)
+        
         if ktype == 'K_240M':
             return convert_to_Nhour(kline[1])
         elif ktype == 'K_120M':
-            df = convert_to_Nhour(kline[1],2).dropna()
+            return convert_to_Nhour(kline[1],2).dropna()
 
         return kline[1]
     
@@ -115,6 +119,11 @@ def get_kline(code:str, config: configparser.ConfigParser, max_count:int=250, au
         ctx = QuoteContext(_config)
         resp = ctx.candlesticks(stock_code, param.period, max_count, AdjustType.ForwardAdjust)
         df = pd.DataFrame(resp)
+        
+        # 确保时间列是DatetimeIndex
+        if 'time' in df.columns:
+            df['time'] = pd.to_datetime(df['time'])
+            df.set_index(pd.DatetimeIndex(df['time']), inplace=True)
         
         if ktype == 'K_240M':
             df = convert_to_Nhour(df).dropna()
