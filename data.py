@@ -26,7 +26,7 @@ from datetime import datetime
 from longport.openapi import QuoteContext, Config, AdjustType
 from tools import convert_to_Nhour, futu_code_to_longport_code, futu_code_to_yfinance_code, get_kline_seconds, map_futu_to_longport_params, map_futu_to_yfinance_params\
 
-def get_kline(code:str, config: configparser.ConfigParser, max_count:int=90, autype=ft.AuType.HFQ):
+def get_kline(code:str, config: configparser.ConfigParser, max_count:int=250, autype=ft.AuType.QFQ):
     data_source = config.get("CONFIG", "DATA_SOURCE")
     ktype = config.get("CONFIG", "FUTU_PUSH_TYPE")
 
@@ -45,7 +45,7 @@ def get_kline(code:str, config: configparser.ConfigParser, max_count:int=90, aut
         
         stock_code = futu_code_to_yfinance_code(code)
         param = map_futu_to_yfinance_params(ktype=ktype, start=start, end=end)
-        history = yf.Ticker(stock_code).history(**param)
+        history = yf.download(code, **param)
 
         if history.empty:
             return None

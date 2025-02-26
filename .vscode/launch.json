@@ -29,10 +29,18 @@
             "args": ["--config","./env/alpha.ini"]
         },
         {
-            "name": "signal",
+            "name": "signal_analysis",
             "type": "debugpy",
             "request": "launch",
             "program": "./detect.py",
+            "console": "integratedTerminal",
+            "args": ["--config","./env/signal.ini"]
+        },
+        {
+            "name": "reverse",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "./trends.py",
             "console": "integratedTerminal",
             "args": ["--config","./env/signal.ini"]
         }

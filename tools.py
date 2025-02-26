@@ -126,7 +126,7 @@ def map_futu_to_yfinance_params(ktype:ft.KLType=None, start:datetime=None, end:d
         730: 'max', 1825: 'max', 3650: 'max'
     }
 
-    yf_params = {'back_adjust':True}
+    yf_params = {'back_adjust':False}
 
     if ktype:
         yf_params['interval'] = yf_interval_map.get(ktype, None)

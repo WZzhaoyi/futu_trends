@@ -165,7 +165,7 @@ def Stochastic(high, low, close, k_period, d_period):
     return k, d
 
 # 矢量化信号检测，区分显性和隐秘强信号
-def detect_stochastic_signals_vectorized(df, k_period=14, d_period=3, overbought=80, oversold=20, support_ma_period=20, resistance_ma_period=20,atr_period_explicit=14, atr_period_hidden=14, strength_threshold=2):
+def detect_stochastic_signals_vectorized(df: pd.DataFrame, k_period=14, d_period=3, overbought=80, oversold=20, support_ma_period=20, resistance_ma_period=20,atr_period_explicit=14, atr_period_hidden=14, strength_threshold=2):
     df = df.copy()
     k, d = Stochastic(df['high'], df['low'], df['close'], k_period, d_period)
     support_ma = df['close'].rolling(window=int(support_ma_period), min_periods=1).mean()

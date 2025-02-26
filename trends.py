@@ -1,5 +1,8 @@
+import json
+import os
 from ft_config import get_config
 from data import get_kline
+from signal_analysis import detect_stochastic_signals_vectorized
 from tools import *
 import datetime
 import configparser
@@ -30,25 +33,69 @@ def inside_MA(close, last_low, last_high): # 计算MA5,10,15中的最小值和�
     else:
         return True
 
-def is_reverse(high, low, close)->str|None:# 最近一根K线创新高/低 收盘价位于K线下半部/上半部
-    if len(close) == 0:
-        return None
+def is_reverse(code:str, df:pd.DataFrame|None, config:configparser.ConfigParser)->str|None:
+    """
+    检查是否出现反转信号
     
-    last_index = len(close) - 1
-    if last_index < 3:  # 确保有足够的数据进行比较
-        return None
+    Args:
+        code: 股票代码
+        df: 股票数据
+        config: 配置对象
     
-    last_close = close[last_index]
-    last_low = low[last_index]
-    last_high = high[last_index]
-    last_ave = (last_high+last_low)/2
-    if inside_MA(close, last_low, last_high):
+    Returns:
+        str|None: 返回反转信号描述或None
+    """
+    assert len(df) >= 90
+    
+    # 从配置中获取参数文件路径
+    params_file = config.get("CONFIG", "KD_PARAMS", fallback=None)
+    if not params_file or not os.path.exists(params_file):
+        print(f"Warning: KD parameters file not found at {params_file}")
         return None
-    if last_low < low[last_index-1] and last_low < low[last_index-2] and last_ave < last_close and last_low < low[last_index-3]:
-         return '下跌可能反转'
-    if last_high > high[last_index-1] and last_high > high[last_index-2] and last_ave > last_close and last_high > high[last_index-3]:
-         return '上涨可能反转'
-    return None
+        
+    try:
+        # 读取JSON文件
+        with open(params_file, 'r') as f:
+            all_params = json.load(f)
+            
+        # 获取特定代码的参数
+        if code not in all_params:
+            print(f"Warning: No parameters found for {code}")
+            return None
+            
+        code_params = all_params[code]
+        
+        # 提取参数
+        params = code_params['best_params']
+        
+        # 使用参数进行信号检测
+        result = detect_stochastic_signals_vectorized(
+            df,
+            k_period=params['k_period'],
+            d_period=params['d_period'],
+            overbought=params['overbought'],
+            oversold=params['oversold'],
+            support_ma_period=params['support_ma_period'],
+            resistance_ma_period=params['resistance_ma_period'],
+            atr_period_explicit=params['atr_period_explicit'],
+            atr_period_hidden=params['atr_period_hidden'],
+            strength_threshold=params['strength_threshold']
+        )
+        
+        # 获取最后一行的信号
+        last_row = result.iloc[-1]
+        
+        # 检查是否有反转信号
+        msg = ''
+        if last_row['reversal'] != 'none':
+            msg += last_row['reversal']
+        if last_row['is_strong'] == 1:
+            msg += u'🚨'
+        return None if msg == '' else msg
+        
+    except Exception as e:
+        print(f"Error processing parameters for {code}: {str(e)}")
+        return None
 
 def is_continue(high, low)->str|None:# 取倒数5根AO柱 近3根趋势与之前相反
     ao = AO(high, low)
@@ -67,7 +114,7 @@ def is_continue(high, low)->str|None:# 取倒数5根AO柱 近3根趋势与之前
     
     return None
 
-def is_breakout(high, low, close, N:int=55)->str|None:# 最近一根K线突破/跌破均线
+def is_breakout(high, low, close, N:int=5)->str|None:# 最近一根K线突破/跌破均线
     high_ema = EMA(high, N)
     low_ema = EMA(low, N)
     last_index = len(close) - 1
@@ -148,6 +195,16 @@ def check_trends(code_in_group, config: configparser.ConfigParser):
         trends_with_rank = []
         for idx, futu_code in enumerate(code_in_group['code'].values):
             df = get_kline(futu_code, config)  # 获取 DataFrame
+
+            # 添加对 df 的检查
+            if df is None:
+                print(f"Warning: Failed to get data for {futu_code}")
+                continue
+                
+            if len(df) == 0:
+                print(f"Warning: Empty data for {futu_code}")
+                continue
+
             high = df['high']  # 从 DataFrame 中提取 high 列
             low = df['low']    # 从 DataFrame 中提取 low 列
             close = df['close']  # 从 DataFrame 中提取 close 列
@@ -164,7 +221,7 @@ def check_trends(code_in_group, config: configparser.ConfigParser):
                     if bo is not None:
                         msg += bo
                 elif i.lower() == 'reverse':
-                    rev = is_reverse(high,low,close) # 趋势反转
+                    rev = is_reverse(futu_code,df,config) # 趋势反转
                     if rev is not None:
                         msg += rev
                 elif i.lower() == 'continue':
