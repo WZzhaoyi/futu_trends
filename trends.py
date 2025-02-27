@@ -50,8 +50,7 @@ def is_reverse(code:str, df:pd.DataFrame|None, config:configparser.ConfigParser)
     # 从配置中获取参数文件路径
     params_file = config.get("CONFIG", "KD_PARAMS", fallback=None)
     if not params_file or not os.path.exists(params_file):
-        print(f"Warning: KD parameters file not found at {params_file}")
-        return None
+        raise(f"Warning: KD parameters file not found at {params_file}")
     
     # 读取JSON文件
     with open(params_file, 'r') as f:
@@ -60,7 +59,7 @@ def is_reverse(code:str, df:pd.DataFrame|None, config:configparser.ConfigParser)
     # 获取特定代码的参数
     if code not in all_params:
         print(f"Warning: No parameters found for {code}")
-        return None
+        return 'No parameters'
         
     code_params = all_params[code]
     

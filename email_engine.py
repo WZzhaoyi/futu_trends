@@ -12,21 +12,16 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
-#  Written by Joey <wzzhaoyi@outlook.com>, 2023
+#  Written by Joey <wzzhaoyi@outlook.com>, 2025
 #  Copyright (c)  Joey - All Rights Reserved
 
-
-# the first step is always the same: import all necessary components:
-import smtplib
-import ssl
-import time
 import configparser
-import os
 from datetime import datetime
-from email.mime.multipart import MIMEMultipart
+import smtplib
 from email.mime.text import MIMEText
+from email.header import Header
 from socket import gaierror
-
+import time
 
 class EmailEngine:
     def plog(self,content):
@@ -36,39 +31,24 @@ class EmailEngine:
         """
             Email Engine Constructor
         """
-        self.EMAIL_PORT = config.get("CONFIG", "EMAIL_PORT")
-        self.EMAIL_SERVER = config.get("CONFIG", "EMAIL_SERVER")
-        self.EMAIL_SENDER = config.get("CONFIG", "EMAIL_SENDER")
-        self.EMAIL_PASWD = config.get("CONFIG", "EMAIL_PASWD")
+        self.mail_port = config.get("CONFIG", "EMAIL_PORT")
+        self.mail_host = config.get("CONFIG", "EMAIL_SERVER")
+        self.sender = config.get("CONFIG", "EMAIL_SENDER")
+        self.mail_pass = config.get("CONFIG", "EMAIL_PASWD")
 
-        # Create a secure SSL context
-        self.context = ssl.create_default_context()
+    def send_email(self, receivers:str|list[str], filter_name: str, message_html: str):
 
-    def send_email(self, receiver: str, filter_name: str, message_html: str):
-        message = MIMEMultipart("alternative")
-        message["Subject"] = f"Futu Stock Trends - {datetime.today().strftime('%Y-%m-%d')} - {filter_name}"
-        message["From"] = self.EMAIL_SENDER
-        message["To"] = receiver
-        text = "Please kindly review today's chosen stock list! "
-        html = message_html
-
-        # Turn these into plain/html MIMEText objects
-        part1 = MIMEText(text, "plain")
-        part2 = MIMEText(html, "html")
-
-        # Add HTML/plain-text parts to MIMEMultipart message
-        # The email client will try to render the last part first
-        message.attach(part1)
-        message.attach(part2)
+        message = MIMEText(message_html, 'html', 'utf-8')
+        message["From"] = self.sender
+        message['To'] = ','.join(receivers) if isinstance(receivers, list) else receivers
+        message['Subject'] = Header(f"Futu Stock Trends - {datetime.today().strftime('%Y-%m-%d')} - {filter_name}", 'utf-8')
 
         try:
-            # send your message with credentials specified above
-            with smtplib.SMTP(self.EMAIL_SERVER, self.EMAIL_PORT) as server:
-                server.starttls(context=self.context)  # Secure the connection
-                server.login(self.EMAIL_SENDER, self.EMAIL_PASWD)
-                server.sendmail(self.EMAIL_SENDER, receiver, message.as_string())
-
-            self.plog(f'Email Sent: {receiver}')
+            smtpObj = smtplib.SMTP_SSL(self.mail_host, self.mail_port) #建立smtp连接，ssl 465端口
+            smtpObj.login(self.sender, self.mail_pass)  #登陆
+            smtpObj.sendmail(self.sender, receivers, message.as_string())  #发送
+            smtpObj.quit()
+            self.plog(f'Email Sent: {receivers}')
         except (gaierror, ConnectionRefusedError):
             self.plog('Failed to connect to the server. Bad connection settings?')
         except smtplib.SMTPServerDisconnected:

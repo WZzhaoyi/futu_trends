@@ -34,7 +34,7 @@
             "request": "launch",
             "program": "./detect.py",
             "console": "integratedTerminal",
-            "args": ["--config","./env/signal.ini"]
+            "args": ["--config","./env/signal_cn.ini"]
         },
         {
             "name": "reverse",
@@ -42,7 +42,7 @@
             "request": "launch",
             "program": "./trends.py",
             "console": "integratedTerminal",
-            "args": ["--config","./env/signal.ini"]
+            "args": ["--config","./env/signal_cn.ini"]
         }
     ]
 }
