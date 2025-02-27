@@ -50,8 +50,8 @@ def futu_code_to_yfinance_code(futu_code: str) -> str:
     :param futu_code: Stock code used in Futu (e.g., HK.09988)
     """
     if futu_code.startswith("HK"):
-        assert re.match(r'^[A-Z]{2}.\d{5}$', futu_code)
-        return '.'.join(reversed(futu_code.split('.')))[1:]
+        assert re.match(r'^[A-Z]{2}.\d{5,6}$', futu_code)
+        return '.'.join(reversed(futu_code.split('.')))
     elif futu_code.startswith('US.'):
         return futu_code.replace('US.', '')
     elif futu_code.startswith('SH.'):

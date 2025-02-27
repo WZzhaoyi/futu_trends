@@ -52,50 +52,54 @@ def is_reverse(code:str, df:pd.DataFrame|None, config:configparser.ConfigParser)
     if not params_file or not os.path.exists(params_file):
         print(f"Warning: KD parameters file not found at {params_file}")
         return None
+    
+    # 读取JSON文件
+    with open(params_file, 'r') as f:
+        all_params = json.load(f)
         
-    try:
-        # 读取JSON文件
-        with open(params_file, 'r') as f:
-            all_params = json.load(f)
-            
-        # 获取特定代码的参数
-        if code not in all_params:
-            print(f"Warning: No parameters found for {code}")
-            return None
-            
-        code_params = all_params[code]
-        
-        # 提取参数
-        params = code_params['best_params']
-        
-        # 使用参数进行信号检测
-        result = detect_stochastic_signals_vectorized(
-            df,
-            k_period=params['k_period'],
-            d_period=params['d_period'],
-            overbought=params['overbought'],
-            oversold=params['oversold'],
-            support_ma_period=params['support_ma_period'],
-            resistance_ma_period=params['resistance_ma_period'],
-            atr_period_explicit=params['atr_period_explicit'],
-            atr_period_hidden=params['atr_period_hidden'],
-            strength_threshold=params['strength_threshold']
-        )
-        
-        # 获取最后一行的信号
-        last_row = result.iloc[-1]
-        
-        # 检查是否有反转信号
-        msg = ''
-        if last_row['reversal'] != 'none':
-            msg += last_row['reversal']
-        if last_row['is_strong'] == 1:
-            msg += u'🚨'
-        return None if msg == '' else msg
-        
-    except Exception as e:
-        print(f"Error processing parameters for {code}: {str(e)}")
+    # 获取特定代码的参数
+    if code not in all_params:
+        print(f"Warning: No parameters found for {code}")
         return None
+        
+    code_params = all_params[code]
+    
+    # 提取参数
+    params = code_params['best_params']
+    
+    # 使用参数进行信号检测
+    result = detect_stochastic_signals_vectorized(
+        df,
+        k_period=params['k_period'],
+        d_period=params['d_period'],
+        overbought=params['overbought'],
+        oversold=params['oversold'],
+        support_ma_period=params['support_ma_period'],
+        resistance_ma_period=params['resistance_ma_period'],
+        atr_period_explicit=params['atr_period_explicit'],
+        atr_period_hidden=params['atr_period_hidden'],
+        strength_threshold=params['strength_threshold']
+    )
+    
+    # 获取最后一行的信号
+    last_row = result.iloc[-1]
+    # 处理 last_row['reversal'] 的两种情况
+    reversal_value = last_row['reversal']
+    strong_value = last_row['is_strong']
+        
+    # 确保 reversal_value 是字符串
+    if isinstance(reversal_value, pd.Series):
+        reversal_value = reversal_value.item()  # 提取单个值
+    if isinstance(strong_value, pd.Series):
+        strong_value = strong_value.item()  # 提取单个值
+    
+    # 检查是否有反转信号
+    msg = ''
+    if reversal_value != 'none':
+        msg += reversal_value
+    if strong_value == 1:
+        msg += u'🚨'
+    return None if msg == '' else msg
 
 def is_continue(high, low)->str|None:# 取倒数5根AO柱 近3根趋势与之前相反
     ao = AO(high, low)
@@ -205,9 +209,9 @@ def check_trends(code_in_group, config: configparser.ConfigParser):
                 print(f"Warning: Empty data for {futu_code}")
                 continue
 
-            high = df['high']  # 从 DataFrame 中提取 high 列
-            low = df['low']    # 从 DataFrame 中提取 low 列
-            close = df['close']  # 从 DataFrame 中提取 close 列
+            high = pd.Series(df['high'].values.ravel())  # 从 DataFrame 中提取 high 列并转换为 pd.Series
+            low = pd.Series(df['low'].values.ravel())    # 从 DataFrame 中提取 low 列并转换为 pd.Series
+            close = pd.Series(df['close'].values.ravel())  # 从 DataFrame 中提取 close 列并转换为 pd.Series
             name = name_list[idx]
 
             if len(high) == 0 or len(low) == 0 or len(close) == 0:

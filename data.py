@@ -45,7 +45,7 @@ def get_kline(code:str, config: configparser.ConfigParser, max_count:int=250, au
         
         stock_code = futu_code_to_yfinance_code(code)
         param = map_futu_to_yfinance_params(ktype=ktype, start=start, end=end)
-        history = yf.download(code, **param)
+        history = yf.download(stock_code, **param)
 
         if history.empty:
             return None
