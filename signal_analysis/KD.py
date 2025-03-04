@@ -430,7 +430,7 @@ def KD_analysis(df, name, pl=False, evals=500): # { 'performance': result, 'best
 
         # 增强标题信息
         title = (
-            f'{name} Stochastic Oscillator Signals\n'
+            f'{name} Stochastic Oscillator Signals (look_ahead={look_ahead})\n'
             f'k={best_params["k_period"]}, d={best_params["d_period"]}, overbought={best_params["overbought"]}, oversold={best_params["oversold"]}, support_ma={best_params["support_ma_period"]}, resistance_ma={best_params["resistance_ma_period"]}, atr_explicit={best_params["atr_period_explicit"]}, atr_hidden={best_params["atr_period_hidden"]}, threshold={best_params["strength_threshold"]:.1f}\n'
             f'Explicit Strong Support Win Rate: {result["explicit_strong_support_win_rate"]:.2%} (Signals: {result["explicit_strong_support_signals_count"]}) Explicit Strong Resistance Win Rate: {result["explicit_strong_resistance_win_rate"]:.2%} (Signals: {result["explicit_strong_resistance_signals_count"]})\n'
             f'Hidden Strong Support Win Rate: {result["hidden_strong_support_win_rate"]:.2%} (Signals: {result["hidden_strong_support_signals_count"]}) Hidden Strong Resistance Win Rate: {result["hidden_strong_resistance_win_rate"]:.2%} (Signals: {result["hidden_strong_resistance_signals_count"]})\n'
