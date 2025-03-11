@@ -6,6 +6,8 @@ import numpy as np
 import pandas_ta as pandas_ta
 import pandas as pd
 import talib as tb
+from io import BytesIO
+import requests
 
 """
 Hong Kong, Shenzhen, Shanghai stocks used number + exch appendix (e.g. HK, SZ, SS)
@@ -13,31 +15,95 @@ so used a generator to generate the possible value within a pre-defined range.
 """
 
 
-def vaid_shenzhen_ticker_generator():
+def shenzhen_ticker_generator():
     for i in range(1000001, 1003999):
         yield str(i)[1:] + ".SZ"
 
 
-def vaid_techboard_ticker_generator():
+def techboard_ticker_generator():
     for i in range(1300001, 1301599):
         yield str(i)[1:] + ".SZ"
 
 
-def vaid_b_ticker_generator():
+def b_ticker_generator():
     for i in range(1200002, 1201000):
         # for i in range(1201000,1202000):
         yield str(i)[1:]
 
 
-def vaid_shanghai_ticker_generator():
+def shanghai_ticker_generator():
     for i in range(1600001, 1605999):
         yield str(i)[1:] + ".SS"
 
+def kc50_generator():
+    # 下载链接
+    url = "https://oss-ch.csindex.com.cn/static/html/csindex/public/uploads/file/autofile/cons/000688cons.xls"
+    
+    # 发送GET请求下载文件
+    response = requests.get(url, timeout=10)
+    response.raise_for_status()  # 检查请求是否成功
+    
+    # 将响应内容转换为Excel文件对象
+    file_content = BytesIO(response.content)
+    df = pd.read_excel(file_content)
+    
+    # 提取成分代码列并转换为字符串格式
+    tickers = df['成份券代码Constituent Code'].astype(str).apply(
+        lambda x: x.zfill(6) + '.SS' if x.startswith('6') else x.zfill(6) + '.SZ'
+    ).to_list()
+    
+    # 生成器返回每个成分代码
+    for t in tickers:
+        yield t
 
-def vaid_hk_ticker_generator():
+def a500_generator():
+    # 下载链接
+    url = "https://oss-ch.csindex.com.cn/static/html/csindex/public/uploads/file/autofile/cons/000510cons.xls"
+    
+    # 发送GET请求下载文件
+    response = requests.get(url, timeout=10)
+    response.raise_for_status()  # 检查请求是否成功
+    
+    # 将响应内容转换为Excel文件对象
+    file_content = BytesIO(response.content)
+    df = pd.read_excel(file_content)
+    
+    # 提取成分代码列并转换为字符串格式
+    tickers = df['成份券代码Constituent Code'].astype(str).apply(
+        lambda x: x.zfill(6) + '.SS' if x.startswith('6') else x.zfill(6) + '.SZ'
+    ).to_list()
+    
+    # 生成器返回每个成分代码
+    for t in tickers:
+        yield t
+
+
+def hk_ticker_generator():
     for i in range(10001, 19999):
         yield str(i)[1:] + ".HK"
 
+def hstech_ticker_generator():
+    table = pd.read_html('https://zh.wikipedia.org/wiki/%E6%81%92%E7%94%9F%E7%A7%91%E6%8A%80%E6%8C%87%E6%95%B8')
+    ls = table[1].values[0]
+    tickers = []
+    for i in ls:
+        i = i.split(' ')
+        for j in i:
+            if type(j) == type('123') and j.isnumeric():
+                tickers.append(j[1:] + ".HK")
+    for t in tickers:
+        yield t
+
+def hsi_ticker_generator():
+    table = pd.read_html('https://zh.wikipedia.org/wiki/%E6%81%92%E7%94%9F%E6%8C%87%E6%95%B8#%E6%81%92%E7%94%9F%E6%8C%87%E6%95%B8%E6%88%90%E4%BB%BD%E8%82%A1')
+    ls = table[14].values
+    tickers = []
+    for i in ls:
+        i = i[0]
+        if type(i) == type('123') and i.isnumeric():
+            tickers.append(i[1:] + ".HK")
+    for t in tickers:
+        yield t
 
 def sp_500_generator():
     table = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')
@@ -280,3 +346,57 @@ def get_technical_analysis_features(df, ticker):
     df['HT_DC'] = tb.HT_DCPERIOD(c)
 
     return df
+
+def yfinance_to_tdx_ebk(tickers, output_file=None):
+    """
+    将yfinance格式的股票代码转换为通达信EBK格式
+    :param tickers: 单个股票代码字符串或股票代码列表
+    :param output_file: 输出的EBK文件路径，如果为None则只返回转换后的列表
+    :return: 转换后的股票代码列表
+    """
+    if isinstance(tickers, str):
+        tickers = [tickers]
+    
+    tdx_codes = []
+    for ticker in tickers:
+        # 移除可能存在的空格
+        ticker = ticker.strip()
+        
+        # 处理后缀
+        if ticker.endswith('.SS'):
+            # 上海市场
+            code = f"1#{ticker[:-3]}"
+        elif ticker.endswith('.SZ'):
+            # 深圳市场
+            code = f"0#{ticker[:-3]}"
+        elif ticker.endswith('.HK'):
+            # 香港市场
+            code = f"20{ticker[:-3]}"
+        else:
+            # 对于没有后缀的代码，假设为美股
+            code = f"31#{ticker}"
+        
+        tdx_codes.append(code)
+    
+    if output_file:
+        # 写入EBK文件
+        with open(output_file, 'w', encoding='gbk') as f:
+            for code in tdx_codes:
+                f.write(code + '\n')
+        logger.info(f"已将股票代码列表保存到: {output_file}")
+    
+    return tdx_codes
+
+if __name__ == "__main__":
+    a500 = kc50_generator()
+    
+    print("前10个成分股代码:")
+    for _ in range(10):
+        try:
+            print(next(a500))
+        except StopIteration:
+            print("已遍历所有成分股")
+            break
+        except Exception as e:
+            print(f"生成器错误: {e}")
+            break
