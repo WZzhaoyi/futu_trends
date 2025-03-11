@@ -65,4 +65,6 @@ if __name__ == '__main__':
 
     ls = code_in_futu_group(group,host,port)
 
-    results = run_analysis(ls, config)
+    timestamp = datetime.now().strftime('%Y%m%d')
+    output_dir = f'./output/detect_{timestamp}'
+    results = run_analysis(ls, config, output_dir=output_dir)

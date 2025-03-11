@@ -7,13 +7,18 @@ import pandas as pd
 
 from .stock_info import Stock_Info
 from .utility import (
-    vaid_hk_ticker_generator,
-    vaid_shanghai_ticker_generator,
-    vaid_shenzhen_ticker_generator,
-    vaid_b_ticker_generator,
-    vaid_techboard_ticker_generator,
+    hk_ticker_generator,
+    shanghai_ticker_generator,
+    shenzhen_ticker_generator,
+    b_ticker_generator,
+    techboard_ticker_generator,
     sp_500_generator,
-    nasdaq_100_generator
+    nasdaq_100_generator,
+    kc50_generator,
+    a500_generator,
+    hstech_ticker_generator,
+    hsi_ticker_generator,
+    yfinance_to_tdx_ebk
 )
 
 class StockAnalyzer:
@@ -33,13 +38,17 @@ class StockAnalyzer:
     def _initialize_generators(self) -> List[Generator]:
         """初始化所有股票代码生成器"""
         generator_map = {
-            'shanghai': vaid_shanghai_ticker_generator,
-            'shenzhen': vaid_shenzhen_ticker_generator,
-            'b': vaid_b_ticker_generator,
-            'techboard': vaid_techboard_ticker_generator,
-            'hk': vaid_hk_ticker_generator,
+            'shanghai': shanghai_ticker_generator,
+            'shenzhen': shenzhen_ticker_generator,
+            'b': b_ticker_generator,
+            'techboard': techboard_ticker_generator,
+            'hk': hk_ticker_generator,
             'sp500': sp_500_generator,
-            'nasdaq100': nasdaq_100_generator
+            'nasdaq100': nasdaq_100_generator,
+            'kc50': kc50_generator,
+            'a500': a500_generator,
+            'hstech': hstech_ticker_generator,
+            'hsi': hsi_ticker_generator
         }
         
         generators = []
@@ -74,19 +83,21 @@ class StockAnalyzer:
         
         return stock_watch_list
 
-    def piotroski_score_filter(self, stock_list: List[Tuple[str, float]]) -> List[Tuple[str, int]]:
+    def piotroski_score_filter(self, stock_list: List[Tuple[str, float]], percent=1, score_limit=4) -> List[Tuple[str, int]]:
         """执行 Piotroski 评分过滤"""
         stock_watch_list_pscore = []
         for ticker, _ in stock_list:
             try:
                 stock = Stock_Info(ticker)
-                stock_watch_list_pscore.append((ticker, stock.piotroski_score()))
+                score = stock.piotroski_score()
+                if score > score_limit:
+                    stock_watch_list_pscore.append((ticker, score))
             except Exception as e:
                 logger.error(f"计算 {ticker} 的 Piotroski 评分时出错: {str(e)}")
         
         stock_watch_list_pscore.sort(key=lambda a: a[1])
         list_length = len(stock_watch_list_pscore)
-        top_twenty_percent = int(list_length * 0.2)
+        top_twenty_percent = int(list_length * percent)
         return stock_watch_list_pscore[-top_twenty_percent:]
 
     def save_results(self, stock_watch_list: List[Tuple[str, float]], 
@@ -101,10 +112,11 @@ class StockAnalyzer:
         df_stock_watch = pd.DataFrame(stock_watch_list, columns=['Ticker', 'Average ROE'])
         df_piotroski = pd.DataFrame(stock_piotroski_list, columns=['Ticker', 'Piotroski Score'])
         
-        stock_list_file = os.path.join(self.output_path, f"stock_list_{current_time}_{tickers}.csv")
+        stock_list_file = os.path.join(self.output_path, f"stock_list_{current_time}_{tickers}.ebk")
         stock_piotroski_file = os.path.join(self.output_path, f"stock_piotroski_list_{current_time}_{tickers}.csv")
         
-        df_stock_watch.to_csv(stock_list_file, index=False)
+        # df_stock_watch.to_csv(stock_list_file, index=False)
+        yfinance_to_tdx_ebk(df_piotroski['Ticker'].tolist(), stock_list_file)
         df_piotroski.to_csv(stock_piotroski_file, index=False)
         
         logger.info(f"分析结果已保存到: {self.output_path}")

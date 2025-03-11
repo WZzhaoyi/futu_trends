@@ -24,7 +24,7 @@
             "name": "alpha_filters",
             "type": "debugpy",
             "request": "launch",
-            "program": "./run_analysis.py",
+            "program": "./fundamental.py",
             "console": "integratedTerminal",
             "args": ["--config","./env/alpha.ini"]
         },
