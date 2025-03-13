@@ -296,34 +296,18 @@ def kline(code:str, max_count:int=365, ktype=ft.KLType.K_DAY, host='127.0.0.1', 
         return kline[1]
 
 def crossover_status(series_a: pd.Series, series_b: pd.Series) -> list:
-    """
-    判断两个等长的 pd.Series 之间的上穿、下穿或不相交的状态。
-    
-    参数:
-    series_a: 第一个 pd.Series（被判断的系列）
-    series_b: 第二个 pd.Series（参考系列）
-    
-    返回:
-    一个列表，标识每个索引的状态：
-    - 1 表示 series_a 上穿 series_b
-    - -1 表示 series_a 下穿 series_b
-    - 0 表示不相交
-    """
+    """判断series_a对series_b的上穿、下穿或不相交状态。
+    返回: [1: 上穿, -1: 下穿, 0: 不相交]"""
     if len(series_a) != len(series_b):
-        raise ValueError("两个 Series 必须等长")
-
-    status = []
+        raise ValueError("两个Series必须等长")
+    status = [0]  # 第一个位置无前值
     for i in range(1, len(series_a)):
-        if series_a.iloc[i-1] < series_b.iloc[i-1] and series_a.iloc[i] > series_b.iloc[i]:
-            status.append(1)  # series_a 上穿 series_b
-        elif series_a.iloc[i-1] > series_b.iloc[i-1] and series_a.iloc[i] < series_b.iloc[i]:
-            status.append(-1)  # series_a 下穿 series_b
+        if series_a.iloc[i-1] <= series_b.iloc[i-1] and series_a.iloc[i] > series_b.iloc[i]:
+            status.append(1)  # 上穿
+        elif series_a.iloc[i-1] >= series_b.iloc[i-1] and series_a.iloc[i] < series_b.iloc[i]:
+            status.append(-1)  # 下穿
         else:
             status.append(0)  # 不相交
-
-    # 在第一个索引位置填充 0，因为没有前一个值进行比较
-    status.insert(0, 0)
-
     return status
 
 def RD(N,D=3):   
@@ -371,7 +355,7 @@ def KDJ(close: pd.Series, high: pd.Series, low: pd.Series, N=15, M1=5, M2=5) -> 
         M2 (int): D 的平滑周期
 
     Returns:
-        pd.DataFrame: 包含 K, D, J 的 DataFrame
+        tuple: (K, D, J)
     """
     low_min = low.rolling(window=N).min()
     high_max = high.rolling(window=N).max()
@@ -382,7 +366,68 @@ def KDJ(close: pd.Series, high: pd.Series, low: pd.Series, N=15, M1=5, M2=5) -> 
     D = SMA(K,M2)
     J = 3 * K - 2 * D
     
-    return pd.DataFrame({'K': K, 'D': D, 'J': J})
+    return K, D, J
+
+def MACD(close: pd.Series, fast_period=12, slow_period=26, signal_period=9):
+    """
+    计算MACD的DIF和DEA
+
+    Args:
+        close (pd.Series): 收盘价序列
+        fast_period (int): 快速移动平均线的周期
+        slow_period (int): 慢速移动平均线的周期
+        signal_period (int): 信号线的周期
+
+    Returns:
+        tuple: (DIF, DEA)
+    """
+    ema_fast = close.ewm(span=fast_period, adjust=False).mean()
+    ema_slow = close.ewm(span=slow_period, adjust=False).mean()
+    dif = ema_fast - ema_slow
+    dea = dif.ewm(span=signal_period, adjust=False).mean()
+    return dif, dea
+
+def detect_divergence(indicator_a: pd.Series, indicator_b: pd.Series, price: pd.Series, 
+                      golden_crosses: list = None, dead_crosses: list = None) -> pd.Series:
+    """通用背离检测函数，接受预计算的交叉点"""
+    divergence = pd.Series(0, index=price.index)
+    idxs = price.index.to_list()
+
+    # 获取交叉状态并提取金叉和死叉索引
+    if golden_crosses is None or dead_crosses is None:
+        crossover = crossover_status(indicator_a, indicator_b)
+        golden_crosses = [i for i, c in enumerate(crossover) if c == 1]  # 金叉索引
+        dead_crosses = [i for i, c in enumerate(crossover) if c == -1]  # 死叉索引
+
+    # 顶背离检测
+    for i in range(1, len(dead_crosses)):
+        last_dc, prev_dc = dead_crosses[-i], dead_crosses[-i-1]
+        gc = next((g for g in reversed(golden_crosses) if prev_dc < g < last_dc), None)
+        if gc:
+            max_price_curr = price.iloc[gc:last_dc+1].max()
+            max_a_curr = indicator_a.iloc[gc:last_dc+1].max()
+            prev_gc = next((g for g in reversed(golden_crosses) if g < prev_dc), None)
+            if prev_gc:
+                max_price_prev = price.iloc[prev_gc:prev_dc+1].max()
+                max_a_prev = indicator_a.iloc[prev_gc:prev_dc+1].max()
+                if max_price_curr > max_price_prev and max_a_curr < max_a_prev:
+                    divergence.loc[idxs[last_dc]] = 1  # 标记顶背离
+
+    # 底背离检测
+    for i in range(1, len(golden_crosses)):
+        last_gc, prev_gc = golden_crosses[-i], golden_crosses[-i-1]
+        dc = next((d for d in reversed(dead_crosses) if prev_gc < d < last_gc), None)
+        if dc:
+            min_price_curr = price.iloc[dc:last_gc+1].min()
+            min_a_curr = indicator_a.iloc[dc:last_gc+1].min()
+            prev_dc = next((d for d in reversed(dead_crosses) if d < prev_gc), None)
+            if prev_dc:
+                min_price_prev = price.iloc[prev_dc:prev_gc+1].min()
+                min_a_prev = indicator_a.iloc[prev_dc:prev_gc+1].min()
+                if min_price_curr < min_price_prev and min_a_curr > min_a_prev:
+                    divergence.loc[idxs[last_gc]] = -1  # 标记底背离
+
+    return divergence
 
 def siegelslopes_ma(price_ser: Union[pd.Series, np.ndarray],method:str="hierarchical") -> float:
     """Repeated Median (Siegel 1982)
@@ -437,7 +482,7 @@ def calc_momentum(close: pd.Series, N=21, method='linear'):
     return score
 
 if __name__ == "__main__":
-    code = 'SH.000922'
+    code = 'SH.510880'
     
     df = kline(code)
 
@@ -447,5 +492,7 @@ if __name__ == "__main__":
 
     print(RSI(close))
     print(AO(high,low))
-    print(KDJ(close,high,low,))
+    print(KDJ(close,high,low))
     print(calc_momentum(close))
+    dif,dea = MACD(close)
+    print(detect_divergence(dif,dea,close).tail(60))

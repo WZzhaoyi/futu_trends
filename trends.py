@@ -100,91 +100,101 @@ def is_reverse(code:str, df:pd.DataFrame|None, config:configparser.ConfigParser)
         msg += u'🚨'
     return None if msg == '' else msg
 
-def is_continue(high, low)->str|None:# 取倒数5根AO柱 近3根趋势与之前相反
-    ao = AO(high, low)
-    if len(ao) < 5:
-        return None
+def is_continue(data:pd.DataFrame)->str|None:# 检查macd趋势延续/背离
+    assert len(data) >= 40
+    # 计算MACD
+    dif, dea = MACD(data['close'], 12, 26, 9)
+    data['DIF'] = dif
+    data['DEA'] = dea
+    data['Signal_Output'] = 0  # 趋势信号: 1上升, -1下降, 0无信号
     
-    # 使用 round_decimal 处理 AO 中的每个元素
-    last_five = [round_decimal(x) for x in ao[-5:]]
-    
-    [a1, a2, a3, a4, a5] = last_five  # 解包最后五个元素以便于比较
+    # 获取交叉状态
+    crossover = crossover_status(data['DIF'], data['DEA'])
+    golden_crosses = [i for i, c in enumerate(crossover) if c == 1]  # 金叉索引
+    dead_crosses = [i for i, c in enumerate(crossover) if c == -1]  # 死叉索引
+    idxs = data.index.tolist()
 
-    if a3 < a4 < a5 and a1 > a2 < a3 and a3 < 0:
-        return '上涨可能延续'
-    if a3 > a4 > a5 and a1 < a2 > a3 and a3 > 0:
-        return '下跌可能延续'
+    # 趋势延续信号
+    for gc in golden_crosses:
+        prev_dc = next((dc for dc in reversed(dead_crosses) if dc < gc), None)
+        if prev_dc and data['DEA'].iloc[prev_dc:gc+1].min() > 0:
+            data.loc[idxs[gc], 'Signal_Output'] = 1  # 上升趋势延续
+
+    for dc in dead_crosses:
+        prev_gc = next((gc for gc in reversed(golden_crosses) if gc < dc), None)
+        if prev_gc and data['DEA'].iloc[prev_gc:dc+1].max() < 0:
+            data.loc[idxs[dc], 'Signal_Output'] = -1  # 下降趋势延续
     
+    # 背离检测
+    divergence = detect_divergence(data['DIF'], data['DEA'], data['close'], golden_crosses, dead_crosses)
+    
+    # 检查最后一行
+    last_row_idx = data.index[-1]
+    continuation = data.loc[last_row_idx, 'Signal_Output']
+    div_value = divergence.iloc[-1]
+    
+    msg = ''
+    if continuation == 1:
+        msg += '上升趋势延续'
+    if continuation == -1:
+        msg += '下降趋势延续'
+    if div_value == 1:
+        msg += '顶背离🚨'
+    if div_value == -1:
+        msg += '底背离🚨'
+    
+    return None if msg == '' else msg
+
+def is_breakout(high, low, close, N:int=10)->str|None:# 最近一根K线突破/跌破均线
+    close_ema = EMA(close, N)
+    last_close = round_decimal(close.iloc[-1])
+    last_ema = round_decimal(close_ema[-1])
+    prev_close = round_decimal(close.iloc[-2])
+    prev_ema = round_decimal(close_ema[-2])
+    if last_close > last_ema and prev_close <= prev_ema:
+        return f'突破ema{N}'
+    if last_close < last_ema and prev_close >= prev_ema:
+        return f'跌破ema{N}'
     return None
 
-def is_breakout(high, low, close, N:int=5)->str|None:# 最近一根K线突破/跌破均线
-    high_ema = EMA(high, N)
-    low_ema = EMA(low, N)
-    last_index = len(close) - 1
-    prev_index = last_index - 1
-    last_close = round_decimal(close.iloc[last_index])
-    prev_close = round_decimal(close.iloc[prev_index])
-    last_high_ema = round_decimal(high_ema[last_index])
-    last_low_ema = round_decimal(low_ema[last_index])
-    points = np.array([last_close,high.iloc[last_index],low.iloc[last_index]])
-    if ((last_low_ema<=points) & (points<=last_high_ema)).any():
-        return '触及均线'
-    if last_close > last_high_ema and prev_close <= round_decimal(high_ema[prev_index]):
-        return '突破均线'
-    if last_close < last_low_ema and prev_close >= round_decimal(low_ema[prev_index]):
-        return '跌破均线'
-    return None
+def is_top_down(data:pd.DataFrame) -> str|None:# 判别 KDJ 指标的顶部和底部信号
+    assert len(data) >= 40
+    # 计算KDJ
+    k,d,j = KDJ(data['close'], data['high'], data['low'])
+    data['K'] = k
+    data['D'] = d
+    data['J'] = j
+    
+    # 获取K和D的交叉状态
+    crossover = crossover_status(data['K'], data['D'])
+    golden_crosses = [i for i, c in enumerate(crossover) if c == 1]  # 金叉索引
+    dead_crosses = [i for i, c in enumerate(crossover) if c == -1]  # 死叉索引
+    
+    j_values = data['J']
+    d_values = data['D']
+    msg = str(round_decimal(d_values.iloc[-1],1))
 
-def is_top_down(high, low, close) -> str|None:# 判别 KDJ 指标的顶部和底部信号
-    kdj_df = KDJ(close, high, low)
-
-    assert len(kdj_df) >= 40
-
-    j_values = kdj_df['J']  # 获取最后周期的 J 值
-    d_values = kdj_df['D']  # 获取最后周期的 D 值
-    last_j = round_decimal(j_values.iloc[-1],1)  # 获取最后一个 J 值
-    msg = u'🚨'+str(last_j) if last_j>100 or last_j<0 else str(last_j)
-
-    # # 顶部信号
-    # if all(j > 100 for j in j_values[-2:]) and j_values.iloc[-4] <= 100:
-    #     msg += f'顶部'
-    # # 底部信号
-    # elif all(j < 0 for j in j_values[-2:]) and j_values.iloc[-4] >= 0:
-    #     msg += f'底部'
-    # 顶消失信号
-    if last_j <= 100 and all(j > 100 for j in j_values[-4:-2]):
-        msg += f'顶消失'
+    if j_values.iloc[-1] <= 100 and all(j > 100 for j in j_values[-4:-2]):
+        msg += f'顶消失🚨'
     # 底消失信号
-    elif last_j >= 0 and all(j < 0 for j in j_values[-4:-2]):
-        msg += f'底消失'
-
-    # 使用 crossover_status 判断 J 和 D 的交叉情况
-    crossover_results = crossover_status(j_values, d_values)
-    # 遍历 crossover_results 判断底背离和顶背离
-    for i in range(1, len(crossover_results)-1):
-        if crossover_results[-i] == 1:  # J 上穿 D
-            for j in range(i + 1, len(crossover_results)):
-                if crossover_results[-j] == 1:  # 上一次 J 上穿 D
-                    bd = (d_values.iloc[-i] > d_values.iloc[-j]) and (low.iloc[-i] < low.iloc[-j])
-                    if bd:
-                        msg += '底背离'
-                break
-            break  # 找到后退出内层循环
-        elif crossover_results[-i] == -1:  # D 上穿 J
-            for j in range(i + 1, len(crossover_results)):
-                if crossover_results[-j] == -1:  # 上一次 D 上穿 J
-                    td = (d_values.iloc[-i] < d_values.iloc[-j]) and (high.iloc[-i] > high.iloc[-j])
-                    if td:
-                        msg += '顶背离'
-                break
-            break  # 找到后退出内层循环
+    elif j_values.iloc[-1] >= 0 and all(j < 0 for j in j_values[-4:-2]):
+        msg += f'底消失🚨'
     
-    if kdj_df['J'].iloc[-1] > kdj_df['J'].iloc[-2]:
+    if d_values.iloc[-1] > d_values.iloc[-2]:
         msg += '↑'
     else:
         msg += '↓'
     
-    return  msg
+    # 背离检测
+    divergence = detect_divergence(data['K'], data['D'], data['close'], golden_crosses, dead_crosses)
+    div_value = divergence.iloc[-1]
+    
+    if div_value == 1:
+        msg += '顶背离🚨'
+    if div_value == -1:
+        msg += '底背离🚨'
+
+    return msg
 
 def get_rank(high, low, close) -> float:  # 动量因子 r_squared：基于年化收益和判定系数打分
     # 计算动量因子
@@ -228,11 +238,11 @@ def check_trends(code_in_group, config: configparser.ConfigParser):
                     if rev is not None:
                         msg += rev
                 elif i.lower() == 'continue':
-                    co = is_continue(high,low) # 趋势延续
+                    co = is_continue(df) # 趋势延续
                     if co is not None:
                         msg += co
                 elif i.lower() == 'topdown':
-                    td = is_top_down(high,low,close) # 顶底结构
+                    td = is_top_down(df) # 顶底结构
                     if td is not None:
                         msg += td
             # 计算每个股票的动量因子并排序
