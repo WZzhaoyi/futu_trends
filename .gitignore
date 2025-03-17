@@ -143,4 +143,6 @@ cython_debug/
 data/
 output/
 log/
+sync/
+.vscode/
 config.ini

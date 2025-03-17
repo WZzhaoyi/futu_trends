@@ -8,7 +8,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from configparser import ConfigParser
 import pandas as pd
-from data import get_kline
+from data import get_kline_data
 from ft_config import get_config
 import json
 from datetime import datetime
@@ -17,6 +17,7 @@ from tools import code_in_futu_group
 def run_analysis(code_list:list[str], config:ConfigParser, output_dir='./output', data_dir='./data'):
     # 确保输出目录存在
     os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(data_dir, exist_ok=True)
     
     results = {}
     name_list = code_list['name']
@@ -25,7 +26,7 @@ def run_analysis(code_list:list[str], config:ConfigParser, output_dir='./output'
         print(f"\n---- Analyzing {name_list[idx]} ----\n")
         
         # 读取数据
-        df = get_kline(code, config, max_count=1000)
+        df = get_kline_data(code, config, max_count=1000)
         timestamp = datetime.now().strftime('%Y%m%d')
         file_name = f'data_{code.replace(".", "_")}_{timestamp}.csv'
         output_file = os.path.join(data_dir, file_name)

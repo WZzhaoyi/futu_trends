@@ -83,37 +83,6 @@ def yfinance_code_to_futu_code(yfinance_code: str) -> str:
     else:
         return '.'.join(reversed((yfinance_code).split('.')))
 
-def map_history_params(period=None, interval=None, start=None, end=None):
-    # 映射 period
-    futu_period_map = {
-        '1d': 1, '5d': 5, '1mo': 30, '3mo': 90, '6mo': 180, '1y': 365,
-        '2y': 730, '5y': 1825, '10y': 3650, 'ytd': None, 'max': None
-    }
-    
-    # 映射 interval
-    futu_interval_map = {
-        '1m': 'K_1M', '2m': 'K_3M', '5m': 'K_5M', '15m': 'K_15M',
-        '30m': 'K_30M', '60m': 'K_60M', '90m': 'K_60M', '1h': 'K_60M',
-        '1d': 'K_DAY', '5d': 'K_WEEK', '1wk': 'K_WEEK', '1mo': 'K_MON',
-        '3mo': 'K_QUARTER'
-    }
-
-    futu_params = {}
-
-    if period:
-        futu_params['max_count'] = futu_period_map.get(period)
-    
-    if interval:
-        futu_params['ktype'] = futu_interval_map.get(interval, 'K_DAY')
-    
-    if start:
-       futu_params['start'] = start.strftime('%Y-%m-%d')
-    
-    if end:
-        futu_params['end'] = end.strftime('%Y-%m-%d')
-
-    return futu_params 
-
 def map_futu_to_yfinance_params(ktype:ft.KLType=None, start:datetime=None, end:datetime=None, max_count=None):
     # 映射 ktype 到 interval
     yf_interval_map = {
