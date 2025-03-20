@@ -10,6 +10,8 @@ import numpy as np
 from telegram_engine import TelegramBotEngine
 from email_engine import EmailEngine
 from decimal import Decimal, ROUND_HALF_UP
+from typing import Dict, Any
+import sqlite3
 
 def round_decimal(value, places=2):
     """
@@ -33,38 +35,39 @@ def inside_MA(close, last_low, last_high): # 计算MA5,10,15中的最小值和�
     else:
         return True
 
-def is_reverse(code:str, df:pd.DataFrame|None, config:configparser.ConfigParser)->str|None:
-    """
-    检查是否出现反转信号
-    
-    Args:
-        code: 股票代码
-        df: 股票数据
-        config: 配置对象
-    
-    Returns:
-        str|None: 返回反转信号描述或None
-    """
+def is_reverse(code: str, df: pd.DataFrame | None, config: configparser.ConfigParser) -> str | None:
+    """检查是否出现反转信号"""
     assert len(df) >= 90
     
-    # 从配置中获取参数文件路径
-    params_file = config.get("CONFIG", "KD_PARAMS", fallback=None)
-    if not params_file or not os.path.exists(params_file):
-        raise(f"Warning: KD parameters file not found at {params_file}")
-    
-    # 读取JSON文件
-    with open(params_file, 'r') as f:
-        all_params = json.load(f)
-        
-    # 获取特定代码的参数
-    if code not in all_params:
-        print(f"Warning: No parameters found for {code}")
-        return 'No parameters'
-        
-    code_params = all_params[code]
-    
-    # 提取参数
-    params = code_params['best_params']
+    # 获取参数 - 优先从数据库读取，失败则从JSON读取
+    try:
+        db_path = config.get("CONFIG", "KD_PARAMS_DB", fallback=None)
+        if db_path and os.path.exists(db_path):
+            with sqlite3.connect(db_path) as conn:
+                result = conn.execute("""
+                    SELECT best_params FROM stock_params WHERE stock_code = ?
+                """, (code,)).fetchone()
+                
+                if result:
+                    params = json.loads(result[0])
+                else:
+                    # 回退到JSON文件
+                    params_file = config.get("CONFIG", "KD_PARAMS")
+                    with open(params_file, 'r') as f:
+                        params = json.load(f).get(code, {}).get('best_params')
+        else:
+            # 直接读取JSON文件
+            params_file = config.get("CONFIG", "KD_PARAMS")
+            with open(params_file, 'r') as f:
+                params = json.load(f).get(code, {}).get('best_params')
+                
+        if not params:
+            print(f"No parameters found for {code}")
+            return 'No parameters'
+            
+    except Exception as e:
+        print(f"Error reading parameters for {code}: {str(e)}")
+        return 'Parameter error'
     
     # 使用参数进行信号检测
     result = detect_stochastic_signals_vectorized(
@@ -82,21 +85,14 @@ def is_reverse(code:str, df:pd.DataFrame|None, config:configparser.ConfigParser)
     
     # 获取最后一行的信号
     last_row = result.iloc[-1]
-    # 处理 last_row['reversal'] 的两种情况
-    reversal_value = last_row['reversal']
-    strong_value = last_row['is_strong']
-        
-    # 确保 reversal_value 是字符串
-    if isinstance(reversal_value, pd.Series):
-        reversal_value = reversal_value.item()  # 提取单个值
-    if isinstance(strong_value, pd.Series):
-        strong_value = strong_value.item()  # 提取单个值
+    reversal =  last_row['reversal']
+    is_strong =  last_row['is_strong']
     
     # 检查是否有反转信号
     msg = ''
-    if reversal_value != 'none':
-        msg += reversal_value
-    if strong_value == 1:
+    if reversal != 'none':
+        msg += reversal
+    if is_strong == 1:
         msg += u'🚨'
     return None if msg == '' else msg
 
