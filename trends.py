@@ -1,7 +1,7 @@
 import json
 import os
 from ft_config import get_config
-from data import get_kline
+from data import get_kline_data
 from signal_analysis import detect_stochastic_signals_vectorized
 from tools import *
 import datetime
@@ -203,7 +203,7 @@ def check_trends(code_in_group, config: configparser.ConfigParser):
         name_list = code_in_group['name']
         trends_with_rank = []
         for idx, futu_code in enumerate(code_in_group['code'].values):
-            df = get_kline(futu_code, config)  # 获取 DataFrame
+            df = get_kline_data(futu_code, config)
 
             # 添加对 df 的检查
             if df is None:
