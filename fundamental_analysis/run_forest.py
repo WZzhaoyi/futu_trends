@@ -1,47 +1,23 @@
+import glob
 import numpy as np
 import pandas as pd
 import seaborn as sns
 import talib as tb
-
-from utility import create_engine
-
+import os
+from datetime import datetime
 pd.core.common.is_list_like = pd.api.types.is_list_like
-from ft_config import get_config
 import xgboost
 from xgboost import XGBClassifier
 from matplotlib import pyplot as plt
 from sklearn.metrics import mean_squared_error
 from sklearn.metrics import accuracy_score
-from datetime import datetime
 from sklearn.model_selection import train_test_split
 from pprint import pprint
-# Libraries required by FeatureSelector()
 import lightgbm as lgb
 import gc
 from itertools import chain
-import glob
-import os
 
-os.environ["PATH"] += os.pathsep + "C:/Program Files/Graphviz/bin/"
-
-# 从配置文件获取路径
-config = get_config()
-ticker_list_path = config.get("CONFIG", "TICKER_LIST_PATH")
-database_path = config.get("CONFIG", "TICKER_DATA_PATH")
-
-# 获取最新的 CSV 文件
-list_of_files = glob.glob(os.path.join(ticker_list_path, "stock_piotroski_list_*.csv"))
-latest_file = max(list_of_files, key=os.path.getctime)
-
-# 读取 CSV 文件获取目标列表
-df = pd.read_csv(latest_file)
-target_list = df['Ticker'].tolist()
-
-# --------------------------------------- GLOBAL PARAMETERS -------------------------------------------
-# Range of date to train and predict
-START = datetime(2020, 12, 23)
-END = datetime(2024, 2, 1)
-
+from .utility import create_engine
 
 # ------------------------------------------------ CLASSES --------------------------------------------
 class Data:
@@ -60,7 +36,7 @@ class Data:
         DataEngine = create_engine(self.db)
 
         df = pd.read_sql(f"select * from '{self.q}'", DataEngine.raw_connection())
-        df.columns = ['Date',  'Close', 'High', 'Low', 'Open', 'Adj Close', 'Volume']
+        df.columns = ['Date',  'Close', 'High', 'Low', 'Open', 'Volume']
         self.daily_data = df
 
     def technical_indicators_df(self):
@@ -277,14 +253,24 @@ class XGB_training:
         #plt.show()
 
         # plot tree
-        try:
-            ax = xgboost.plot_tree(self.best_xgb.get_booster(), num_trees=4)
-        except IndexError:
-            ax = xgboost.plot_tree(self.best_xgb.get_booster(), num_trees=3)
+        ax = self.plot_model_tree()
         fig = ax.figure
         fig.set_size_inches(8, 8)
         plt.savefig(f'{ticker}_tree.png', bbox_inches='tight')
         #plt.show()
+
+    def plot_model_tree(self):
+        booster = self.best_xgb.get_booster()
+        # 获取模型中实际的树的数量
+        n_trees = len(booster.get_dump())
+        
+        if n_trees > 0:
+            # 选择最后一棵或指定的树进行绘制
+            tree_idx = min(3, n_trees - 1)  # 默认选择第3棵树或最后一棵
+            ax = xgboost.plot_tree(booster, num_trees=tree_idx)
+            return ax
+        else:
+            raise ValueError("No trees available in the model")
 
 
 class FeatureSelector():
@@ -927,23 +913,48 @@ class FeatureSelector():
 
 
 # ----------------------------- MAIN PROGRAM ---------------------------------
-def main():
+def run_forest_analysis(
+    ticker_list_path: str,
+    database_path: str,
+    start_date: datetime,
+    end_date: datetime,
+    graphviz_path: str = "C:/Program Files/Graphviz/bin/",
+    output_dir: str = './output'
+) -> None:
     """
-    The main program
+    运行森林分析模型
+    
+    Args:
+        ticker_list_path (str): 股票列表CSV文件的完整路径
+        database_path (str): 数据库文件路径
+        start_date (datetime): 分析开始日期
+        end_date (datetime): 分析结束日期
+        graphviz_path (str): Graphviz安装路径，默认为"C:/Program Files/Graphviz/bin/"
+        output_dir (str): 输出文件保存目录，默认为'./output'
+    
+    Returns:
+        None
     """
-
+    # 确保输出目录存在
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 设置Graphviz环境变量
+    os.environ["PATH"] += os.pathsep + graphviz_path
+    
+    # 读取CSV文件获取目标列表
+    df = pd.read_csv(ticker_list_path)
+    target_list = df['Ticker'].tolist()
+    
     for ticker in target_list:
         print("\n")
-        print(
-            "##################### Gradient Boosting Classification by XGBoost on stock data ##########################")
+        print("##################### Gradient Boosting Classification by XGBoost on stock data ##########################")
         print("\n")
-        # Set the print canvas right
+        # 设置显示格式
         pd.set_option('display.float_format', lambda x: '%.2f' % x)
         pd.set_option('display.max_columns', 14)
         pd.set_option('display.width', 1600)
 
-        print(
-            "*********************************************  Data Preprocessing ***************************************")
+        print("*********************************************  Data Preprocessing ***************************************")
         print("\n")
         symbol = ticker
         stock_data = Data(symbol, database_path)
@@ -961,25 +972,18 @@ def main():
         print("\n")
 
         plot = Display(Xy, Xy_fs)
-        plot.features_histograms(symbol)
-        plot.plot_corr_heatmap(symbol)
-        plot.plot_corr_heatmap_fs(symbol)
+        plot.features_histograms(os.path.join(output_dir, f'{symbol}'))
+        plot.plot_corr_heatmap(os.path.join(output_dir, f'{symbol}'))
+        plot.plot_corr_heatmap_fs(os.path.join(output_dir, f'{symbol}'))
 
-        print(
-            "******************************************  Model training and tuning ************************************")
+        print("******************************************  Model training and tuning ************************************")
         print("\n")
 
-        # Training Decision Tree & Random Forest model to get the best model and its hyperparameters:
+        # 训练XGBoost模型
         xgb_clf = XGB_training(X_train, y_train, X_test, y_test)
-        xgb_clf.predict(symbol)
+        xgb_clf.predict(os.path.join(output_dir, symbol))
 
         print("\n")
-        print(
-            "All plots are saved with relevant filenames in the same folder as this program, feel free to review after this program ends.")
+        print(f"All plots are saved in the output directory: {output_dir}")
         print("\n")
-        print(
-            "#########################################   END OF PROGRAM   ##############################################")
-
-
-if __name__ == '__main__':
-    main()
+        print("#########################################   END OF PROGRAM   ##############################################")

@@ -16,8 +16,11 @@ from .utility import (
     nasdaq_100_generator,
     kc50_generator,
     a500_generator,
-    hstech_ticker_generator,
+    hktech_ticker_generator,
     hsi_ticker_generator,
+    ggt_generator,
+    hs300_generator,
+    zz500_generator,
     yfinance_to_tdx_ebk
 )
 
@@ -47,8 +50,11 @@ class StockAnalyzer:
             'nasdaq100': nasdaq_100_generator,
             'kc50': kc50_generator,
             'a500': a500_generator,
-            'hstech': hstech_ticker_generator,
-            'hsi': hsi_ticker_generator
+            'hstech': hktech_ticker_generator,
+            'hsi': hsi_ticker_generator,
+            'ggt': ggt_generator,
+            'hs300': hs300_generator,
+            'zz500': zz500_generator,
         }
         
         generators = []
@@ -121,6 +127,8 @@ class StockAnalyzer:
         
         logger.info(f"分析结果已保存到: {self.output_path}")
 
+        return stock_list_file, stock_piotroski_file
+
     def run_analysis(self):
         """运行完整的分析流程"""
         # 步骤1: ROE过滤
@@ -131,10 +139,10 @@ class StockAnalyzer:
         stock_piotroski_list = self.piotroski_score_filter(stock_watch_list)
         
         # 保存结果
-        self.save_results(stock_watch_list, stock_piotroski_list)
+        stock_list_file, stock_piotroski_file = self.save_results(stock_watch_list, stock_piotroski_list)
         
         logger.info(f"最终目标股票及其评分: {stock_piotroski_list}")
-        return stock_piotroski_list
+        return stock_piotroski_list, stock_list_file, stock_piotroski_file
 
 """
 Rank from lowest score to highest score for further analysis: 
