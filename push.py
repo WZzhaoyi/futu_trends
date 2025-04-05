@@ -5,7 +5,7 @@ import time
 import futu as ft
 import pandas as pd
 from ft_config import get_config
-from telegram_engine import TelegramBotEngine
+from notification_engine import NotificationEngine
 
 from tools import codeInFutuGroup, get_kline_seconds
 from trends import checkTrends
@@ -38,14 +38,14 @@ class CurKlineCallback(ft.CurKlineHandlerBase):
 
 def create_callback(config: configparser.ConfigParser):
     def send_message(data):
-        telebot = TelegramBotEngine(config)
+        notification = NotificationEngine(config)
         trends = checkTrends(data, config)
         
         if len(trends) >= 1:
             current_time = datetime.datetime.now()
             message = '{}:\n{}'.format(current_time.strftime('%Y-%m-%d %H:%M:%S'), '\n'.join(trends))
             print(message)
-            telebot.send_telegram_message(message, 'https://www.futunn.com/')
+            notification.send_telegram_message(message, 'https://www.futunn.com/')
         return ft.RET_OK, data
     return send_message
 

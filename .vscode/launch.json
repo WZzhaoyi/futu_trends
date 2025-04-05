@@ -13,12 +13,12 @@
             "args": ["--config","./env/tkdj_us.ini"]
         },
         {
-            "name": "tkdj_cn",
+            "name": "params_db",
             "type": "debugpy",
             "request": "launch",
-            "program": "./trends.py",
+            "program": "./params_db.py",
             "console": "integratedTerminal",
-            "args": ["--config","./env/tkdj_cn.ini"]
+            "args": ["--db","./sync/kd_params.db", "--params","./output/detect_202502/analysis_params_20250225.json"]
         },
         {
             "name": "alpha_filters",
@@ -34,7 +34,7 @@
             "request": "launch",
             "program": "./detect.py",
             "console": "integratedTerminal",
-            "args": ["--config","./env/signal_cn.ini"]
+            "args": ["--config","./env/kd_next.ini"]
         },
         {
             "name": "reverse",

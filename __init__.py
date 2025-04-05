@@ -1,4 +1,4 @@
-#  Futu Telegram Bot
+#  Futu Trends
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -12,11 +12,10 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
-#  Written by Joey <wzzhaoyi@outlook.com>, 2023
+#  Written by Joey <wzzhaoyi@outlook.com>, 2025
 #  Copyright (c)  Joey - All Rights Reserved
 
-from .telegram_engine import TelegramBotEngine
-from .email_engine import EmailEngine
+from .notification_engine import *
 from .tools import *
 from .data import *
 from .ft_config import *

@@ -6,12 +6,10 @@ from signal_analysis import detect_stochastic_signals_vectorized
 from tools import *
 import datetime
 import configparser
-import numpy as np
-from telegram_engine import TelegramBotEngine
-from email_engine import EmailEngine
+from notification_engine import NotificationEngine
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Dict, Any
 import sqlite3
+import pandas as pd
 
 def round_decimal(value, places=2):
     """
@@ -192,78 +190,89 @@ def is_top_down(data:pd.DataFrame) -> str|None:# 判别 KDJ 指标的顶部和�
 
     return msg
 
-def get_rank(high, low, close) -> float:  # 动量因子 r_squared：基于年化收益和判定系数打分
-    # 计算动量因子
-    return calc_momentum(close)
-
 def check_trends(code_in_group, config: configparser.ConfigParser):
-    trends = []
+    """
+    检查股票趋势并返回DataFrame格式的结果
+    返回的DataFrame包含以下列：
+    - name: 股票名称
+    - msg: 趋势信息
+    - momentum: 动量因子值
+    """
     trend_type = config.get("CONFIG", "TREND_TYPE").split(',')
-    if code_in_group.size and len(trend_type):
-        name_list = code_in_group['name']
-        trends_with_rank = []
-        for idx, futu_code in enumerate(code_in_group['code'].values):
-            df = get_kline_data(futu_code, config)
+    if not (code_in_group.size and len(trend_type)):
+        return pd.DataFrame(columns=['name', 'msg', 'momentum'])
+        
+    results = []
+    for idx, futu_code in enumerate(code_in_group['code'].values):
+        df = get_kline_data(futu_code, config)
 
-            # 添加对 df 的检查
-            if df is None:
-                print(f"Warning: Failed to get data for {futu_code}")
-                continue
-                
-            if len(df) == 0:
-                print(f"Warning: Empty data for {futu_code}")
-                continue
+        # 添加对 df 的检查
+        if df is None:
+            print(f"Warning: Failed to get data for {futu_code}")
+            continue
+            
+        if len(df) == 0:
+            print(f"Warning: Empty data for {futu_code}")
+            continue
 
-            high = pd.Series(df['high'].values.ravel())  # 从 DataFrame 中提取 high 列并转换为 pd.Series
-            low = pd.Series(df['low'].values.ravel())    # 从 DataFrame 中提取 low 列并转换为 pd.Series
-            close = pd.Series(df['close'].values.ravel())  # 从 DataFrame 中提取 close 列并转换为 pd.Series
-            name = name_list[idx]
+        high = pd.Series(df['high'].values.ravel())
+        low = pd.Series(df['low'].values.ravel())
+        close = pd.Series(df['close'].values.ravel())
+        name = code_in_group['name'].iloc[idx]
 
-            if len(high) == 0 or len(low) == 0 or len(close) == 0:
-                print(f"Warning: No data for {futu_code}")
-                continue
+        if len(high) == 0 or len(low) == 0 or len(close) == 0:
+            print(f"Warning: No data for {futu_code}")
+            continue
 
-            msg = '{} {} '.format(futu_code, name)
-            for i in trend_type:
-                if i.lower() == 'breakout':
-                    bo = is_breakout(high,low,close) # 突破/跌破EMA均线
-                    if bo is not None:
-                        msg += bo
-                elif i.lower() == 'reverse':
-                    rev = is_reverse(futu_code,df,config) # 趋势反转
-                    if rev is not None:
-                        msg += rev
-                elif i.lower() == 'continue':
-                    co = is_continue(df) # 趋势延续
-                    if co is not None:
-                        msg += co
-                elif i.lower() == 'topdown':
-                    td = is_top_down(df) # 顶底结构
-                    if td is not None:
-                        msg += td
-            # 计算每个股票的动量因子并排序
-            trends_with_rank.append([msg, get_rank(high, low, close)])         
-        trends_with_rank.sort(key=lambda x: x[1], reverse=True)  # 根据动量因子排序
-        trends = [trend[0] for trend in trends_with_rank]  # 返回排序后的趋势列表
-
-    return trends
+        msg = '{} {} '.format(futu_code, name)
+        for i in trend_type:
+            if i.lower() == 'breakout':
+                bo = is_breakout(high,low,close) # 突破/跌破EMA均线
+                if bo is not None:
+                    msg += bo
+            elif i.lower() == 'reverse':
+                rev = is_reverse(futu_code,df,config) # 趋势反转
+                if rev is not None:
+                    msg += rev
+            elif i.lower() == 'continue':
+                co = is_continue(df) # 趋势延续
+                if co is not None:
+                    msg += co
+            elif i.lower() == 'topdown':
+                td = is_top_down(df) # 顶底结构
+                if td is not None:
+                    msg += td
+        
+        # 计算动量因子
+        momentum = calc_momentum(close)
+        
+        # 添加到结果列表
+        results.append({
+            'futu_code': futu_code,
+            'name': name,
+            'msg': msg,
+            'momentum': momentum
+        })
+    
+    # 创建DataFrame并按动量因子排序
+    if results:
+        result_df = pd.DataFrame(results)
+        result_df.set_index('futu_code', inplace=True)
+        result_df.sort_values('momentum', ascending=False, inplace=True)
+        return result_df
+    else:
+        return pd.DataFrame(columns=['name', 'msg', 'momentum'])
 
 if __name__ == "__main__":
     config = get_config()
     host = config.get("CONFIG", "FUTU_HOST")
     port = int(config.get("CONFIG", "FUTU_PORT"))
     group = config.get("CONFIG", "FUTU_GROUP")
-    telegram = config.get("CONFIG", "TELEGRAM_BOT_TOKEN")
-    emails = config.get("CONFIG", "EMAIL_SUBSCRIBTION").split(',')
 
     ls = code_in_futu_group(group,host,port)
-    trends = check_trends(ls,config)
-    
-    if telegram:
-        telebot = TelegramBotEngine(config)
-        telebot.send_telegram_message('{} {}:\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group, '\n'.join(trends)),'https://www.futunn.com/')
+    trends_df = check_trends(ls,config)
 
-    if emails[0]:
-        emailWorker = EmailEngine(config)
-        for address in emails:
-            emailWorker.send_email(address,group,'<p>{} {}:<br>{}</p>'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group, '<br>'.join(trends)))
+    notification = NotificationEngine(config)
+    notification.send_futu_message(trends_df.index.tolist(),trends_df['msg'].tolist())
+    notification.send_telegram_message('{} {}:\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group, '\n'.join(trends_df['msg'])),'https://www.futunn.com/')
+    notification.send_email(group,'<p>{} {}:<br>{}</p>'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group, '<br>'.join(trends_df['msg'])))
