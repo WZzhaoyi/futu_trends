@@ -5,12 +5,12 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "tkdj_us",
+            "name": "scheduler",
             "type": "debugpy",
             "request": "launch",
-            "program": "./trends.py",
+            "program": "./scheduler.py",
             "console": "integratedTerminal",
-            "args": ["--config","./env/tkdj_us.ini"]
+            "args": ["--config-dir","./env"]
         },
         {
             "name": "params_db",
