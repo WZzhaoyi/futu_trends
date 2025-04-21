@@ -252,8 +252,8 @@ def is_balance(data: pd.DataFrame, M: int = 3, N: int = 5) -> str | None: # 量�
         msg += '成交量反转🚨'
     
     # 检测量价失衡
-    if (last_row['entity_change'] < 0 and 
-        last_row['volume'] - prev_row['volume'] > 0 and 
+    if (last_row['entity_change'] < -0.4 and 
+        last_row['vol_change'] > -0.1 and 
         last_row['trend']):
         msg += '量价失衡🚨'
     
