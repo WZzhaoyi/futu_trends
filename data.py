@@ -140,6 +140,8 @@ def fetch_futu_data(code: str, ktype: str, max_count: int, config: configparser.
         
         # 确保获取最近的数据
         df = df.sort_index().tail(request_count)
+
+        sleep(0.5)
         
         return df
     finally:

@@ -106,9 +106,8 @@ def is_continue(data:pd.DataFrame)->str|None:# 检查macd趋势延续/低位金�
     golden_crosses = [i for i, c in enumerate(crossover) if c == 1]  # 金叉索引
     dead_crosses = [i for i, c in enumerate(crossover) if c == -1]  # 死叉索引
     
-    # 初始化信号
     msg = ''
-    last_row_pos = len(data) - 1  # 最后一行的位置（从0开始）
+    last_row_pos = len(data) - 1
     
     # 检测趋势延续信号
     if golden_crosses and golden_crosses[-1] == last_row_pos and len(golden_crosses) > 1:
@@ -169,19 +168,13 @@ def is_top_down(data:pd.DataFrame) -> str|None:# KDJ顶部和底部信号/背离
     data['J'] = j
     
     j_values = data['J']
-    d_values = data['D']
-    msg = str(round_decimal(d_values.iloc[-1],1))
+    msg = ''
 
     if j_values.iloc[-1] <= 100 and all(j > 100 for j in j_values[-4:-2]):
         msg += f'顶消失'
     # 底消失信号
     elif j_values.iloc[-1] >= 0 and all(j < 0 for j in j_values[-4:-2]):
         msg += f'底消失'
-    
-    if d_values.iloc[-1] > d_values.iloc[-2]:
-        msg += '↑'
-    else:
-        msg += '↓'
     
     # 背离检测
     # KDJ背离
@@ -207,7 +200,7 @@ def is_top_down(data:pd.DataFrame) -> str|None:# KDJ顶部和底部信号/背离
     if kdj_div_value == -1 or macd_div_value == -1:
         msg += '底背离🚨'
 
-    return msg
+    return None if msg == '' else msg
 
 def is_balance(data: pd.DataFrame, M: int = 3, N: int = 5) -> str | None: # 量价关系平衡
     assert len(data) >= max(M*6, N*6)
@@ -300,42 +293,62 @@ def check_trends(code_in_group, config: configparser.ConfigParser):
             print(f"Warning: No data for {futu_code}")
             continue
 
-        msg = '{} {} '.format(futu_code, name)
+        msg = f'{futu_code} {name}'
         for i in trend_type:
             if i.lower() == 'breakout':
                 bo = is_breakout(high,low,close) # 突破/跌破EMA均线
                 if bo is not None:
-                    msg += bo
+                    msg += f' | {bo}'
             elif i.lower() == 'reverse':
                 rev = is_reverse(futu_code,df,config) # 趋势反转
                 if rev is not None:
-                    msg += rev
+                    msg += f' | {rev}'
             elif i.lower() == 'continue':
                 co = is_continue(df) # 趋势延续
                 if co is not None:
-                    msg += co
+                    msg += f' | {co}'
             elif i.lower() == 'topdown':
                 td = is_top_down(df) # 顶底结构
                 if td is not None:
-                    msg += td
+                    msg += f' | {td}'
             elif i.lower() == 'balance':
                 bal = is_balance(df) # 量价关系平衡
                 if bal is not None:
-                    msg += bal
+                    msg += f' | {bal}'
         
         # 计算动量因子
         momentum = calc_momentum(close)
+        
+        # 获取最后两个动量值，用于判断方向
+        last_momentum = momentum.iloc[-1]
+        prev_momentum = momentum.iloc[-2]
+        msg += f' | {last_momentum:.3f}'
+
+        if last_momentum > prev_momentum:
+            msg += f'↑'
+        elif last_momentum < prev_momentum:
+            msg += f'↓'
+        else:
+            msg += f'→'
         
         # 添加到结果列表
         results.append({
             'futu_code': futu_code,
             'name': name,
             'msg': msg,
-            'momentum': momentum
+            'momentum': last_momentum
         })
     
     # 创建DataFrame并按动量因子排序
     if results:
+        # 添加一行动量值为0的记录作为0轴指示
+        results.append({
+            'futu_code': 'ZERO_AXIS',
+            'name': '动量0轴',
+            'msg': '━━━━━━━━动量0轴━━━━━━━━',
+            'momentum': 0.000
+        })
+        
         result_df = pd.DataFrame(results)
         result_df.set_index('futu_code', inplace=True)
         result_df.sort_values('momentum', ascending=False, inplace=True)
