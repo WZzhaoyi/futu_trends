@@ -128,7 +128,8 @@ def create_trend_task(config: Dict[str, Any]) -> Callable[[], Optional[pd.DataFr
             # 获取配置
             futu_group = config['futu_group']
             futu_host = config['raw_config'].get('CONFIG', 'FUTU_HOST', fallback='127.0.0.1')
-            futu_port = int(config['raw_config'].get('CONFIG', 'FUTU_PORT', fallback='11111'))           
+            futu_port = int(config['raw_config'].get('CONFIG', 'FUTU_PORT', fallback='11111'))
+            futu_push_type = config['futu_push_type']
             
             # 获取自选股列表
             ls = code_in_futu_group(futu_group, futu_host, futu_port)
@@ -146,18 +147,20 @@ def create_trend_task(config: Dict[str, Any]) -> Callable[[], Optional[pd.DataFr
             notification = NotificationEngine(config['raw_config'])
             notification.send_futu_message(trends_df.index.tolist(), trends_df['msg'].tolist())
             notification.send_telegram_message(
-                '{} {}:\n{}'.format(
+                '{} {} {}:\n{}'.format(
                     datetime.now().strftime('%Y-%m-%d'),
                     futu_group,
+                    futu_push_type,
                     '\n'.join(trends_df['msg'])
                 ),
                 'https://www.futunn.com/'
             )
             notification.send_email(
                 futu_group,
-                '<p>{} {}:<br>{}</p>'.format(
+                '<p>{} {} {}:\n{}</p>'.format(
                     datetime.now().strftime('%Y-%m-%d'),
                     futu_group,
+                    futu_push_type,
                     '<br>'.join(trends_df['msg'])
                 )
             )

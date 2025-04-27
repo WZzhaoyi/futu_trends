@@ -132,15 +132,15 @@ def is_continue(data:pd.DataFrame)->str|None:# 检查macd趋势延续/低位金�
     
     # 检测低位金叉和高位死叉
     if golden_crosses and golden_crosses[-1] == last_row_pos:
-        dif_high_threshold = data['DIF'].quantile(0.4)
-        dea_high_threshold = data['DEA'].quantile(0.4)
+        dif_high_threshold = data['DIF'].quantile(0.2)
+        dea_high_threshold = data['DEA'].quantile(0.2)
         
         if data['DIF'].iloc[last_row_pos] <= dif_high_threshold and data['DEA'].iloc[last_row_pos] <= dea_high_threshold:
             msg += '低位金叉🚨'
     
     if dead_crosses and dead_crosses[-1] == last_row_pos:
-        dif_low_threshold = data['DIF'].quantile(0.6)
-        dea_low_threshold = data['DEA'].quantile(0.6)
+        dif_low_threshold = data['DIF'].quantile(0.8)
+        dea_low_threshold = data['DEA'].quantile(0.8)
         
         if data['DIF'].iloc[last_row_pos] >= dif_low_threshold and data['DEA'].iloc[last_row_pos] >= dea_low_threshold:
             msg += '高位死叉🚨'
@@ -219,18 +219,9 @@ def is_balance(data: pd.DataFrame, M: int = 3, N: int = 5) -> str | None: # 量�
     data['ma_mid'] = MA(data['close'], N*2)  # 中期均线
     data['ma_long'] = MA(data['close'], N*3)  # 长期均线
     
-    # 均线斜率
-    data['ma_short_slope'] = (data['ma_short'] - data['ma_short'].shift(1)) / data['ma_short'].shift(1)
-    data['ma_mid_slope'] = (data['ma_mid'] - data['ma_mid'].shift(1)) / data['ma_mid'].shift(1)
-    
     # 判断上涨/下跌趋势
-    # 1. 短期均线在中期均线上方，且中期均线在长期均线上方
-    # 2. 短期均线斜率为正
-    data['up_trend'] = (data['ma_short'] > data['ma_mid']) & (data['ma_mid'] > data['ma_long']) & (data['ma_short_slope'] > 0)
-    
-    # 1. 短期均线在中期均线下方，且中期均线在长期均线下方
-    # 2. 短期均线斜率为负
-    data['down_trend'] = (data['ma_short'] < data['ma_mid']) & (data['ma_mid'] < data['ma_long']) & (data['ma_short_slope'] < 0)
+    data['up_trend'] = (data['ma_short'] > data['ma_mid']) & (data['ma_mid'] > data['ma_long']) & (data['ma_short'] > data['ma_short'].shift(1))
+    data['down_trend'] = (data['ma_short'] < data['ma_mid']) & (data['ma_mid'] < data['ma_long']) & (data['ma_short'] < data['ma_short'].shift(1))
     
     # 综合趋势判断
     data['trend'] = data['up_trend'] | data['down_trend']
@@ -239,11 +230,7 @@ def is_balance(data: pd.DataFrame, M: int = 3, N: int = 5) -> str | None: # 量�
     data['vol_up'] = data['vol_change'].shift(1).rolling(M-1).sum() >= M-1
     data['vol_down'] = (data['vol_change'].shift(1) < 0).rolling(M-1).sum() >= M-1
     
-    # 获取最后一行的数据
     last_row = data.iloc[-1]
-    prev_row = data.iloc[-2]
-    
-    # 初始化消息
     msg = ''
     
     # 检测成交量反转
@@ -361,11 +348,12 @@ if __name__ == "__main__":
     host = config.get("CONFIG", "FUTU_HOST")
     port = int(config.get("CONFIG", "FUTU_PORT"))
     group = config.get("CONFIG", "FUTU_GROUP")
+    type = config.get("CONFIG", "FUTU_PUSH_TYPE")
 
     ls = code_in_futu_group(group,host,port)
     trends_df = check_trends(ls,config)
 
     notification = NotificationEngine(config)
     notification.send_futu_message(trends_df.index.tolist(),trends_df['msg'].tolist())
-    notification.send_telegram_message('{} {}:\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group, '\n'.join(trends_df['msg'])),'https://www.futunn.com/')
-    notification.send_email(group,'<p>{} {}:<br>{}</p>'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group, '<br>'.join(trends_df['msg'])))
+    notification.send_telegram_message('{} {} {}:\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group, type, '\n'.join(trends_df['msg'])),'https://www.futunn.com/')
+    notification.send_email(group,'<p>{} {} {}:\n{}</p>'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group, type, '<br>'.join(trends_df['msg'])))
