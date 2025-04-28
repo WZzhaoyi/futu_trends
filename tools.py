@@ -61,27 +61,6 @@ def futu_code_to_yfinance_code(futu_code: str) -> str:
     else:
         assert re.match(r'^[A-Z]{2}.\d{6}$', futu_code)
         return '.'.join(reversed(futu_code.split('.')))
-    
-def futu_code_to_longport_code(futu_code: str) -> str:
-    """
-        Convert Futu Stock Code to Longport Stock Code format
-        E.g., HK.09988 -> 9988.HK; US.SOHO -> SOHO.US
-    :param futu_code: Stock code used in Futu (e.g., HK.09988)
-    """
-    return '.'.join(reversed(futu_code.split('.')))
-
-def yfinance_code_to_futu_code(yfinance_code: str) -> str:
-    """
-        Convert Yahoo Finance Stock Code to Futu Stock Code format
-        E.g., 9988.HK -> HK.09988
-    :param yfinance_code: Stock code used in Yahoo Finance (e.g., 9988.HK)
-    """
-    if 'HK' in yfinance_code:
-        return '.'.join(reversed(('0' + yfinance_code).split('.')))
-    if 'SS' in yfinance_code:
-        return '.'.join(reversed((yfinance_code).split('.'))).replace('SS','SH')
-    else:
-        return '.'.join(reversed((yfinance_code).split('.')))
 
 def map_futu_to_yfinance_params(ktype:ft.KLType=None, start:datetime=None, end:datetime=None, max_count=None):
     # 映射 ktype 到 interval
@@ -113,40 +92,6 @@ def map_futu_to_yfinance_params(ktype:ft.KLType=None, start:datetime=None, end:d
         yf_params['period'] = yf_period_map.get(max_count, None)
 
     return yf_params
-
-def map_futu_to_longport_params(ktype:ft.KLType=None, start:datetime=None, end:datetime=None, count:int=None, direction=None):
-    """
-    将 Futu 参数映射到 Longport 的历史 K 线查询参数
-
-    :param ktype: K 线类型
-    :param start: 开始日期
-    :param end: 结束日期
-    :param count: 查询数量
-    :param direction: 查询方向
-    :return: Longport 查询参数字典
-    """
-    # 映射 ktype 到 period
-    longport_period_map = {
-        'K_1M': Period.Min_1, 'K_5M': Period.Min_5, 'K_15M': Period.Min_15,
-        'K_30M': Period.Min_30, 'K_60M': Period.Min_60, 'K_120M': Period.Min_60, 'K_240M': Period.Min_60, 'K_DAY': Period.Day, 'K_WEEK': Period.Week,
-        'K_MON': Period.Month
-    }
-
-    longport_params = {}
-
-    if ktype:
-        longport_params['period'] = longport_period_map.get(ktype, None)  # 直接映射 K 线类型
-
-    if start:
-        longport_params['start'] = start
-
-    if end:
-        longport_params['end'] = end
-
-    if count:
-        longport_params['count'] = count
-
-    return longport_params
 
 def code_in_futu_group(group_name:str, host='127.0.0.1', port=11111):
     quote_ctx = ft.OpenQuoteContext(host=host, port=port)
