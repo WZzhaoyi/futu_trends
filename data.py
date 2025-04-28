@@ -23,8 +23,52 @@ import numpy as np
 from datetime import datetime, timedelta
 import yfinance as yf
 from tools import futu_code_to_yfinance_code
-from typing import Optional
 import math
+import akshare as ak
+import threading
+import os
+import json
+
+# 美股代码列表缓存
+_us_stocks_cache = None
+# 数据保存目录
+_DATA_DIR = './data'
+# 缓存有效期（天）
+_CACHE_EXPIRE_DAYS = 7
+
+# 添加锁机制 确保同一时间只有一个调用
+_futu_lock = threading.Lock()
+_yfinance_lock = threading.Lock()
+_akshare_lock = threading.Lock()
+
+def get_us_stocks():
+    """获取美股代码列表，使用缓存避免重复调用"""
+    global _us_stocks_cache
+    
+    # 如果内存缓存存在，直接返回
+    if _us_stocks_cache is not None:
+        return _us_stocks_cache
+    
+    # 准备缓存文件路径
+    cache_file = os.path.join(_DATA_DIR, 'us_stocks.json')
+    os.makedirs(_DATA_DIR, exist_ok=True)
+    
+    # 检查缓存文件是否存在且未过期
+    if os.path.exists(cache_file):
+        file_mtime = datetime.fromtimestamp(os.path.getmtime(cache_file))
+        if datetime.now() - file_mtime < timedelta(days=_CACHE_EXPIRE_DAYS):
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                _us_stocks_cache = pd.read_json(f)
+            return _us_stocks_cache
+    
+    # 如果缓存不存在或已过期，重新获取数据
+    _us_stocks_cache = ak.stock_us_spot_em()
+    
+    # 保存到缓存文件
+    with open(cache_file, 'w', encoding='utf-8') as f:
+        _us_stocks_cache.to_json(f, force_ascii=False, orient='records')
+    
+    return _us_stocks_cache
 
 def convert_to_Nhour(df: pd.DataFrame, n_hours: int = 4, session_type: str = None) -> pd.DataFrame:
     """
@@ -95,57 +139,58 @@ def convert_to_Nhour(df: pd.DataFrame, n_hours: int = 4, session_type: str = Non
 
 def fetch_futu_data(code: str, ktype: str, max_count: int, config: configparser.ConfigParser) -> pd.DataFrame:
     """获取Futu最近数据"""
-    host = config.get("CONFIG", "FUTU_HOST")
-    port = int(config.get("CONFIG", "FUTU_PORT"))
-    
-    # 确定实际请求的K线类型和数量
-    needs_hourly = ktype in ['K_HALF_DAY', 'K_240M', 'K_120M']
-    _ktype = ft.KLType.K_60M if needs_hourly else ktype
-    multiplier = {'K_HALF_DAY': 6, 'K_240M': 4, 'K_120M': 2}.get(ktype, 1)
-    request_count = min(1000, max_count * multiplier if needs_hourly else max_count)
-    
-    # 计算时间范围
-    end = datetime.now()
-    # 根据请求数量和K线类型计算合适的开始时间
-    if _ktype == ft.KLType.K_60M:
-        # 按交易时段估算，一天约6个交易小时
-        days_needed = math.ceil(request_count / 6)
-        # 使用交易日历获取开始日期
-        start = pd.bdate_range(end=end, periods=days_needed, freq='B')[0]
-    else:
-        # 对于日K及以上周期，直接用交易日历
-        start = pd.bdate_range(end=end, periods=request_count, freq='B')[0]
-    
-    start_str = start.strftime('%Y-%m-%d')
-    end_str = end.strftime('%Y-%m-%d')
-    
-    quote_ctx = ft.OpenQuoteContext(host=host, port=port)
-    try:
-        kline = quote_ctx.request_history_kline(
-            code=code,
-            ktype=_ktype,
-            start=start_str,
-            end=end_str,
-            autype=ft.AuType.QFQ,
-            max_count=None  # 不限制返回数量，获取时间范围内所有数据
-        )
+    with _futu_lock:
+        host = config.get("CONFIG", "FUTU_HOST")
+        port = int(config.get("CONFIG", "FUTU_PORT"))
         
-        if kline[0] != ft.RET_OK:
-            print(f"Futu API error: {kline[1]}")
-            return None
+        # 确定实际请求的K线类型和数量
+        needs_hourly = ktype in ['K_HALF_DAY', 'K_240M', 'K_120M']
+        _ktype = ft.KLType.K_60M if needs_hourly else ktype
+        multiplier = {'K_HALF_DAY': 6, 'K_240M': 4, 'K_120M': 2}.get(ktype, 1)
+        request_count = min(1000, max_count * multiplier if needs_hourly else max_count)
+        
+        # 计算时间范围
+        end = datetime.now()
+        # 根据请求数量和K线类型计算合适的开始时间
+        if _ktype == ft.KLType.K_60M:
+            # 按交易时段估算，一天约6个交易小时
+            days_needed = math.ceil(request_count / 6)
+            # 使用交易日历获取开始日期
+            start = pd.bdate_range(end=end, periods=days_needed, freq='B')[0]
+        else:
+            # 对于日K及以上周期，直接用交易日历
+            start = pd.bdate_range(end=end, periods=request_count, freq='B')[0]
+        
+        start_str = start.strftime('%Y-%m-%d')
+        end_str = end.strftime('%Y-%m-%d')
+        
+        quote_ctx = ft.OpenQuoteContext(host=host, port=port)
+        try:
+            kline = quote_ctx.request_history_kline(
+                code=code,
+                ktype=_ktype,
+                start=start_str,
+                end=end_str,
+                autype=ft.AuType.QFQ,
+                max_count=None  # 不限制返回数量，获取时间范围内所有数据
+            )
             
-        df = kline[1].copy()
-        df['time_key'] = pd.to_datetime(df['time_key'])
-        df = df.set_index('time_key')
-        
-        # 确保获取最近的数据
-        df = df.sort_index().tail(request_count)
+            if kline[0] != ft.RET_OK:
+                print(f"Futu API error: {kline[1]}")
+                return None
+                
+            df = kline[1].copy()
+            df['time_key'] = pd.to_datetime(df['time_key'])
+            df = df.set_index('time_key')
+            
+            # 确保获取最近的数据
+            df = df.sort_index().tail(request_count)
 
-        sleep(0.5)
-        
-        return df
-    finally:
-        quote_ctx.close()
+            sleep(0.5)
+            
+            return df
+        finally:
+            quote_ctx.close()
 
 def get_yfinance_params(ktype: str, max_count: int) -> dict:
     """获取YFinance参数的纯函数"""
@@ -171,21 +216,103 @@ def get_yfinance_params(ktype: str, max_count: int) -> dict:
 
 def fetch_yfinance_data(code: str, ktype: str, max_count: int) -> pd.DataFrame:
     """获取YFinance最近数据"""
-    yf_code = futu_code_to_yfinance_code(code)
-    params = get_yfinance_params(ktype, max_count)
-    
-    history = yf.Ticker(yf_code).history(**params)
-    if history.empty:
-        return None
-    
-    sleep(1)
+    with _yfinance_lock:
+        yf_code = futu_code_to_yfinance_code(code)
+        params = get_yfinance_params(ktype, max_count)
         
-    df = history[['Open', 'Close', 'Volume', 'High', 'Low']].copy()
-    return df.rename(columns={
-        'Open': 'open', 'High': 'high',
-        'Low': 'low', 'Close': 'close',
-        'Volume': 'volume'
-    })
+        history = yf.Ticker(yf_code).history(**params)
+        if history.empty:
+            return None
+        
+        sleep(1)
+            
+        df = history[['Open', 'Close', 'Volume', 'High', 'Low']].copy()
+        return df.rename(columns={
+            'Open': 'open', 'High': 'high',
+            'Low': 'low', 'Close': 'close',
+            'Volume': 'volume'
+        })
+
+def get_akshare_params(ktype: str, max_count: int) -> dict:
+    """获取AKShare参数的纯函数"""
+    # AKShare主要支持日线及以上周期
+    period_map = {
+        'K_DAY': 'daily',
+        'K_WEEK': 'weekly',
+        'K_MON': 'monthly'
+    }
+    
+    period = period_map.get(ktype)
+
+    if period is None:
+        raise ValueError(f"Unsupported ktype: {ktype}")
+    
+    # 计算适当的时间范围
+    end = datetime.now()
+    if period == 'daily':
+        # 日线数据，根据请求数量计算开始日期
+        start = pd.bdate_range(end=end, periods=max_count, freq='B')[0]
+    elif period == 'weekly':
+        # 周线数据
+        start = end - timedelta(days=max_count * 7)
+    else:  # 月线
+        start = end - timedelta(days=max_count * 30)
+    
+    return {
+        'period': period,
+        'start_date': start.strftime('%Y%m%d'),
+        'end_date': end.strftime('%Y%m%d'),
+        'adjust': 'qfq'
+    }
+
+def fetch_akshare_data(code: str, ktype: str, max_count: int) -> pd.DataFrame:
+    """获取AKShare最近数据"""
+    with _akshare_lock:
+        raw_code = code.split('.')[1]
+        params = get_akshare_params(ktype, max_count)
+        
+        if code.startswith('SH.') or code.startswith('SZ.'):
+            # A股数据
+            df = ak.stock_zh_a_hist(symbol=raw_code, **params)
+        elif code.startswith('HK.'):
+            # 港股数据
+            df = ak.stock_hk_hist(symbol=raw_code, **params)
+        elif code.startswith('US.'):
+            # 美股数据
+            # 获取东财美股代码
+            us_stocks = get_us_stocks()
+            matched_stock = us_stocks[us_stocks['代码'].str.split('.').str[1] == raw_code]
+            if matched_stock.empty:
+                raise ValueError(f"无法找到美股代码: {raw_code}")
+            
+            full_symbol = matched_stock.iloc[0]['代码']
+            df = ak.stock_us_hist(symbol=full_symbol, **params)
+        else:
+            raise ValueError(f"Unsupported market code: {code}")
+        
+        if df.empty:
+            return None
+        
+        # 重命名列以匹配统一格式
+        df = df.rename(columns={
+            '日期': 'time_key',
+            '开盘': 'open',
+            '收盘': 'close',
+            '最高': 'high',
+            '最低': 'low',
+            '成交量': 'volume'
+        })
+        
+        # 设置时间索引
+        df['time_key'] = pd.to_datetime(df['time_key'])
+        df = df.set_index('time_key')
+        
+        # 确保获取最近的数据
+        df = df.sort_index().tail(max_count)
+        
+        sleep(0.5)  # 避免请求过于频繁
+        
+        return df
 
 def get_kline_data(code: str, config: configparser.ConfigParser, max_count: int = 250) -> pd.DataFrame:
     """
@@ -207,6 +334,8 @@ def get_kline_data(code: str, config: configparser.ConfigParser, max_count: int 
         df = fetch_futu_data(code, ktype, max_count, config)
     elif source_type == 'yfinance':
         df = fetch_yfinance_data(code, ktype, max_count)
+    elif source_type == 'akshare':
+        df = fetch_akshare_data(code, ktype, max_count)
     else:
         raise ValueError("Unsupported data source")
     
@@ -253,3 +382,9 @@ if __name__ == "__main__":
         config.set("CONFIG", "DATA_SOURCE", "yfinance")
         df = get_kline_data(code, config, count)
         print(f"YFinance数据源获取到 {len(df) if df is not None else 0} 根K线")
+        
+        # 测试AKShare数据源（仅支持日线及以上周期）
+        if ktype in ['K_DAY', 'K_WEEK', 'K_MON']:
+            config.set("CONFIG", "DATA_SOURCE", "akshare")
+            df = get_kline_data(code, config, count)
+            print(f"AKShare数据源获取到 {len(df) if df is not None else 0} 根K线")
