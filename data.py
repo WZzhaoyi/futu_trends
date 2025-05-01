@@ -26,9 +26,15 @@ from tools import futu_code_to_yfinance_code
 import math
 import akshare as ak
 import threading
+import os
+import json
 
 # 美股代码列表缓存
 _us_stocks_cache = None
+# 数据保存目录
+_DATA_DIR = './data'
+# 缓存有效期（天）
+_CACHE_EXPIRE_DAYS = 7
 
 # 添加锁机制 确保同一时间只有一个调用
 _futu_lock = threading.Lock()
@@ -38,8 +44,30 @@ _akshare_lock = threading.Lock()
 def get_us_stocks():
     """获取美股代码列表，使用缓存避免重复调用"""
     global _us_stocks_cache
-    if _us_stocks_cache is None:
-        _us_stocks_cache = ak.stock_us_spot_em()
+    
+    # 如果内存缓存存在，直接返回
+    if _us_stocks_cache is not None:
+        return _us_stocks_cache
+    
+    # 准备缓存文件路径
+    cache_file = os.path.join(_DATA_DIR, 'us_stocks.json')
+    os.makedirs(_DATA_DIR, exist_ok=True)
+    
+    # 检查缓存文件是否存在且未过期
+    if os.path.exists(cache_file):
+        file_mtime = datetime.fromtimestamp(os.path.getmtime(cache_file))
+        if datetime.now() - file_mtime < timedelta(days=_CACHE_EXPIRE_DAYS):
+            with open(cache_file, 'r', encoding='utf-8') as f:
+                _us_stocks_cache = pd.read_json(f)
+            return _us_stocks_cache
+    
+    # 如果缓存不存在或已过期，重新获取数据
+    _us_stocks_cache = ak.stock_us_spot_em()
+    
+    # 保存到缓存文件
+    with open(cache_file, 'w', encoding='utf-8') as f:
+        _us_stocks_cache.to_json(f, force_ascii=False, orient='records')
+    
     return _us_stocks_cache
 
 def convert_to_Nhour(df: pd.DataFrame, n_hours: int = 4, session_type: str = None) -> pd.DataFrame:
@@ -251,9 +279,9 @@ def fetch_akshare_data(code: str, ktype: str, max_count: int) -> pd.DataFrame:
             df = ak.stock_hk_hist(symbol=raw_code, **params)
         elif code.startswith('US.'):
             # 美股数据
-            # 获取美股代码列表
+            # 获取东财美股代码
             us_stocks = get_us_stocks()
-            matched_stock = us_stocks[us_stocks['代码'].str.endswith(raw_code)]
+            matched_stock = us_stocks[us_stocks['代码'].str.split('.').str[1] == raw_code]
             if matched_stock.empty:
                 raise ValueError(f"无法找到美股代码: {raw_code}")
             
