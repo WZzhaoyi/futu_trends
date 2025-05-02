@@ -166,23 +166,25 @@ def is_top_down(data:pd.DataFrame) -> str|None:# KDJ顶部和底部信号/背离
     data['K'] = k
     data['D'] = d
     data['J'] = j
-    
-    j_values = data['J']
+
     msg = ''
 
-    if j_values.iloc[-1] <= 100 and all(j > 100 for j in j_values[-4:-2]):
-        msg += f'顶消失'
-    # 底消失信号
-    elif j_values.iloc[-1] >= 0 and all(j < 0 for j in j_values[-4:-2]):
-        msg += f'底消失'
+    if data['J'].iloc[-1]<100 and data['J'].iloc[-2]>=100 and data['J'].iloc[-3]>=100:
+        msg += f'KDJ顶消失'
+    elif data['J'].iloc[-1]>0 and data['J'].iloc[-2]<=0 and data['J'].iloc[-3]<=0:
+        msg += f'KDJ底消失'
     
-    # 背离检测
     # KDJ背离
     crossover = crossover_status(data['K'], data['D'])
     golden_crosses = [i for i, c in enumerate(crossover) if c == 1]  # 金叉索引
     dead_crosses = [i for i, c in enumerate(crossover) if c == -1]  # 死叉索引
     kdj_divergence = detect_divergence(data['K'], data['D'], data['close'], golden_crosses, dead_crosses)
     kdj_div_value = kdj_divergence.iloc[-1]
+
+    if kdj_div_value == 1:
+        msg += 'KDJ顶背离🚨'
+    if kdj_div_value == -1:
+        msg += 'KDJ底背离🚨'
     
     # MACD背离
     dif, dea = MACD(data['close'], 12, 26, 9)
@@ -193,13 +195,24 @@ def is_top_down(data:pd.DataFrame) -> str|None:# KDJ顶部和底部信号/背离
     macd_dead_crosses = [i for i, c in enumerate(macd_crossover) if c == -1]  # 死叉索引
     macd_divergence = detect_divergence(data['DIF'], data['DEA'], data['close'], macd_golden_crosses, macd_dead_crosses)
     macd_div_value = macd_divergence.iloc[-1]
-    
-    # 综合背离信号
-    if kdj_div_value == 1 or macd_div_value == 1:
-        msg += '顶背离🚨'
-    if kdj_div_value == -1 or macd_div_value == -1:
-        msg += '底背离🚨'
 
+    if macd_div_value == 1:
+        msg += 'MACD顶背离🚨'
+    if macd_div_value == -1:
+        msg += 'MACD底背离🚨'
+    
+    # RSI计算
+    rsi = RSI(data['close'], 6)
+    data['RSI'] = rsi
+    
+    # RSI顶消失和底消失
+    top_disappear = (data['RSI'].iloc[-3]>=80 and data['RSI'].iloc[-2]>=80 and data['RSI'].iloc[-1]<80) or (data['RSI'].iloc[-2]>=85 and data['RSI'].iloc[-1]<85)
+    bottom_disappear = (data['RSI'].iloc[-3]<=20 and data['RSI'].iloc[-2]<=20 and data['RSI'].iloc[-1]>20) or (data['RSI'].iloc[-2]<=15 and data['RSI'].iloc[-1]>15)
+    if top_disappear:
+        msg += 'RSI顶消失'
+    if bottom_disappear:
+        msg += 'RSI底消失'
+    
     return None if msg == '' else msg
 
 def is_balance(data: pd.DataFrame, M: int = 3, N: int = 5) -> str | None: # 量价关系平衡
@@ -332,7 +345,7 @@ def check_trends(code_in_group, config: configparser.ConfigParser):
         results.append({
             'futu_code': 'ZERO_AXIS',
             'name': '动量0轴',
-            'msg': '━━━━━━━━动量0轴━━━━━━━━',
+            'msg': '━━━动量0轴━━━',
             'momentum': 0.000
         })
         
@@ -356,4 +369,4 @@ if __name__ == "__main__":
     notification = NotificationEngine(config)
     notification.send_futu_message(trends_df.index.tolist(),trends_df['msg'].tolist())
     notification.send_telegram_message('{} {} {}:\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group, type, '\n'.join(trends_df['msg'])),'https://www.futunn.com/')
-    notification.send_email(group,'<p>{} {} {}:\n{}</p>'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group, type, '<br>'.join(trends_df['msg'])))
+    notification.send_email(group,'<p>{} {} {}:<br>{}</p>'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group, type, '<br>'.join(trends_df['msg'])))

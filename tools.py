@@ -254,49 +254,20 @@ def AO(H, L):
     M =AVE(H, L)
     return MA(M,5)-MA(M,34)
 
-def RSI(CLOSE, N=24):
+def RSI(CLOSE, N=24): # 计算RSI指标
     DIF = CLOSE-REF(CLOSE,1) 
     return RD(SMA(MAX(DIF,0), N) / SMA(ABS(DIF), N) * 100)  
 
-def KDJ(close: pd.Series, high: pd.Series, low: pd.Series, N=15, M1=5, M2=5) -> pd.DataFrame:
-    """
-    计算 KDJ 指标
-
-    Args:
-        close (pd.Series): 收盘价序列
-        high (pd.Series): 最高价序列
-        low (pd.Series): 最低价序列
-        N (int): 计算 K 和 D 的周期
-        M1 (int): K 的平滑周期
-        M2 (int): D 的平滑周期
-
-    Returns:
-        tuple: (K, D, J)
-    """
+def KDJ(close: pd.Series, high: pd.Series, low: pd.Series, N=15, M1=5, M2=5) -> pd.DataFrame: # 计算KDJ指标
     low_min = low.rolling(window=N).min()
     high_max = high.rolling(window=N).max()
-    
     RSV = 100 * (close - low_min) / (high_max - low_min)
-    
     K = SMA(RSV,M1)
     D = SMA(K,M2)
     J = 3 * K - 2 * D
-    
     return K, D, J
 
-def MACD(close: pd.Series, fast_period=12, slow_period=26, signal_period=9):
-    """
-    计算MACD的DIF和DEA
-
-    Args:
-        close (pd.Series): 收盘价序列
-        fast_period (int): 快速移动平均线的周期
-        slow_period (int): 慢速移动平均线的周期
-        signal_period (int): 信号线的周期
-
-    Returns:
-        tuple: (DIF, DEA)
-    """
+def MACD(close: pd.Series, fast_period=12, slow_period=26, signal_period=9): # 计算MACD指标
     ema_fast = close.ewm(span=fast_period, adjust=False).mean()
     ema_slow = close.ewm(span=slow_period, adjust=False).mean()
     dif = ema_fast - ema_slow

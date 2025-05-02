@@ -28,6 +28,7 @@ import akshare as ak
 import threading
 import os
 import json
+import re
 
 # 美股代码列表缓存
 _us_stocks_cache = None
@@ -272,8 +273,15 @@ def fetch_akshare_data(code: str, ktype: str, max_count: int) -> pd.DataFrame:
         params = get_akshare_params(ktype, max_count)
         
         if code.startswith('SH.') or code.startswith('SZ.'):
-            # A股数据
-            df = ak.stock_zh_a_hist(symbol=raw_code, **params)
+            if re.match(r'^(51|15|56|58)', raw_code):
+                # A股ETF数据
+                df = ak.fund_etf_hist_em(symbol=raw_code, **params)
+            elif raw_code.startswith('16'):
+                # A股LOF数据
+                df = ak.fund_lof_hist_em(symbol=raw_code, **params)
+            else:
+                # A股数据
+                df = ak.stock_zh_a_hist(symbol=raw_code, **params)
         elif code.startswith('HK.'):
             # 港股数据
             df = ak.stock_hk_hist(symbol=raw_code, **params)
@@ -283,8 +291,7 @@ def fetch_akshare_data(code: str, ktype: str, max_count: int) -> pd.DataFrame:
             us_stocks = get_us_stocks()
             matched_stock = us_stocks[us_stocks['代码'].str.split('.').str[1] == raw_code]
             if matched_stock.empty:
-                raise ValueError(f"无法找到美股代码: {raw_code}")
-            
+                return None
             full_symbol = matched_stock.iloc[0]['代码']
             df = ak.stock_us_hist(symbol=full_symbol, **params)
         else:

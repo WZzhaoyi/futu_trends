@@ -276,7 +276,7 @@ def calculate_win_rate(df, look_ahead=10, target_multiplier=1, atr_period=20):
         'detailed_df': df
     }
 
-def KD_analysis(df, name, pl=False, evals=500): # { 'performance': result, 'best_params': best_params, 'signal': df_visual }
+def KD_analysis(df, name, pl=False, evals=500, look_ahead:int=0):
     # 参数空间
     space = {
         'k_period': hp.quniform('k_period', 9, 20, 1),  #聚焦有效范围
@@ -295,10 +295,11 @@ def KD_analysis(df, name, pl=False, evals=500): # { 'performance': result, 'best
     # 分析市场状态(每月)
     df_states = analyze_market_states(df, period='ME')
     # 最近一个月市场状态
-    current_state = df_states.iloc[-1]
+    current_state = df_states.iloc[-1] 
     # 根据近期Trend Duration Distribution估计
     currnet_look_ahead = determine_look_ahead(current_state['Volatility'], current_state['Trend_Length'])
-    look_ahead = 10 
+    if look_ahead <= 0:
+       look_ahead = currnet_look_ahead
     target_multiplier = calculate_target_multiplier(df, atr_period=atr_period, look_ahead=look_ahead)
 
     # 根据市场状态调整目标百分比
