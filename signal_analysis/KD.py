@@ -165,20 +165,37 @@ def Stochastic(high, low, close, k_period, d_period):
     return k, d
 
 # 矢量化信号检测，区分显性和隐秘强信号
-def detect_stochastic_signals_vectorized(df: pd.DataFrame, k_period=14, d_period=3, overbought=80, oversold=20, support_ma_period=20, resistance_ma_period=20,atr_period_explicit=14, atr_period_hidden=14, strength_threshold=2):
+def detect_stochastic_signals_vectorized(df: pd.DataFrame, params: dict):
+    """
+    使用随机指标检测信号
+    
+    Args:
+        df: 包含OHLCV数据的DataFrame
+        params: 参数字典，包含以下字段：
+            - k_period: K线周期
+            - d_period: D线周期
+            - overbought: 超买阈值
+            - oversold: 超卖阈值
+            - support_ma_period: 支撑位MA周期
+            - resistance_ma_period: 阻力位MA周期
+            - atr_period_explicit: 显性信号ATR周期
+            - atr_period_hidden: 隐性信号ATR周期
+            - strength_threshold: 信号强度阈值
+    """
     df = df.copy()
-    k, d = Stochastic(df['high'], df['low'], df['close'], k_period, d_period)
-    support_ma = df['close'].rolling(window=int(support_ma_period), min_periods=1).mean()
-    resistance_ma = df['close'].rolling(window=int(resistance_ma_period), min_periods=1).mean()
-    vol_ma = df['volume'].rolling(window=5, min_periods=1).mean()
-    atr_explicit = ATR(df['high'], df['low'], df['close'], period=atr_period_explicit)
-    atr_hidden = ATR(df['high'], df['low'], df['close'], period=atr_period_hidden)
+    k, d = Stochastic(df['high'], df['low'], df['close'], 
+                      params['k_period'], params['d_period'])
+    support_ma = df['close'].rolling(window=int(params['support_ma_period']), min_periods=1).mean()
+    resistance_ma = df['close'].rolling(window=int(params['resistance_ma_period']), min_periods=1).mean()
+    # vol_ma = df['volume'].rolling(window=5, min_periods=1).mean()
+    atr_explicit = ATR(df['high'], df['low'], df['close'], period=params['atr_period_explicit'])
+    atr_hidden = ATR(df['high'], df['low'], df['close'], period=params['atr_period_hidden'])
     
     df['signal_strength'] = abs(k - d)
     df['k_amplitude'] = df['high'] - df['low']
     
-    support_condition = (k > d) & (k.shift(1) <= d.shift(1)) & (k < oversold) & (df['close'] < support_ma)
-    resistance_condition = (k < d) & (k.shift(1) >= d.shift(1)) & (k > overbought) & (df['close'] > resistance_ma)
+    support_condition = (k > d) & (k.shift(1) <= d.shift(1)) & (k < params['oversold']) & (df['close'] < support_ma)
+    resistance_condition = (k < d) & (k.shift(1) >= d.shift(1)) & (k > params['overbought']) & (df['close'] > resistance_ma)
     
     df['reversal'] = np.select(
         [support_condition, resistance_condition],
@@ -189,19 +206,16 @@ def detect_stochastic_signals_vectorized(df: pd.DataFrame, k_period=14, d_period
     # 显性强信号 放量突破
     df['is_strong_explicit'] = np.where(
         (df['reversal'] != 'none') & 
-        (df['signal_strength'] >= strength_threshold) & 
+        (df['signal_strength'] >= params['strength_threshold']) & 
         (df['k_amplitude'] > atr_explicit),
-        # (df['volume'] >= vol_ma),
         1, 0
     )
     
     # 隐秘强信号 小实体衰竭
     df['is_strong_hidden'] = np.where(
         (df['reversal'] != 'none') & 
-        (df['signal_strength'] >= strength_threshold) & 
+        (df['signal_strength'] >= params['strength_threshold']) & 
         (df['k_amplitude'] < atr_hidden), 
-        # (df['volume'] <= vol_ma),
-        # (abs(df['close'] - ma) <= atr_hidden),
         1, 0
     )
     
@@ -320,7 +334,7 @@ def KD_analysis(df, name, pl=False, evals=500, look_ahead:int=0):
             'atr_period_hidden': int(params['atr_period_hidden']),
             'strength_threshold': params['strength_threshold']
         }
-        df_with_signals = detect_stochastic_signals_vectorized(df.copy(), **params_int)
+        df_with_signals = detect_stochastic_signals_vectorized(df.copy(), params_int)
         result = calculate_win_rate(df_with_signals, look_ahead=look_ahead, target_multiplier=target_multiplier, atr_period=atr_period)
         
         # 计算F2得分（β=2，更重视召回率）
@@ -363,7 +377,7 @@ def KD_analysis(df, name, pl=False, evals=500, look_ahead:int=0):
     }
 
     # 使用最佳参数计算最终信号
-    df = detect_stochastic_signals_vectorized(df, **best_params)
+    df = detect_stochastic_signals_vectorized(df, best_params)
     result = calculate_win_rate(df)
 
     print(f"\n--------KD analysis for {name}--------")
@@ -385,6 +399,7 @@ def KD_analysis(df, name, pl=False, evals=500, look_ahead:int=0):
 
     if pl:
         fig = plt.figure(figsize=(16, 10))
+        plt.yscale('log')  # 设置y轴为对数坐标
         plt.plot(df_visual.index, df_visual['close'], label='Close Price', color='blue', alpha=0.5)
 
         # 显性强信号
@@ -451,12 +466,17 @@ def KD_analysis(df, name, pl=False, evals=500, look_ahead:int=0):
 
     del result["detailed_df"]
 
-    return { 
-            'look_ahead': look_ahead,
-            'target_multiplier': target_multiplier,
-            'atr_period': atr_period,
+    meta_info = {
+        'strategy': 'KD',
+        'look_ahead': look_ahead,
+        'target_multiplier': target_multiplier,
+        'atr_period': atr_period
+    }
+
+    return {
             'performance': result,
             'best_params': best_params,
             'signal': df_visual,
-            'plot': img_buf
+            'plot': img_buf,
+            'meta_info': meta_info
             }

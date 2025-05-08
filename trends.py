@@ -2,6 +2,7 @@ import json
 import os
 from ft_config import get_config
 from data import get_kline_data
+from params_db import ParamsDB
 from signal_analysis import detect_stochastic_signals_vectorized
 from tools import *
 import datetime
@@ -37,27 +38,11 @@ def is_reverse(code: str, df: pd.DataFrame | None, config: configparser.ConfigPa
     """检查是否出现反转信号"""
     assert len(df) >= 90
     
-    # 获取参数 - 优先从数据库读取，失败则从JSON读取
+    # 从数据库读取参数
     try:
         db_path = config.get("CONFIG", "KD_PARAMS_DB", fallback=None)
-        if db_path and os.path.exists(db_path):
-            with sqlite3.connect(db_path) as conn:
-                result = conn.execute("""
-                    SELECT best_params FROM stock_params WHERE stock_code = ?
-                """, (code,)).fetchone()
-                
-                if result:
-                    params = json.loads(result[0])
-                else:
-                    # 回退到JSON文件
-                    params_file = config.get("CONFIG", "KD_PARAMS")
-                    with open(params_file, 'r') as f:
-                        params = json.load(f).get(code, {}).get('best_params')
-        else:
-            # 直接读取JSON文件
-            params_file = config.get("CONFIG", "KD_PARAMS")
-            with open(params_file, 'r') as f:
-                params = json.load(f).get(code, {}).get('best_params')
+        db = ParamsDB(db_path)
+        params = db.get_stock_params(code)['best_params']
                 
         if not params:
             print(f"No parameters found for {code}")
@@ -67,19 +52,8 @@ def is_reverse(code: str, df: pd.DataFrame | None, config: configparser.ConfigPa
         print(f"Error reading parameters for {code}: {str(e)}")
         return 'Parameter error'
     
-    # 使用参数进行信号检测
-    result = detect_stochastic_signals_vectorized(
-        df,
-        k_period=params['k_period'],
-        d_period=params['d_period'],
-        overbought=params['overbought'],
-        oversold=params['oversold'],
-        support_ma_period=params['support_ma_period'],
-        resistance_ma_period=params['resistance_ma_period'],
-        atr_period_explicit=params['atr_period_explicit'],
-        atr_period_hidden=params['atr_period_hidden'],
-        strength_threshold=params['strength_threshold']
-    )
+    # 信号检测
+    result = detect_stochastic_signals_vectorized(df, params)
     
     # 获取最后一行的信号
     last_row = result.iloc[-1]

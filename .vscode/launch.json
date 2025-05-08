@@ -18,7 +18,7 @@
             "request": "launch",
             "program": "./params_db.py",
             "console": "integratedTerminal",
-            "args": ["--db","./sync/kd_params.db", "--params","./output/detect_202502/analysis_params_20250225.json"]
+            "args": ["--db","./sync/kd_params.db", "--params","sqlite:///output/detect_202502/analysis_params_20250225.json"]
         },
         {
             "name": "alpha_filters",
