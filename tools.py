@@ -367,15 +367,8 @@ def calc_momentum(close: pd.Series, N=21, method='linear')->pd.Series:
             y_predict = np.polyval(slope_list,x)
             r_squared = 1 - (sum((y-y_predict)**2) / ((len(y) - 1) * np.var(y, ddof=1)))
             score = annualized_returns * r_squared
-        elif method == 'ma':
-            ma_short = close.rolling(window=10).mean().iloc[i]
-            ma_long = close.rolling(window=50).mean().iloc[i]
-            score = ma_short - ma_long
-        elif method == 'kendall':
-            # 保留原有的kendall方法实现
-            pass
         else:
-            score = 0
+            raise ValueError(f"Unsupported method: {method}")
             
         result.iloc[i] = score
     
