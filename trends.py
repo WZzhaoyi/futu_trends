@@ -2,6 +2,7 @@ import json
 import os
 from ft_config import get_config
 from data import get_kline_data
+from llm_client import generate_text, read_prompt
 from params_db import ParamsDB
 from signal_analysis import detect_stochastic_signals_vectorized
 from tools import *
@@ -63,7 +64,7 @@ def is_reverse(code: str, df: pd.DataFrame | None, config: configparser.ConfigPa
     # 检查是否有反转信号
     msg = ''
     if reversal != 'none':
-        msg += reversal
+        msg += reversal.replace(' reversal','')
     if is_strong == 1:
         msg += u'🚨'
     return None if msg == '' else msg
@@ -105,19 +106,19 @@ def is_continue(data:pd.DataFrame)->str|None:# 检查macd趋势延续/低位金�
                 msg += '下降延续'
     
     # 检测低位金叉和高位死叉
-    if golden_crosses and golden_crosses[-1] == last_row_pos:
-        dif_high_threshold = data['DIF'].quantile(0.2)
-        dea_high_threshold = data['DEA'].quantile(0.2)
+    # if golden_crosses and golden_crosses[-1] == last_row_pos:
+    #     dif_high_threshold = data['DIF'].quantile(0.2)
+    #     dea_high_threshold = data['DEA'].quantile(0.2)
         
-        if data['DIF'].iloc[last_row_pos] <= dif_high_threshold and data['DEA'].iloc[last_row_pos] <= dea_high_threshold:
-            msg += '低位金叉🚨'
+    #     if data['DIF'].iloc[last_row_pos] <= dif_high_threshold and data['DEA'].iloc[last_row_pos] <= dea_high_threshold:
+    #         msg += '低位金叉🚨'
     
-    if dead_crosses and dead_crosses[-1] == last_row_pos:
-        dif_low_threshold = data['DIF'].quantile(0.8)
-        dea_low_threshold = data['DEA'].quantile(0.8)
+    # if dead_crosses and dead_crosses[-1] == last_row_pos:
+    #     dif_low_threshold = data['DIF'].quantile(0.8)
+    #     dea_low_threshold = data['DEA'].quantile(0.8)
         
-        if data['DIF'].iloc[last_row_pos] >= dif_low_threshold and data['DEA'].iloc[last_row_pos] >= dea_low_threshold:
-            msg += '高位死叉🚨'
+    #     if data['DIF'].iloc[last_row_pos] >= dif_low_threshold and data['DEA'].iloc[last_row_pos] >= dea_low_threshold:
+    #         msg += '高位死叉🚨'
     
     return None if msg == '' else msg
 
@@ -135,6 +136,7 @@ def is_breakout(high, low, close, N:int=10)->str|None:# K线突破/跌破均线
 
 def is_top_down(data:pd.DataFrame) -> str|None:# KDJ顶部和底部信号/背离
     assert len(data) >= 40
+    last_row = len(data) - 1
     # 计算KDJ
     k,d,j = KDJ(data['close'], data['high'], data['low'])
     data['K'] = k
@@ -174,18 +176,63 @@ def is_top_down(data:pd.DataFrame) -> str|None:# KDJ顶部和底部信号/背离
         msg += 'MACD顶背离🚨'
     if macd_div_value == -1:
         msg += 'MACD底背离🚨'
+
+    # 检测MACD顶消失底消失
+    if macd_golden_crosses and macd_golden_crosses[-1] == last_row and macd_div_value == 0:
+        dif_high_threshold = data['DIF'].quantile(0.2)
+        dea_high_threshold = data['DEA'].quantile(0.2)
+        
+        if data['DIF'].iloc[last_row] <= dif_high_threshold and data['DEA'].iloc[last_row] <= dea_high_threshold:
+            msg += 'MACD底消失'
     
-    # RSI计算
+    elif macd_dead_crosses and macd_dead_crosses[-1] == last_row and macd_div_value == 0:
+        dif_low_threshold = data['DIF'].quantile(0.8)
+        dea_low_threshold = data['DEA'].quantile(0.8)
+        
+        if data['DIF'].iloc[last_row] >= dif_low_threshold and data['DEA'].iloc[last_row] >= dea_low_threshold:
+            msg += 'MACD顶消失'
+    
+    # RSI检测
     rsi = RSI(data['close'], 6)
     data['RSI'] = rsi
     
-    # RSI顶消失和底消失
-    top_disappear = (data['RSI'].iloc[-3]>=80 and data['RSI'].iloc[-2]>=80 and data['RSI'].iloc[-1]<80) or (data['RSI'].iloc[-2]>=85 and data['RSI'].iloc[-1]<85)
-    bottom_disappear = (data['RSI'].iloc[-3]<=20 and data['RSI'].iloc[-2]<=20 and data['RSI'].iloc[-1]>20) or (data['RSI'].iloc[-2]<=15 and data['RSI'].iloc[-1]>15)
-    if top_disappear:
-        msg += 'RSI顶消失'
-    if bottom_disappear:
-        msg += 'RSI底消失'
+    # 检测顶底消失位置
+    top_indices = []
+    bottom_indices = []
+    
+    for i in range(2, len(data)):
+        if ((data['RSI'].iloc[i-2]>=80 and data['RSI'].iloc[i-1]>=80 and data['RSI'].iloc[i]<80) or 
+            (data['RSI'].iloc[i-1]>=85 and data['RSI'].iloc[i]<85)):
+            top_indices.append(i)
+        if ((data['RSI'].iloc[i-2]<=20 and data['RSI'].iloc[i-1]<=20 and data['RSI'].iloc[i]>20) or 
+            (data['RSI'].iloc[i-1]<=15 and data['RSI'].iloc[i]>15)):
+            bottom_indices.append(i)
+    
+    has_top = top_indices and top_indices[-1] == last_row
+    has_bottom = bottom_indices and bottom_indices[-1] == last_row
+    
+    # 检测背离
+    has_divergence = False
+    i = len(top_indices) - 1
+    if has_top and len(top_indices) >= 2 and 3 <= top_indices[i] - top_indices[i-1] < 14:
+        prev_high = max(data['high'].iloc[top_indices[i-1]], data['high'].iloc[top_indices[i-1]-1])
+        curr_high = max(data['high'].iloc[top_indices[i]], data['high'].iloc[top_indices[i]-1])
+        if curr_high > prev_high:
+            msg += 'RSI顶背离🚨'
+            has_divergence = True
+    elif has_bottom and len(bottom_indices) >= 2 and 3 <= bottom_indices[i] - bottom_indices[i-1] < 14:
+        prev_low = min(data['low'].iloc[bottom_indices[i-1]], data['low'].iloc[bottom_indices[i-1]-1])
+        curr_low = min(data['low'].iloc[bottom_indices[i]], data['low'].iloc[bottom_indices[i]-1])
+        if curr_low < prev_low:
+            msg += 'RSI底背离🚨'
+            has_divergence = True
+    
+    # 添加消失信号
+    if not has_divergence:
+        if has_top:
+            msg += 'RSI顶消失'
+        if has_bottom:
+            msg += 'RSI底消失'
     
     return None if msg == '' else msg
 
@@ -336,11 +383,18 @@ if __name__ == "__main__":
     port = int(config.get("CONFIG", "FUTU_PORT"))
     group = config.get("CONFIG", "FUTU_GROUP")
     type = config.get("CONFIG", "FUTU_PUSH_TYPE")
+    prompt = config.get("CONFIG", "LLM_PROMPT")
+    llm_url = config.get("CONFIG", "LLM_URL")
 
     ls = code_in_futu_group(group,host,port)
     trends_df = check_trends(ls,config)
 
+    msg = '{} {} {}:\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group, type, '\n'.join(trends_df['msg']))
+    if prompt and llm_url:
+        prompt = read_prompt(prompt)
+        msg = generate_text(llm_url,prompt+'\n'+msg,format='email')+'\n\n当日信号如下：\n'+msg
+
     notification = NotificationEngine(config)
     notification.send_futu_message(trends_df.index.tolist(),trends_df['msg'].tolist())
-    notification.send_telegram_message('{} {} {}:\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group, type, '\n'.join(trends_df['msg'])),'https://www.futunn.com/')
-    notification.send_email(group,'<p>{} {} {}:<br>{}</p>'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group, type, '<br>'.join(trends_df['msg'])))
+    notification.send_telegram_message(msg,'https://www.futunn.com/')
+    notification.send_email(group,msg)

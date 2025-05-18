@@ -85,7 +85,7 @@ class NotificationEngine:
         quote_ctx.close()
 
 
-    def send_email(self, filter_name: str, message_html: str):
+    def send_email(self, subject: str, message_html: str):
         """
         发送邮件
         """
@@ -99,10 +99,28 @@ class NotificationEngine:
             self.plog('没有邮件订阅者，跳过发送')
             return
 
-        message = MIMEText(message_html, 'html', 'utf-8')
+        # 将消息转换为HTML格式
+        message_html = message_html.replace('\n', '<br>')
+        
+        # 添加基本的HTML样式
+        html_content = f"""
+        <html>
+        <head>
+            <style>
+                body {{ font-family: Arial, sans-serif; line-height: 1.6; }}
+                br {{ margin-bottom: 5px; }}
+            </style>
+        </head>
+        <body>
+            {message_html}
+        </body>
+        </html>
+        """
+
+        message = MIMEText(html_content, 'html', 'utf-8')
         message["From"] = self.sender
         message['To'] = ','.join(self.receivers)
-        message['Subject'] = Header(f"Futu Stock Trends - {datetime.today().strftime('%Y-%m-%d')} - {filter_name}", 'utf-8')
+        message['Subject'] = Header(f"Futu Stock Trends - {datetime.today().strftime('%Y-%m-%d')} - {subject}", 'utf-8')
 
         try:
             smtpObj = smtplib.SMTP_SSL(self.mail_host, self.mail_port) #建立smtp连接，ssl 465端口
