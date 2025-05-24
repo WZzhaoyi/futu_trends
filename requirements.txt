@@ -176,6 +176,6 @@ webencodings==0.5.1
 websockets==10.4
 xlrd==2.0.1
 yarl==1.20.0
-yfinance==0.2.51
+yfinance==0.2.61
 zipp==3.21.0
 openai==1.75.0

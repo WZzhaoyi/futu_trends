@@ -14,7 +14,7 @@ import json
 from datetime import datetime
 from tools import code_in_futu_group
 
-def run_analysis(code_list:list[str], config:ConfigParser, output_dir='./output', data_dir='./data'):
+def run_analysis(code_list:pd.DataFrame, config:ConfigParser, output_dir='./output', data_dir='./data'):
     # 确保输出目录存在
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(data_dir, exist_ok=True)
@@ -31,32 +31,46 @@ def run_analysis(code_list:list[str], config:ConfigParser, output_dir='./output'
         
         # 检查本地数据文件
         timestamp = datetime.now().strftime('%Y%m%d')
-        file_name = f'data_{code.replace(".", "_")}_{timestamp}_{ktype}.csv'
-        output_file = os.path.join(data_dir, file_name)
+        data_file_name = f'data_{code.replace(".", "_")}_{timestamp}_{ktype}.csv'
+        data_file = os.path.join(data_dir, data_file_name)
         
-        if os.path.exists(output_file):
-            print(f"使用本地数据文件: {output_file}")
-            df = pd.read_csv(output_file, index_col=0, parse_dates=True)
+        if os.path.exists(data_file):
+            print(f"使用本地数据文件: {data_file}")
+            df = pd.read_csv(data_file, index_col=0, parse_dates=True)
         else:
             # 文件不存在，下载数据
-            print(f"下载新数据: {output_file}")
-            df = get_kline_data(code, config, max_count=1000)
-            df.to_csv(output_file)
+            print(f"下载新数据: {data_file}")
+            df = get_kline_data(code, config, max_count=1100)
+            df.to_csv(data_file)
 
-        result = KD_analysis(df, code, evals=500, pl=True, look_ahead=look_ahead)
+        result_file_name = os.path.join(output_dir, f'signals_{code.replace(".", "_")}_{timestamp}_{ktype}.json')
+        if os.path.exists(result_file_name):
+            print(f"使用本地结果文件: {result_file_name}")
+            with open(result_file_name, 'r') as f:
+                result = json.load(f)
+        else:
+            print(f"训练新结果: {result_file_name}")
+            result = KD_analysis(df, code, evals=500, look_ahead=look_ahead)
 
-        # 保存详细信号数据
-        output_file = os.path.join(output_dir, f'signals_{code.replace(".", "_")}_{timestamp}_{ktype}.csv')
-        result['signal'].to_csv(output_file)
-        # 信号图保存到文件
-        if result['plot'] is not None:
-            pic_file = os.path.join(output_dir, f'signals_{code.replace(".", "_")}_{timestamp}_{ktype}.png')
-            with open(pic_file, 'wb') as f:
-                f.write(result['plot'].getvalue())
+            # 保存详细信号数据
+            singal_file_name = os.path.join(output_dir, f'signals_{code.replace(".", "_")}_{timestamp}_{ktype}.csv')
+            result['signal'].to_csv(singal_file_name)
+            # 信号图保存到文件
+            if result['plot'] is not None:
+                pic_file = os.path.join(output_dir, f'signals_{code.replace(".", "_")}_{timestamp}_{ktype}.png')
+                with open(pic_file, 'wb') as f:
+                    f.write(result['plot'].getvalue())
 
-        # 删除detailed_df详细信号数据
-        del result["signal"]
-        del result["plot"]
+            if result['checked_plot'] is not None:
+                pic_file = os.path.join(output_dir, f'signals_{code.replace(".", "_")}_{timestamp}_checked_{ktype}.png')
+                with open(pic_file, 'wb') as f:
+                    f.write(result['checked_plot'].getvalue())
+
+            del result["checked_plot"]
+            del result["plot"]
+            del result["signal"]
+            with open(result_file_name, 'w') as f:
+                json.dump(result, f, indent=4)
         results[code] = result
         
     # 保存参数优化结果
@@ -73,10 +87,27 @@ if __name__ == '__main__':
 
     host = config.get("CONFIG", "FUTU_HOST")
     port = int(config.get("CONFIG", "FUTU_PORT"))
-    group = config.get("CONFIG", "FUTU_GROUP")
+    group = config.get("CONFIG", "FUTU_GROUP", fallback='')
+    code_list = config.get("CONFIG", "FUTU_CODE_LIST", fallback='').split(',')
+    code_list = [code for code in code_list if code.strip()]
 
-    ls = code_in_futu_group(group,host,port)
+    # 获取股票列表
+    code_pd = pd.DataFrame(columns=['code','name'])
+    if group:
+        ls = code_in_futu_group(group,host,port)
+        if type(ls) == pd.DataFrame:
+            ls = ls[['code','name']]
+            code_pd = pd.concat([code_pd,ls])
+    if len(code_list) > 0:
+        ls = pd.DataFrame(columns=['code','name'])
+        ls['code'] = code_list
+        ls['name'] = code_list
+        code_pd = pd.concat([code_pd,ls], ignore_index=True)
+
+    if code_pd.empty:
+        print('warning: no code in config')
+        exit()
 
     timestamp = datetime.now().strftime('%Y%m%d')
     output_dir = f'./output/detect_{timestamp}'
-    results = run_analysis(ls, config, output_dir=output_dir)
+    results = run_analysis(code_pd, config, output_dir=output_dir)

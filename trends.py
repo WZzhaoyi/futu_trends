@@ -69,7 +69,7 @@ def is_reverse(code: str, df: pd.DataFrame | None, config: configparser.ConfigPa
         msg += u'🚨'
     return None if msg == '' else msg
 
-def is_continue(data:pd.DataFrame)->str|None:# 检查macd趋势延续/低位金叉/高位死叉
+def is_continue(data:pd.DataFrame)->str|None:# 检查macd趋势延续
     assert len(data) >= 26
     # 计算MACD
     dif, dea = MACD(data['close'], 12, 26, 9)
@@ -381,15 +381,35 @@ if __name__ == "__main__":
     config = get_config()
     host = config.get("CONFIG", "FUTU_HOST")
     port = int(config.get("CONFIG", "FUTU_PORT"))
-    group = config.get("CONFIG", "FUTU_GROUP")
-    type = config.get("CONFIG", "FUTU_PUSH_TYPE")
-    prompt = config.get("CONFIG", "LLM_PROMPT")
-    llm_url = config.get("CONFIG", "LLM_URL")
+    group = config.get("CONFIG", "FUTU_GROUP", fallback='')
+    code_list = config.get("CONFIG", "FUTU_CODE_LIST", fallback='').split(',')
+    code_list = [code for code in code_list if code.strip()]
+    push_type = config.get("CONFIG", "FUTU_PUSH_TYPE")
+    prompt = config.get("CONFIG", "LLM_PROMPT", fallback='')
+    llm_url = config.get("CONFIG", "LLM_URL", fallback='')
 
-    ls = code_in_futu_group(group,host,port)
-    trends_df = check_trends(ls,config)
+    # 获取股票列表
+    code_pd = pd.DataFrame(columns=['code','name'])
+    if group:
+        ls = code_in_futu_group(group,host,port)
+        if type(ls) == pd.DataFrame:
+            ls = ls[['code','name']]
+            code_pd = pd.concat([code_pd,ls])
+    if len(code_list) > 0:
+        ls = pd.DataFrame(columns=['code','name'])
+        ls['code'] = code_list
+        ls['name'] = code_list
+        code_pd = pd.concat([code_pd,ls], ignore_index=True)
 
-    msg = '{} {} {}:\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group, type, '\n'.join(trends_df['msg']))
+    if code_pd.empty:
+        print('warning: no code in config')
+        exit()
+
+    trends_df = check_trends(code_pd,config)
+
+    msg = '{} {} {}:\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group if group else '', push_type, '\n'.join(trends_df['msg']))
+
+    # 使用LLM生成消息
     if prompt and llm_url:
         prompt = read_prompt(prompt)
         msg = generate_text(llm_url,prompt+'\n'+msg,format='email')+'\n\n当日信号如下：\n'+msg
@@ -397,4 +417,4 @@ if __name__ == "__main__":
     notification = NotificationEngine(config)
     notification.send_futu_message(trends_df.index.tolist(),trends_df['msg'].tolist())
     notification.send_telegram_message(msg,'https://www.futunn.com/')
-    notification.send_email(group,msg)
+    notification.send_email(f'{group} {push_type}',msg)

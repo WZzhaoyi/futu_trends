@@ -100,10 +100,11 @@ def code_in_futu_group(group_name:str, host='127.0.0.1', port=11111):
 
     quote_ctx.close()
 
-    if ret == ft.RET_OK:
+    if ret == ft.RET_OK and type(data) == pd.DataFrame:
         return data
     else:
         print('error:', data)
+        return None
 
 def convert_to_Nhour(df: pd.DataFrame,hour:2|4=4) -> pd.DataFrame:
     """

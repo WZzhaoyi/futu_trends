@@ -120,7 +120,7 @@ class NotificationEngine:
         message = MIMEText(html_content, 'html', 'utf-8')
         message["From"] = self.sender
         message['To'] = ','.join(self.receivers)
-        message['Subject'] = Header(f"Futu Stock Trends - {datetime.today().strftime('%Y-%m-%d')} - {subject}", 'utf-8')
+        message['Subject'] = Header(f"Trends - {datetime.today().strftime('%Y-%m-%d')} - {subject}", 'utf-8')
 
         try:
             smtpObj = smtplib.SMTP_SSL(self.mail_host, self.mail_port) #建立smtp连接，ssl 465端口

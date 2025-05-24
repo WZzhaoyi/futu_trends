@@ -145,10 +145,12 @@ def fetch_futu_data(code: str, ktype: str, max_count: int, config: configparser.
         port = int(config.get("CONFIG", "FUTU_PORT"))
         
         # 确定实际请求的K线类型和数量
-        needs_hourly = ktype in ['K_HALF_DAY', 'K_240M', 'K_120M']
-        _ktype = ft.KLType.K_60M if needs_hourly else ktype
-        multiplier = {'K_HALF_DAY': 6, 'K_240M': 4, 'K_120M': 2}.get(ktype, 1)
-        request_count = min(1000, max_count * multiplier if needs_hourly else max_count)
+        _ktype = ktype
+        request_count = max_count
+        if ktype in ['K_HALF_DAY', 'K_240M', 'K_120M']:
+            _ktype = ft.KLType.K_60M
+            multiplier = {'K_HALF_DAY': 6, 'K_240M': 4, 'K_120M': 2}.get(ktype, 1)
+            request_count = min(1000, max_count * multiplier)
         
         # 计算时间范围
         end = datetime.now()
@@ -173,7 +175,7 @@ def fetch_futu_data(code: str, ktype: str, max_count: int, config: configparser.
                 start=start_str,
                 end=end_str,
                 autype=ft.AuType.QFQ,
-                max_count=None  # 不限制返回数量，获取时间范围内所有数据
+                max_count=None
             )
             
             if kline[0] != ft.RET_OK:
@@ -215,19 +217,26 @@ def get_yfinance_params(ktype: str, max_count: int) -> dict:
     
     return {'interval': interval, 'period': period}
 
-def fetch_yfinance_data(code: str, ktype: str, max_count: int) -> pd.DataFrame:
+def fetch_yfinance_data(code: str, ktype: str, max_count: int, config: configparser.ConfigParser) -> pd.DataFrame:
     """获取YFinance最近数据"""
     with _yfinance_lock:
+        # 设置代理
+        proxy = config.get("CONFIG", "PROXY", fallback=None)
+        if proxy:
+            yf.set_config(proxy=proxy)
+            
         yf_code = futu_code_to_yfinance_code(code)
         params = get_yfinance_params(ktype, max_count)
         
-        history = yf.Ticker(yf_code).history(**params)
+        tic = yf.Ticker(yf_code)
+
+        history = tic.history(**params)
         if history.empty:
             return None
+        df = history[['Open', 'Close', 'Volume', 'High', 'Low']].copy()
         
         sleep(1)
-            
-        df = history[['Open', 'Close', 'Volume', 'High', 'Low']].copy()
+        
         return df.rename(columns={
             'Open': 'open', 'High': 'high',
             'Low': 'low', 'Close': 'close',
@@ -317,7 +326,7 @@ def fetch_akshare_data(code: str, ktype: str, max_count: int) -> pd.DataFrame:
         # 确保获取最近的数据
         df = df.sort_index().tail(max_count)
         
-        sleep(0.5)  # 避免请求过于频繁
+        sleep(0.5)
         
         return df
 
@@ -340,7 +349,7 @@ def get_kline_data(code: str, config: configparser.ConfigParser, max_count: int 
     if source_type == 'futu':
         df = fetch_futu_data(code, ktype, max_count, config)
     elif source_type == 'yfinance':
-        df = fetch_yfinance_data(code, ktype, max_count)
+        df = fetch_yfinance_data(code, ktype, max_count, config)
     elif source_type == 'akshare':
         df = fetch_akshare_data(code, ktype, max_count)
     else:
