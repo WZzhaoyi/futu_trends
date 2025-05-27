@@ -387,6 +387,7 @@ if __name__ == "__main__":
     push_type = config.get("CONFIG", "FUTU_PUSH_TYPE")
     prompt = config.get("CONFIG", "LLM_PROMPT", fallback='')
     llm_url = config.get("CONFIG", "LLM_URL", fallback='')
+    proxy = config.get("CONFIG", "PROXY", fallback=None)
 
     # 获取股票列表
     code_pd = pd.DataFrame(columns=['code','name'])
@@ -412,7 +413,7 @@ if __name__ == "__main__":
     # 使用LLM生成消息
     if prompt and llm_url:
         prompt = read_prompt(prompt)
-        msg = generate_text(llm_url,prompt+'\n'+msg,format='email')+'\n\n当日信号如下：\n'+msg
+        msg = generate_text(llm_url,prompt+'\n'+msg,format='email',proxy=proxy)+'\n\n当日信号如下：\n'+msg
 
     notification = NotificationEngine(config)
     notification.send_futu_message(trends_df.index.tolist(),trends_df['msg'].tolist())

@@ -6,7 +6,7 @@ LLM客户端模块，统一使用OpenAI SDK
 """
 
 import argparse
-from openai import OpenAI
+import openai
 from urllib.parse import urlparse, parse_qs, urljoin
 import sys
 import os
@@ -44,7 +44,8 @@ def generate_text(
     prompt: str,
     temperature: float = 1,
     max_tokens: int = 2000,
-    format: str = "markdown"
+    format: str = "markdown",
+    proxy: str = None
 ) -> str:
     """
     使用指定的URL生成文本
@@ -78,19 +79,23 @@ def generate_text(
                  "5. 使用缩进表示层级关系\n" + \
                  "6. 使用 ===== 作为分隔线\n" + \
                  "7. 避免使用表格、代码块等复杂格式"
-    
-    client = OpenAI(
+
+    client = openai.OpenAI(
         base_url=params["base_url"],
-        api_key=params["api_key"]
+        api_key=params["api_key"],
+        http_client=openai.DefaultHttpxClient(
+            proxy=proxy
+        ) if proxy else None
     )
     
     response = client.chat.completions.create(
         model=params["model"],
         messages=[{"role": "user", "content": prompt}],
         temperature=temperature,
-        max_tokens=max_tokens
+        max_tokens=max_tokens,
+        reasoning_effort='low'
     )
-    
+
     return response.choices[0].message.content
 
 def read_prompt(prompt: str) -> str:
@@ -122,7 +127,7 @@ def main():
     parser.add_argument('--temperature', type=float, default=1, help='温度参数（默认：1）')
     parser.add_argument('--max-tokens', type=int, default=2000, help='最大生成token数（默认：2000）')
     parser.add_argument('--format', choices=['markdown', 'email', 'plain'], default='markdown', help='输出格式（默认：markdown）')
-    
+    parser.add_argument('--proxy', type=str, default=None, help='代理地址')
     args = parser.parse_args()
     
     try:
@@ -135,7 +140,8 @@ def main():
             prompt=prompt,
             temperature=args.temperature,
             max_tokens=args.max_tokens,
-            format=args.format
+            format=args.format,
+            proxy=args.proxy
         )
         print(response)
     except Exception as e:
