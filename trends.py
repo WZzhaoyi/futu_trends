@@ -2,7 +2,7 @@ import json
 import os
 from ft_config import get_config
 from data import get_kline_data
-from llm_client import generate_text, read_prompt
+from llm_client import generate_text_with_config
 from params_db import ParamsDB
 from signal_analysis import detect_stochastic_signals_vectorized
 from tools import *
@@ -385,9 +385,6 @@ if __name__ == "__main__":
     code_list = config.get("CONFIG", "FUTU_CODE_LIST", fallback='').split(',')
     code_list = [code for code in code_list if code.strip()]
     push_type = config.get("CONFIG", "FUTU_PUSH_TYPE")
-    prompt = config.get("CONFIG", "LLM_PROMPT", fallback='')
-    llm_url = config.get("CONFIG", "LLM_URL", fallback='')
-    proxy = config.get("CONFIG", "PROXY", fallback=None)
 
     # 获取股票列表
     code_pd = pd.DataFrame(columns=['code','name'])
@@ -411,9 +408,7 @@ if __name__ == "__main__":
     msg = '{} {} {}:\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group if group else '', push_type, '\n'.join(trends_df['msg']))
 
     # 使用LLM生成消息
-    if prompt and llm_url:
-        prompt = read_prompt(prompt)
-        msg = generate_text(llm_url,prompt+'\n'+msg,format='email',proxy=proxy)+'\n\n当日信号如下：\n'+msg
+    msg = generate_text_with_config(config, msg)
 
     notification = NotificationEngine(config)
     notification.send_futu_message(trends_df.index.tolist(),trends_df['msg'].tolist())

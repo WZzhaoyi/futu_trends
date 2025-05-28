@@ -9,6 +9,8 @@ from IPython.display import display
 from statsmodels.tsa.stattools import acf
 from scipy.signal import periodogram
 import os
+from tqdm import tqdm
+from multiprocessing import Pool, cpu_count
 
 # 设置随机种子
 random_seed = 42  # 可以选择任意整数（如 42、2025 等）
@@ -431,6 +433,64 @@ def display_kd_signals(df_visual, title, best_params, result):
     img_buf.seek(0)  # 将缓冲区的指针重置到开始位置
     return img_buf
 
+def run_bayes_optimization(args):
+    """运行贝叶斯优化"""
+    i, space, objective, max_evals, random_seed = args
+    
+    if random_seed is not None:
+        np.random.seed(random_seed)
+        random.seed(random_seed)
+    
+    trials = Trials()
+    
+    best = fmin(
+        fn=objective,
+        space=space,
+        algo=tpe.suggest,
+        max_evals=max_evals,
+        trials=trials,
+        verbose=False
+    )
+    
+    score = -trials.best_trial['result']['loss']
+    return score, best
+
+class OptimizationObjective:
+    def __init__(self, df, look_ahead, target_multiplier, atr_period, signal_count_target):
+        self.df = df
+        self.look_ahead = look_ahead
+        self.target_multiplier = target_multiplier
+        self.atr_period = atr_period
+        self.signal_count_target = signal_count_target
+
+    def __call__(self, params):
+        # 转换为整数值
+        params_int = {
+            'k_period': int(params['k_period']),
+            'd_period': int(params['d_period']),
+            'overbought': params['overbought'],
+            'oversold': params['oversold'],
+            'support_ma_period': int(params['support_ma_period']),
+            'resistance_ma_period': int(params['resistance_ma_period']),
+            'atr_period_explicit': int(params['atr_period_explicit']),
+            'atr_period_hidden': int(params['atr_period_hidden']),
+            'strength_threshold': params['strength_threshold']
+        }
+        df_with_signals = detect_stochastic_signals_vectorized(self.df.copy(), params_int, mode='train')
+        result = calculate_win_rate(df_with_signals, look_ahead=self.look_ahead, 
+                                  target_multiplier=self.target_multiplier, 
+                                  atr_period=self.atr_period)
+        
+        support_f1 = 2 * (result['strong_support_win_rate'] * result['support_recall']) / (result['strong_support_win_rate'] + result['support_recall']) if (result['strong_support_win_rate'] + result['support_recall']) > 0 else 0
+        resistance_f1 = 2 * (result['strong_resistance_win_rate'] * result['resistance_recall']) / (result['strong_resistance_win_rate'] + result['resistance_recall']) if (result['strong_resistance_win_rate'] + result['resistance_recall']) > 0 else 0
+        score = (support_f1 + resistance_f1) / 2
+        
+        # 添加信号数量惩罚项
+        signal_count_penalty = min(1.0, min(result['strong_support_signals_count'], result['strong_resistance_signals_count']) / self.signal_count_target)
+        adjusted_score = score * signal_count_penalty
+        
+        return -adjusted_score  # 负值用于最小化
+
 def KD_analysis(df, name, evals=500, look_ahead:int=0):
     # 参数空间
     space = {
@@ -442,7 +502,7 @@ def KD_analysis(df, name, evals=500, look_ahead:int=0):
         'resistance_ma_period': hp.quniform('resistance_ma_period', 5, 60, 5),
         'atr_period_explicit': hp.quniform('atr_period_explicit', 5, 60, 5),
         'atr_period_hidden': hp.quniform('atr_period_hidden', 5, 60, 5),
-        'strength_threshold': hp.quniform('strength_threshold', 0.1, 2, 0.1)
+        'strength_threshold': hp.quniform('strength_threshold', 0.1, 4, 0.1)
     }
 
     # 主流atr_period
@@ -467,47 +527,32 @@ def KD_analysis(df, name, evals=500, look_ahead:int=0):
     print(f"Recommended look_ahead for {current_state['Period']}: {currnet_look_ahead} days")
     print(f"Pre-calculated: look_ahead={look_ahead}, target_multiplier={target_multiplier:.2f}, atr_period={atr_period}")
 
-    # 目标函数，调整优化目标以保留更多信号
-    def objective(params):
-        # 转换为整数值
-        params_int = {
-            'k_period': int(params['k_period']),
-            'd_period': int(params['d_period']),
-            'overbought': params['overbought'],
-            'oversold': params['oversold'],
-            'support_ma_period': int(params['support_ma_period']),
-            'resistance_ma_period': int(params['resistance_ma_period']),
-            'atr_period_explicit': int(params['atr_period_explicit']),
-            'atr_period_hidden': int(params['atr_period_hidden']),
-            'strength_threshold': params['strength_threshold']
-        }
-        df_with_signals = detect_stochastic_signals_vectorized(df.copy(), params_int, mode='train')
-        result = calculate_win_rate(df_with_signals, look_ahead=look_ahead, target_multiplier=target_multiplier, atr_period=atr_period)
-        
-        # 计算F2得分（β=2，更重视召回率）
-        # beta = 2
-        # support_precision = result['strong_support_win_rate']
-        # support_recall = result['support_recall']
-        # resistance_precision = result['strong_resistance_win_rate']
-        # resistance_recall = result['resistance_recall']
-        
-        # support_f2 = (1 + beta**2) * (support_precision * support_recall) / (beta**2 * support_precision + support_recall) if (support_precision + support_recall) > 0 else 0
-        # resistance_f2 = (1 + beta**2) * (resistance_precision * resistance_recall) / (beta**2 * resistance_precision + resistance_recall) if (resistance_precision + resistance_recall) > 0 else 0
-        # score = (support_f2 + resistance_f2) / 2
+    # 创建目标函数对象
+    objective = OptimizationObjective(df, look_ahead, target_multiplier, atr_period, signal_count_target)
 
-        support_f1 = 2 * (result['strong_support_win_rate'] * result['support_recall']) / (result['strong_support_win_rate'] + result['support_recall']) if (result['strong_support_win_rate'] + result['support_recall']) > 0 else 0
-        resistance_f1 = 2 * (result['strong_resistance_win_rate'] * result['resistance_recall']) / (result['strong_resistance_win_rate'] + result['resistance_recall']) if (result['strong_resistance_win_rate'] + result['resistance_recall']) > 0 else 0
-        score = (support_f1 + resistance_f1) / 2
-        
-        # 添加信号数量惩罚项
-        signal_count_penalty = min(1.0, min(result['strong_support_signals_count'], result['strong_resistance_signals_count']) / signal_count_target)
-        adjusted_score = score * signal_count_penalty
-        
-        return -adjusted_score  # 负值用于最小化
+    # 进程池并行优化
+    scores = []
+    best_params = []
+    n_optimizations = 10
 
-    # 执行贝叶斯优化
-    trials = Trials()
-    best = fmin(objective, space, algo=tpe.suggest, max_evals=evals, trials=trials, rstate=np.random.default_rng(random_seed))
+    optimization_args = [
+        (i, space, objective, evals, np.random.randint(0, 1000000))
+        for i in range(n_optimizations)
+    ]
+
+    n_processes = max(1, cpu_count() - 1)  # 保留一个CPU核心
+    with Pool(processes=n_processes) as pool:
+        results = list(tqdm(
+            pool.imap(run_bayes_optimization, optimization_args),
+            total=n_optimizations
+        ))
+
+    scores, best_params = zip(*results)
+
+    best_idx = np.argmax(scores)
+    print(f"best score: {scores[best_idx]:.4f} best params: {best_params[best_idx]}")
+
+    best = best_params[best_idx]
 
     # 将best参数转换为实际值
     best_params = {
