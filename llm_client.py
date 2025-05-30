@@ -124,7 +124,7 @@ def generate_text(
     url: str,
     prompt: str,
     temperature: float | str = None,
-    max_tokens: int = 2000,
+    max_tokens: int = None,
     format: str = "markdown",
     proxy: str = None
 ) -> str:
@@ -209,7 +209,7 @@ def main():
     parser.add_argument('--url', required=True, help='LLM API URL，格式：{base_url}?model={model}&key={api_key}')
     parser.add_argument('--prompt', required=True, help='输入提示，可以是文本或文件路径（以@开头）')
     parser.add_argument('--temperature', type=float, default=None, help='温度参数（默认：None）')
-    parser.add_argument('--max-tokens', type=int, default=2000, help='最大生成token数（默认：2000）')
+    parser.add_argument('--max-tokens', type=int, default=None, help='最大生成token数')
     parser.add_argument('--format', choices=['markdown', 'email', 'plain'], default='markdown', help='输出格式（默认：markdown）')
     parser.add_argument('--proxy', type=str, default=None, help='代理地址')
     args = parser.parse_args()
