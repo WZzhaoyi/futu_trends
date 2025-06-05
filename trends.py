@@ -35,7 +35,7 @@ def inside_MA(close, last_low, last_high): # 计算MA5,10,15中的最小值和�
     else:
         return True
 
-def is_reverse(code: str, df: pd.DataFrame | None, config: configparser.ConfigParser) -> str | None:
+def is_reverse(df: pd.DataFrame | None, code: str, config: configparser.ConfigParser) -> str | None:
     """检查是否出现反转信号"""
     assert len(df) >= 90
     
@@ -122,7 +122,8 @@ def is_continue(data:pd.DataFrame)->str|None:# 检查macd趋势延续
     
     return None if msg == '' else msg
 
-def is_breakout(high, low, close, N:int=10)->str|None:# K线突破/跌破均线
+def is_breakout(data:pd.DataFrame, N:int=10)->str|None:# K线突破/跌破均线
+    close = data['close']
     close_ema = EMA(close, N)
     last_close = round_decimal(close.iloc[-1])
     last_ema = round_decimal(close_ema[-1])
@@ -135,7 +136,7 @@ def is_breakout(high, low, close, N:int=10)->str|None:# K线突破/跌破均线
     return None
 
 def is_top_down(data:pd.DataFrame) -> str|None:# KDJ顶部和底部信号/背离
-    assert len(data) >= 40
+    assert len(data) >= 26
     last_row = len(data) - 1
     # 计算KDJ
     k,d,j = KDJ(data['close'], data['high'], data['low'])
@@ -305,23 +306,20 @@ def check_trends(code_in_group, config: configparser.ConfigParser):
             print(f"Warning: Empty data for {futu_code}")
             continue
 
-        high = pd.Series(df['high'].values.ravel())
-        low = pd.Series(df['low'].values.ravel())
-        close = pd.Series(df['close'].values.ravel())
         name = code_in_group['name'].iloc[idx]
 
-        if len(high) == 0 or len(low) == 0 or len(close) == 0:
+        if len(df['high']) == 0 or len(df['low']) == 0 or len(df['close']) == 0:
             print(f"Warning: No data for {futu_code}")
             continue
 
         msg = f'{futu_code} {name}'
         for i in trend_type:
             if i.lower() == 'breakout':
-                bo = is_breakout(high,low,close) # 突破/跌破EMA均线
+                bo = is_breakout(df) # 突破/跌破EMA均线
                 if bo is not None:
                     msg += f' | {bo}'
             elif i.lower() == 'reverse':
-                rev = is_reverse(futu_code,df,config) # 趋势反转
+                rev = is_reverse(df,futu_code,config) # 趋势反转
                 if rev is not None:
                     msg += f' | {rev}'
             elif i.lower() == 'continue':
@@ -338,7 +336,7 @@ def check_trends(code_in_group, config: configparser.ConfigParser):
                     msg += f' | {bal}'
         
         # 计算动量因子
-        momentum = calc_momentum(close)
+        momentum = calc_momentum(df['close'])
         
         # 获取最后两个动量值，用于判断方向
         last_momentum = momentum.iloc[-1]
@@ -353,11 +351,17 @@ def check_trends(code_in_group, config: configparser.ConfigParser):
             msg += f'→'
         
         # 添加到结果列表
+
+        recent_high = df['high'].iloc[-3:].max()
+        recent_low = df['low'].iloc[-3:].min()
+
         results.append({
             'futu_code': futu_code,
             'name': name,
             'msg': msg,
-            'momentum': last_momentum
+            'momentum': last_momentum,
+            'high': recent_high,
+            'low': recent_low
         })
     
     # 创建DataFrame并按动量因子排序
@@ -367,7 +371,9 @@ def check_trends(code_in_group, config: configparser.ConfigParser):
             'futu_code': 'ZERO_AXIS',
             'name': '动量0轴',
             'msg': '━━━动量0轴━━━',
-            'momentum': 0.000
+            'momentum': 0.000,
+            'high': 0.000,
+            'low': 0.000
         })
         
         result_df = pd.DataFrame(results)
@@ -375,7 +381,7 @@ def check_trends(code_in_group, config: configparser.ConfigParser):
         result_df.sort_values('momentum', ascending=False, inplace=True)
         return result_df
     else:
-        return pd.DataFrame(columns=['name', 'msg', 'momentum'])
+        return pd.DataFrame(columns=['name', 'msg', 'momentum', 'high', 'low'])
 
 if __name__ == "__main__":
     config = get_config()
@@ -405,12 +411,17 @@ if __name__ == "__main__":
 
     trends_df = check_trends(code_pd,config)
 
-    msg = '{} {} {}:\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group if group else '', push_type, '\n'.join(trends_df['msg']))
-
-    # 使用LLM生成消息
-    msg = generate_text_with_config(config, msg)
+    raw_msg = '{} {} {}:\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group if group else '', push_type, '\n'.join(trends_df['msg']))
 
     notification = NotificationEngine(config)
-    notification.send_futu_message(trends_df.index.tolist(),trends_df['msg'].tolist())
-    notification.send_telegram_message(msg,'https://www.futunn.com/')
-    notification.send_email(f'{group} {push_type}',msg)
+    notification.send_futu_message(trends_df.index.tolist(),trends_df['msg'].tolist(),trends_df['high'].tolist(),trends_df['low'].tolist())
+
+    # LLM消息
+    msg = generate_text_with_config(config, raw_msg)
+    if raw_msg != msg:
+        notification.send_telegram_message(msg,'https://www.futunn.com/')
+        notification.send_email(f'{group} {push_type}',msg)
+
+    # 原始消息
+    notification.send_telegram_message(raw_msg,'https://www.futunn.com/')
+    notification.send_email(f'{group} {push_type}',raw_msg)

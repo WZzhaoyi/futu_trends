@@ -59,7 +59,7 @@ class NotificationEngine:
         futu_keyword = config.get("CONFIG", "FUTU_KEYWORD", fallback="")
         self.futu_keyword = [keyword.strip() for keyword in futu_keyword.split(',') if keyword.strip()]
 
-    def send_futu_message(self, codes:list[str], messages:list[str]):
+    def send_futu_message(self, codes:list[str], messages:list[str], highs:list[float], lows:list[float]):
         """
         根据关键词存入futu group
         """
@@ -71,9 +71,14 @@ class NotificationEngine:
         
         for keyword in self.futu_keyword:
             code_list = []
-            for code, msg in zip(codes, messages): 
+            for code, msg, recent_high, recent_low in zip(codes, messages, highs, lows): 
                 if keyword in msg:
                     code_list.append(code)
+                    quote_ctx.set_price_reminder(code=code, op=SetPriceReminderOp.DEL_ALL)
+                    quote_ctx.set_price_reminder(code=code, op=SetPriceReminderOp.ADD, reminder_type=PriceReminderType.PRICE_UP,reminder_freq=PriceReminderFreq.ONCE,value=recent_high)
+                    quote_ctx.set_price_reminder(code=code, op=SetPriceReminderOp.ADD, reminder_type=PriceReminderType.PRICE_DOWN,reminder_freq=PriceReminderFreq.ONCE,value=recent_low)
+                    self.plog(f'{code} 价格提醒 [{recent_low},{recent_high}]')
+                    time.sleep(0.5)
             if code_list:
                 ret, data = quote_ctx.modify_user_security(keyword, ModifyUserSecurityOp.ADD, code_list)
                 if ret == RET_OK:

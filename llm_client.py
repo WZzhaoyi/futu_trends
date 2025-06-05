@@ -91,7 +91,7 @@ def generate_text_with_config(
         proxy=llm_config['proxy']
     )
     
-    return msg + '\n\n当日信号如下：\n' + content
+    return msg
 
 def parse_llm_url(url: str) -> Dict[str, str|None]:
     """
