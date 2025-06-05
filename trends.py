@@ -215,15 +215,16 @@ def is_top_down(data:pd.DataFrame) -> str|None:# KDJ顶部和底部信号/背离
     # 检测背离
     has_divergence = False
     i = len(top_indices) - 1
+    j = len(bottom_indices) - 1
     if has_top and len(top_indices) >= 2 and 3 <= top_indices[i] - top_indices[i-1] < 14:
         prev_high = max(data['high'].iloc[top_indices[i-1]], data['high'].iloc[top_indices[i-1]-1])
         curr_high = max(data['high'].iloc[top_indices[i]], data['high'].iloc[top_indices[i]-1])
         if curr_high > prev_high:
             msg += 'RSI顶背离🚨'
             has_divergence = True
-    elif has_bottom and len(bottom_indices) >= 2 and 3 <= bottom_indices[i] - bottom_indices[i-1] < 14:
-        prev_low = min(data['low'].iloc[bottom_indices[i-1]], data['low'].iloc[bottom_indices[i-1]-1])
-        curr_low = min(data['low'].iloc[bottom_indices[i]], data['low'].iloc[bottom_indices[i]-1])
+    elif has_bottom and len(bottom_indices) >= 2 and 3 <= bottom_indices[j] - bottom_indices[j-1] < 14:
+        prev_low = min(data['low'].iloc[bottom_indices[j-1]], data['low'].iloc[bottom_indices[j-1]-1])
+        curr_low = min(data['low'].iloc[bottom_indices[j]], data['low'].iloc[bottom_indices[j]-1])
         if curr_low < prev_low:
             msg += 'RSI底背离🚨'
             has_divergence = True
