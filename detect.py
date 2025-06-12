@@ -14,7 +14,7 @@ import json
 from datetime import datetime
 from tools import code_in_futu_group
 
-def run_analysis(code_list:pd.DataFrame, config:ConfigParser, output_dir='./output', data_dir='./data'):
+def run_analysis(code_list:pd.DataFrame, config:ConfigParser, output_dir='./output', data_dir='./data/detect'):
     # 确保输出目录存在
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(data_dir, exist_ok=True)
