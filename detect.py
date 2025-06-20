@@ -14,7 +14,7 @@ import json
 from datetime import datetime
 from tools import code_in_futu_group
 
-def run_analysis(code_list:pd.DataFrame, config:ConfigParser, output_dir='./output', data_dir='./data/detect'):
+def run_analysis(code_list:pd.DataFrame, config:ConfigParser, output_dir='./output', data_dir='./data/detect', cache_expiry_days=1):
     # 确保输出目录存在
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(data_dir, exist_ok=True)
@@ -30,18 +30,16 @@ def run_analysis(code_list:pd.DataFrame, config:ConfigParser, output_dir='./outp
         print(f"\n---- Analyzing {name_list[idx]} ----\n")
         
         # 检查本地数据文件
-        timestamp = datetime.now().strftime('%Y%m%d')
-        data_file_name = f'data_{code.replace(".", "_")}_{timestamp}_{ktype}.csv'
+        data_file_name = f'data_{code.replace(".", "_")}_{ktype}.csv'
         data_file = os.path.join(data_dir, data_file_name)
-        
-        if os.path.exists(data_file):
-            print(f"使用本地数据文件: {data_file}")
-            df = pd.read_csv(data_file, index_col=0, parse_dates=True)
-        else:
+        if not os.path.exists(data_file) or (datetime.now() - datetime.fromtimestamp(os.path.getmtime(data_file))).days > cache_expiry_days:
             # 文件不存在，下载数据
             print(f"下载新数据: {data_file}")
             df = get_kline_data(code, config, max_count=1100)
             df.to_csv(data_file)
+        else:
+            print(f"使用本地数据文件: {data_file}")
+            df = pd.read_csv(data_file, index_col=0, parse_dates=True)
 
         result_file_name = os.path.join(output_dir, f'signals_{code.replace(".", "_")}_{timestamp}_{ktype}.json')
         if os.path.exists(result_file_name):

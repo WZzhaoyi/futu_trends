@@ -19,34 +19,31 @@ class RSRatingCalculator:
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True, parents=True)
         self.cache_expiry_days = 1
-        self._data_cache = {}  # 股票数据内存缓存
-        self._us_stocks = None  # 美股代码内存缓存
-        self._benchmark_cache = {}  # 基准个股列表内存缓存
+        self.market_index_map = {
+            'A500': '000905.SH',  # 中证500指数
+            'HSI': '159920.SZ',         # 恒生指数
+            'SP500': 'SPY'      # 标普500指数
+        }
         
     def _get_us_stocks(self) -> pd.DataFrame:
         """获取美股代码列表，带缓存功能"""
-        # 检查内存缓存
-        if self._us_stocks is not None:
-            return self._us_stocks
-            
         # 检查文件缓存
         cache_path = self.cache_dir / "us_stocks.csv"
         if cache_path.exists():
             cache_time = datetime.fromtimestamp(cache_path.stat().st_mtime)
             if (datetime.now() - cache_time).days < self.cache_expiry_days*30:
                 try:
-                    self._us_stocks = pd.read_csv(cache_path)
-                    return self._us_stocks
+                    return pd.read_csv(cache_path)
                 except Exception as e:
                     logger.warning(f"读取美股代码缓存失败: {str(e)}")
         
         # 获取新的美股代码列表
         try:
-            self._us_stocks = ak.stock_us_spot_em()
-            if not self._us_stocks.empty:
+            us_stocks = ak.stock_us_spot_em()
+            if not us_stocks.empty:
                 # 保存到文件缓存
-                self._us_stocks.to_csv(cache_path, index=False)
-            return self._us_stocks
+                us_stocks.to_csv(cache_path, index=False)
+            return us_stocks
         except Exception as e:
             logger.error(f"获取美股代码列表失败: {str(e)}")
             return pd.DataFrame()
@@ -79,9 +76,6 @@ class RSRatingCalculator:
         else:
             ak_ticker = self._convert_ticker_format(ticker)
         
-        if ak_ticker in self._data_cache:
-            return self._data_cache[ak_ticker]
-            
         cache_path = self.cache_dir / f"{ak_ticker}.csv"
         
         # 检查文件缓存
@@ -89,9 +83,7 @@ class RSRatingCalculator:
             cache_time = datetime.fromtimestamp(cache_path.stat().st_mtime)
             if (datetime.now() - cache_time).days < self.cache_expiry_days:
                 try:
-                    data = pd.read_csv(cache_path, index_col=0, parse_dates=True)
-                    self._data_cache[ak_ticker] = data
-                    return data
+                    return pd.read_csv(cache_path, index_col=0, parse_dates=True)
                 except Exception as e:
                     logger.warning(f"读取缓存失败 {ak_ticker}: {str(e)}")
         
@@ -148,7 +140,6 @@ class RSRatingCalculator:
             
             if not df.empty:
                 df.to_csv(cache_path)
-                self._data_cache[ak_ticker] = df
                 
             time.sleep(0.5)  # 避免请求过于频繁
             return df
@@ -174,19 +165,13 @@ class RSRatingCalculator:
     
     def _get_benchmark_tickers(self, market: str) -> List[str]:
         """获取基准指数成分股列表，带缓存功能"""
-        # 检查内存缓存
-        if market in self._benchmark_cache:
-            return self._benchmark_cache[market]
-            
         # 检查文件缓存
         cache_path = self.cache_dir / f"benchmark_{market}.csv"
         if cache_path.exists():
             cache_time = datetime.fromtimestamp(cache_path.stat().st_mtime)
             if (datetime.now() - cache_time).days < self.cache_expiry_days*30:
                 try:
-                    tickers = pd.read_csv(cache_path)['ticker'].tolist()
-                    self._benchmark_cache[market] = tickers
-                    return tickers
+                    return pd.read_csv(cache_path)['ticker'].tolist()
                 except Exception as e:
                     logger.warning(f"读取基准个股缓存失败 {market}: {str(e)}")
         
@@ -206,8 +191,6 @@ class RSRatingCalculator:
                 
             # 保存到文件缓存
             pd.DataFrame({'ticker': tickers}).to_csv(cache_path, index=False)
-            # 保存到内存缓存
-            self._benchmark_cache[market] = tickers
             
             return tickers
             
@@ -265,27 +248,102 @@ class RSRatingCalculator:
         
         return rs_ratings
 
+    def _calculate_beta(self, stock_data: pd.DataFrame, market_data: pd.DataFrame, period: str = '12mo') -> float:
+        """计算股票的beta值
+        
+        Args:
+            stock_data: 股票历史数据
+            market_data: 大盘指数历史数据
+            period: 计算周期，默认12个月
+            
+        Returns:
+            float: beta值
+        """
+        if stock_data.empty or market_data.empty:
+            return 0.0
+            
+        days = self.days_map[period]
+        start_date = stock_data.index[-1] - pd.Timedelta(days=days)
+        
+        # 获取指定周期的数据
+        stock_period = stock_data[stock_data.index >= start_date]
+        market_period = market_data[market_data.index >= start_date]
+        
+        # 确保数据对齐
+        common_dates = stock_period.index.intersection(market_period.index)
+        if len(common_dates) < 2:
+            return 0.0
+            
+        stock_returns = stock_period.loc[common_dates, 'close'].pct_change().dropna()
+        market_returns = market_period.loc[common_dates, 'close'].pct_change().dropna()
+        
+        # 计算beta
+        covariance = np.cov(stock_returns, market_returns)[0][1]
+        market_variance = np.var(market_returns)
+        
+        if market_variance == 0:
+            return 0.0
+            
+        return covariance / market_variance
+        
+    def calculate_rs_rating_and_beta(self, ticker: str, market: str = 'A500') -> Dict[str, Union[Dict[str, float], float]]:
+        """计算股票的RS Rating和Beta值
+        
+        Args:
+            ticker: 股票代码
+            market: 市场类型 ('A500', 'HSI', 'SP500')
+            
+        Returns:
+            Dict: 包含RS Rating和Beta值的字典
+        """
+        if market not in ['A500', 'HSI', 'SP500']:
+            raise ValueError("市场类型必须是 'A500', 'HSI' 或 'SP500'")
+            
+        # 获取股票数据
+        stock_data = self._get_stock_data(ticker, market)
+        if stock_data.empty:
+            return {'rs_rating': {}, 'beta': 0.0}
+            
+        # 获取大盘指数数据
+        market_index = self.market_index_map[market]
+        market_data = self._get_stock_data(market_index, market)
+        if market_data.empty:
+            return {'rs_rating': {}, 'beta': 0.0}
+            
+        # 计算RS Rating
+        rs_ratings = self.calculate_rs_rating(ticker, market)
+        
+        # 计算Beta值
+        beta = self._calculate_beta(stock_data, market_data)
+        
+        return {
+            'rs_rating': rs_ratings,
+            'beta': beta
+        }
+
 def main():
-    # 使用示例
     calculator = RSRatingCalculator()
     
-    # A股示例（支持两种格式）
+    # A股
     a_stock = '603129.SS'
-    a_result = calculator.calculate_rs_rating(a_stock, 'A500')
-    print(f"\nA股 {a_stock} 的RS Rating:")
-    print(f"各时间段评分: {a_result}")
+    a_result = calculator.calculate_rs_rating_and_beta(a_stock, 'A500')
+    print(f"\nA股 {a_stock} 的分析结果:")
+    print(f"RS Rating: {a_result['rs_rating']}")
+    print(f"Beta值: {a_result['beta']:.2f}")
     
-    # 港股示例（支持两种格式）
+    # 港股
     hk_stock = '9899.HK'
-    hk_result = calculator.calculate_rs_rating(hk_stock, 'HSI')
-    print(f"\n港股 {hk_stock} 的RS Rating:")
-    print(f"各时间段评分: {hk_result}")
+    hk_result = calculator.calculate_rs_rating_and_beta(hk_stock, 'HSI')
+    print(f"\n港股 {hk_stock} 的分析结果:")
+    print(f"RS Rating: {hk_result['rs_rating']}")
+    print(f"Beta值: {hk_result['beta']:.2f}")
     
-    # 美股示例
+    # 美股
     us_stock = 'ESLT'
-    us_result = calculator.calculate_rs_rating(us_stock, 'SP500')
-    print(f"\n美股 {us_stock} 的RS Rating:")
-    print(f"各时间段评分: {us_result}")
+    us_result = calculator.calculate_rs_rating_and_beta(us_stock, 'SP500')
+    print(f"\n美股 {us_stock} 的分析结果:")
+    print(f"RS Rating: {us_result['rs_rating']}")
+    print(f"Beta值: {us_result['beta']:.2f}")
 
 if __name__ == "__main__":
     main() 
