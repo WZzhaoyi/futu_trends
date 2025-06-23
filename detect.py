@@ -25,6 +25,7 @@ def run_analysis(code_list:pd.DataFrame, config:ConfigParser, output_dir='./outp
     look_ahead = config.get("CONFIG", "KD_LOOK_AHEAD")
     look_ahead = int(look_ahead) if look_ahead else 0
     ktype = config.get("CONFIG", "FUTU_PUSH_TYPE")
+    timestamp = datetime.now().strftime('%Y%m%d')
 
     for idx, code in enumerate(code_list['code'].values):
         print(f"\n---- Analyzing {name_list[idx]} ----\n")
@@ -72,7 +73,6 @@ def run_analysis(code_list:pd.DataFrame, config:ConfigParser, output_dir='./outp
         results[code] = result
         
     # 保存参数优化结果
-    timestamp = datetime.now().strftime('%Y%m%d')
     summary_file = os.path.join(output_dir, f'analysis_params_{timestamp}_{ktype}.json')
     with open(summary_file, 'w') as f:
         json.dump(results, f, indent=4)
