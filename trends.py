@@ -411,11 +411,13 @@ if __name__ == "__main__":
         exit()
 
     trends_df = check_trends(code_pd,config)
-
     raw_msg = '{} {} {}:\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group if group else '', push_type, '\n'.join(trends_df['msg']))
+    filter_df = trends_df[trends_df['msg'].str.count('\\|') >= 2]
 
     notification = NotificationEngine(config)
-    notification.send_futu_message(trends_df.index.tolist(),trends_df['msg'].tolist(),trends_df['high'].tolist(),trends_df['low'].tolist())
+
+    # futu分组/到价提醒
+    notification.send_futu_message(filter_df.index.tolist(),filter_df['msg'].tolist(),filter_df['high'].tolist(),filter_df['low'].tolist())
 
     # LLM消息
     msg = generate_text_with_config(config, raw_msg)
@@ -426,3 +428,6 @@ if __name__ == "__main__":
     # 原始消息
     notification.send_telegram_message(raw_msg,'https://www.futunn.com/')
     notification.send_email(f'{group} {push_type}',raw_msg)
+
+    # google sheet
+    notification.send_google_sheet_message('{} {} {}:\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group if group else '', push_type, '\n'.join(filter_df['msg'])))

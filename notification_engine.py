@@ -17,6 +17,7 @@
 
 import configparser
 from datetime import datetime
+import re
 import smtplib
 from email.mime.text import MIMEText
 from email.header import Header
@@ -26,6 +27,12 @@ import os
 import json
 from requests_html import HTMLSession
 from futu import *
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+import datetime
+import httplib2
+from google_auth_httplib2 import AuthorizedHttp
+
 
 class NotificationEngine:
     def plog(self,content):
@@ -58,6 +65,11 @@ class NotificationEngine:
         self.port = int(config.get("CONFIG", "FUTU_PORT"))
         futu_keyword = config.get("CONFIG", "FUTU_KEYWORD", fallback="")
         self.futu_keyword = [keyword.strip() for keyword in futu_keyword.split(',') if keyword.strip()]
+
+        # Google Sheet configuration
+        self.google_sheet_id = config.get("CONFIG", "GOOGLE_SHEET_ID")
+        self.google_api_json = config.get("CONFIG", "GOOGLE_API_JSON")
+        self.google_sheet_cell_origin = config.get("CONFIG", "GOOGLE_SHEET_CELL_ORIGIN", fallback="B2")
 
     def send_futu_message(self, codes:list[str], messages:list[str], highs:list[float], lows:list[float]):
         """
@@ -197,6 +209,93 @@ class NotificationEngine:
         if result.status_code != 200: # 如果分组发送失败 则单独发送图片
             for pic in pic_urls:
                 self.send_telegram_photo(pic)
+    
+    def send_google_sheet_message(self, message):
+        """
+        更新Google Sheet
+        """
+        if not self.google_sheet_id or not os.path.exists(self.google_api_json) or not self.google_sheet_cell_origin:
+            self.plog('Google Sheet配置不完整，跳过发送')
+            return
+
+        # 获取Google Sheet服务
+        SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+        creds = Credentials.from_service_account_file(self.google_api_json, scopes=SCOPES)
+        
+        # 配置代理
+        proxy_url = self.PROXIES['http'].split('://', 1)[1]
+        proxy_host, proxy_port = proxy_url.rsplit(':', 1)
+        http = AuthorizedHttp(creds, httplib2.Http(proxy_info=httplib2.ProxyInfo(
+            proxy_type=httplib2.socks.PROXY_TYPE_HTTP,
+            proxy_host=proxy_host,
+            proxy_port=int(proxy_port),
+        )))
+        service = build('sheets', 'v4', http=http)
+
+        # 解析网格原点和日期
+        match = re.match(r'([A-Z]+)(\d+)', self.google_sheet_cell_origin)
+        if not match:
+            raise ValueError("Invalid grid_origin format, expected like 'B2'")
+        
+        start_col_letter, start_row = match.groups()
+        start_row = int(start_row)
+        today = datetime.date.today()
+        cell_sheet_name = today.strftime('%y-%m')
+
+        # 确保工作表存在
+        sheet_metadata = service.spreadsheets().get(spreadsheetId=self.google_sheet_id).execute()
+        if not any(sheet['properties']['title'] == cell_sheet_name for sheet in sheet_metadata.get('sheets', [])):
+            # 创建新工作表并初始化日历模板
+            service.spreadsheets().batchUpdate(
+                spreadsheetId=self.google_sheet_id,
+                body={'requests': [{'addSheet': {'properties': {'title': cell_sheet_name}}}]}
+            ).execute()
+            
+            headers = [['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']]
+            header_range = f'{cell_sheet_name}!{start_col_letter}{start_row}:{chr(ord(start_col_letter)+6)}{start_row}'
+            service.spreadsheets().values().update(
+                spreadsheetId=self.google_sheet_id,
+                range=header_range,
+                valueInputOption='RAW',
+                body={'values': headers}
+            ).execute()
+
+        # 计算目标单元格位置
+        start_col = ord(start_col_letter[0]) - ord('A')
+        day, weekday = today.day, today.weekday()
+        week = (day - 1) // 7
+        col_offset = (weekday + 1) % 7
+        target_col = chr(ord('A') + start_col + col_offset)
+        target_row = start_row + week + 1  # +1 跳过星期标题行
+        
+        # 更新单元格 读取后追加内容
+        cell = f'{cell_sheet_name}!{target_col}{target_row}'
+        
+        try:
+            existing_result = service.spreadsheets().values().get(
+                spreadsheetId=self.google_sheet_id,
+                range=cell
+            ).execute()
+            existing_values = existing_result.get('values', [])
+            existing_content = existing_values[0][0] if existing_values and existing_values[0] else ""
+        except:
+            existing_content = ""
+        
+        # 合并内容
+        if existing_content:
+            updated_content = f"{existing_content}\n\n{message}"
+        else:
+            updated_content = f"{message}"
+        
+        # 更新单元格
+        result = service.spreadsheets().values().update(
+            spreadsheetId=self.google_sheet_id,
+            range=cell,
+            valueInputOption='RAW',
+            body={'values': [[updated_content]]}
+        ).execute()
+        
+        self.plog(f'Google Sheet Updated: {self.google_sheet_id} at {cell}')
 
 if __name__ == "__main__":
     BASE_DIR = os.path.split(os.path.realpath(__file__))[0]
