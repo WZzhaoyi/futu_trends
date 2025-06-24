@@ -16,7 +16,7 @@
 #  Copyright (c)  Joey - All Rights Reserved
 
 import configparser
-from datetime import datetime
+from datetime import datetime,date
 import re
 import smtplib
 from email.mime.text import MIMEText
@@ -29,7 +29,6 @@ from requests_html import HTMLSession
 from futu import *
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-import datetime
 import httplib2
 from google_auth_httplib2 import AuthorizedHttp
 
@@ -239,7 +238,7 @@ class NotificationEngine:
         
         start_col_letter, start_row = match.groups()
         start_row = int(start_row)
-        today = datetime.date.today()
+        today = date.today()
         cell_sheet_name = today.strftime('%y-%m')
 
         # 确保工作表存在
