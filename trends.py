@@ -4,7 +4,7 @@ from ft_config import get_config
 from data import get_kline_data
 from llm_client import generate_text_with_config
 from params_db import ParamsDB
-from signal_analysis import detect_stochastic_signals_vectorized
+from signal_analysis import detect_stochastic_signals_vectorized, get_target_price
 from tools import *
 import datetime
 import configparser
@@ -43,7 +43,10 @@ def is_reverse(df: pd.DataFrame | None, code: str, config: configparser.ConfigPa
     try:
         db_path = config.get("CONFIG", "KD_PARAMS_DB", fallback=None)
         db = ParamsDB(db_path)
-        params = db.get_stock_params(code)['best_params']
+        data = db.get_stock_params(code)
+        params = data['best_params']
+        meta = data['meta_info']
+        performance = data['performance']
                 
         if not params:
             print(f"No parameters found for {code}")
@@ -63,8 +66,11 @@ def is_reverse(df: pd.DataFrame | None, code: str, config: configparser.ConfigPa
     
     # 检查是否有反转信号
     msg = ''
-    if reversal != 'none':
+    if reversal != 'none' and type(reversal) == str:
         msg += reversal.replace(' reversal','')
+        target = get_target_price(df, is_support='support' in reversal, target_multiplier=meta['target_multiplier'], atr_period=meta['atr_period'])
+        if target is not None:
+            msg += f' {target}'
     if is_strong == 1:
         msg += u'🚨'
     return None if msg == '' else msg
