@@ -176,7 +176,7 @@ def calculate_target_multiplier(df, atr_period=20, look_ahead=10):
     resistance_returns = (df['close'] - df['future_low']) / df['atr']
     valid_returns = pd.concat([support_returns.dropna(), resistance_returns.dropna()])
     
-    return np.median(valid_returns) if len(valid_returns) > 0 else 1.0
+    return np.mean(valid_returns) if len(valid_returns) > 0 else 1.0
 
 def calculate_atr_period(df, max_period=60):
     daily_range = df['high'] - df['low']
@@ -218,21 +218,8 @@ def detect_stochastic_signals_vectorized(df: pd.DataFrame, params: dict, mode='t
                       params['k_period'], params['d_period'])
     support_ma = df['close'].rolling(window=int(params['support_ma_period']), min_periods=1).mean()
     resistance_ma = df['close'].rolling(window=int(params['resistance_ma_period']), min_periods=1).mean()
-    # vol_ma = df['volume'].rolling(window=5, min_periods=1).mean()
-    # ma_short = df['close'].rolling(window=5).mean().fillna(0)
-    # ma_middle = df['close'].rolling(window=10).mean().fillna(0)
-    # ma_long = df['close'].rolling(window=15).mean().fillna(0)
-    # atr_explicit = ATR(df['high'], df['low'], df['close'], period=params['atr_period_explicit'])
-    # atr_hidden = ATR(df['high'], df['low'], df['close'], period=params['atr_period_hidden'])
     
     df['signal_strength'] = abs(k - d)
-    # df['k_amplitude'] = df['high'] - df['low']
-
-    # up_trend = (ma_short > ma_middle) & (ma_middle > ma_long)
-    # down_trend = (ma_short < ma_middle) & (ma_middle < ma_long)
-    
-    # support_condition = (k > d) & (k.shift(1) <= d.shift(1)) & (k < params['oversold']) & (up_trend) & (df['close'] < support_ma)
-    # resistance_condition = (k < d) & (k.shift(1) >= d.shift(1)) & (k > params['overbought']) & (down_trend) & (df['close'] > resistance_ma)
 
     support_condition = (k > d) & (k.shift(1) <= d.shift(1)) & (k < params['oversold']) & (df['close'] < support_ma)
     resistance_condition = (k < d) & (k.shift(1) >= d.shift(1)) & (k > params['overbought']) & (df['close'] > resistance_ma)
@@ -251,34 +238,24 @@ def detect_stochastic_signals_vectorized(df: pd.DataFrame, params: dict, mode='t
         default='none'
     )
     
-    # 显性强信号 放量突破
-    # df['is_strong_explicit'] = np.where(
-    #     (df['reversal'] != 'none') & 
-    #     (df['signal_strength'] >= params['strength_threshold']) & 
-    #     (df['k_amplitude'] > atr_explicit),
-    #     1, 0
-    # )
-    
-    # 隐秘强信号 小实体衰竭
-    # df['is_strong_hidden'] = np.where(
-    #     (df['reversal'] != 'none') & 
-    #     (df['signal_strength'] >= params['strength_threshold']) & 
-    #     (df['k_amplitude'] < atr_hidden), 
-    #     1, 0
-    # )
-    
-    # df['is_strong'] = np.where(
-    #     (df['is_strong_explicit'] == 1) | (df['is_strong_hidden'] == 1),
-    #     1, 0
-    # )
-    
     df['is_strong'] = np.where(
         (df['reversal'] != 'none') & 
-        (df['signal_strength'] >= params['strength_threshold']),
+        (df['signal_strength'] >= round(params['strength_threshold'],1)),
         1, 0
     )
 
     return df
+
+def get_target_price(df, is_support=True, target_multiplier=1, atr_period=20):
+    df = df.copy()
+    atr = ATR(df['high'], df['low'], df['close'], period=atr_period).fillna(0).iloc[-1]
+    close = df['close'].iloc[-1]
+    target = None
+    if is_support:
+        target = close + atr * target_multiplier
+    else:
+        target = close - atr * target_multiplier
+    return round(target, 3) if isinstance(target, float) and target > 0 else None
 
 def calculate_win_rate(df, look_ahead=10, target_multiplier=1, atr_period=20):
     df = df.copy()
@@ -312,16 +289,6 @@ def calculate_win_rate(df, look_ahead=10, target_multiplier=1, atr_period=20):
     strong_support_win_rate = strong_support_signals['support_win'].mean() if len(strong_support_signals) > 0 else 0
     strong_resistance_win_rate = strong_resistance_signals['resistance_win'].mean() if len(strong_resistance_signals) > 0 else 0
     
-    # explicit_strong_support_signals = df[(df['reversal'] == 'support reversal') & (df['is_strong_explicit'] == 1)]
-    # explicit_strong_resistance_signals = df[(df['reversal'] == 'resistance reversal') & (df['is_strong_explicit'] == 1)]
-    # explicit_strong_support_win_rate = explicit_strong_support_signals['support_win'].mean() if len(explicit_strong_support_signals) > 0 else 0
-    # explicit_strong_resistance_win_rate = explicit_strong_resistance_signals['resistance_win'].mean() if len(explicit_strong_resistance_signals) > 0 else 0
-    
-    # hidden_strong_support_signals = df[(df['reversal'] == 'support reversal') & (df['is_strong_hidden'] == 1)]
-    # hidden_strong_resistance_signals = df[(df['reversal'] == 'resistance reversal') & (df['is_strong_hidden'] == 1)]
-    # hidden_strong_support_win_rate = hidden_strong_support_signals['support_win'].mean() if len(hidden_strong_support_signals) > 0 else 0
-    # hidden_strong_resistance_win_rate = hidden_strong_resistance_signals['resistance_win'].mean() if len(hidden_strong_resistance_signals) > 0 else 0
-    
     support_recall = len(strong_support_signals) / len(support_signals) if len(support_signals) > 0 else 0
     resistance_recall = len(strong_resistance_signals) / len(resistance_signals) if len(resistance_signals) > 0 else 0
     
@@ -334,14 +301,6 @@ def calculate_win_rate(df, look_ahead=10, target_multiplier=1, atr_period=20):
         'strong_support_signals_count': len(strong_support_signals),
         'strong_resistance_win_rate': strong_resistance_win_rate,
         'strong_resistance_signals_count': len(strong_resistance_signals),
-        # 'explicit_strong_support_win_rate': explicit_strong_support_win_rate,
-        # 'explicit_strong_support_signals_count': len(explicit_strong_support_signals),
-        # 'explicit_strong_resistance_win_rate': explicit_strong_resistance_win_rate,
-        # 'explicit_strong_resistance_signals_count': len(explicit_strong_resistance_signals),
-        # 'hidden_strong_support_win_rate': hidden_strong_support_win_rate,
-        # 'hidden_strong_support_signals_count': len(hidden_strong_support_signals),
-        # 'hidden_strong_resistance_win_rate': hidden_strong_resistance_win_rate,
-        # 'hidden_strong_resistance_signals_count': len(hidden_strong_resistance_signals),
         'support_recall': support_recall,
         'resistance_recall': resistance_recall,
         'detailed_df': df
@@ -366,44 +325,12 @@ def display_kd_signals(df_visual, title, best_params, result):
     print(f"Overall Resistance Reversal Win Rate: {result['resistance_win_rate']:.2%} (Signals: {result['resistance_signals_count']})")
     print(f"Strong Support Reversal Win Rate: {result['strong_support_win_rate']:.2%} (Signals: {result['strong_support_signals_count']})")
     print(f"Strong Resistance Reversal Win Rate: {result['strong_resistance_win_rate']:.2%} (Signals: {result['strong_resistance_signals_count']})")
-    # print(f"Explicit Strong Support Win Rate: {result['explicit_strong_support_win_rate']:.2%} (Signals: {result['explicit_strong_support_signals_count']})")
-    # print(f"Explicit Strong Resistance Win Rate: {result['explicit_strong_resistance_win_rate']:.2%} (Signals: {result['explicit_strong_resistance_signals_count']})")
-    # print(f"Hidden Strong Support Win Rate: {result['hidden_strong_support_win_rate']:.2%} (Signals: {result['hidden_strong_support_signals_count']})")
-    # print(f"Hidden Strong Resistance Win Rate: {result['hidden_strong_resistance_win_rate']:.2%} (Signals: {result['hidden_strong_resistance_signals_count']})")
     print(f"Support Recall: {result['support_recall']:.2%}")
     print(f"Resistance Recall: {result['resistance_recall']:.2%}")
 
-    fig = plt.figure(figsize=(16, 10))
+    fig = plt.figure(figsize=(20, 10))
     plt.yscale('log')  # 设置y轴为对数坐标
     plt.plot(df_visual.index, df_visual['close'], label='Close Price', color='blue', alpha=0.5)
-
-    # 显性强信号
-    # plt.scatter(df_visual[(df_visual['reversal'] == 'support reversal') & (df_visual['is_strong_explicit'] == 1) & (df_visual['support_win'] == 1)].index,
-    #             df_visual[(df_visual['reversal'] == 'support reversal') & (df_visual['is_strong_explicit'] == 1) & (df_visual['support_win'] == 1)]['close'],
-    #             color='darkgreen', marker='o', label='Explicit Strong Support (Win)', s=100)
-    # plt.scatter(df_visual[(df_visual['reversal'] == 'support reversal') & (df_visual['is_strong_explicit'] == 1) & (df_visual['support_win'] == 0)].index,
-    #             df_visual[(df_visual['reversal'] == 'support reversal') & (df_visual['is_strong_explicit'] == 1) & (df_visual['support_win'] == 0)]['close'],
-    #             color='lightgreen', marker='o', label='Explicit Strong Support (Lose)', s=100)
-    # plt.scatter(df_visual[(df_visual['reversal'] == 'resistance reversal') & (df_visual['is_strong_explicit'] == 1) & (df_visual['resistance_win'] == 1)].index,
-    #             df_visual[(df_visual['reversal'] == 'resistance reversal') & (df_visual['is_strong_explicit'] == 1) & (df_visual['resistance_win'] == 1)]['close'],
-    #             color='darkred', marker='s', label='Explicit Strong Resistance (Win)', s=100)
-    # plt.scatter(df_visual[(df_visual['reversal'] == 'resistance reversal') & (df_visual['is_strong_explicit'] == 1) & (df_visual['resistance_win'] == 0)].index,
-    #             df_visual[(df_visual['reversal'] == 'resistance reversal') & (df_visual['is_strong_explicit'] == 1) & (df_visual['resistance_win'] == 0)]['close'],
-    #             color='salmon', marker='s', label='Explicit Strong Resistance (Lose)', s=100)
-
-    # 隐秘强信号（用不同标记区分）
-    # plt.scatter(df_visual[(df_visual['reversal'] == 'support reversal') & (df_visual['is_strong_hidden'] == 1) & (df_visual['support_win'] == 1)].index,
-    #             df_visual[(df_visual['reversal'] == 'support reversal') & (df_visual['is_strong_hidden'] == 1) & (df_visual['support_win'] == 1)]['close'],
-    #             color='darkgreen', marker='^', label='Hidden Strong Support (Win)', s=100)
-    # plt.scatter(df_visual[(df_visual['reversal'] == 'support reversal') & (df_visual['is_strong_hidden'] == 1) & (df_visual['support_win'] == 0)].index,
-    #             df_visual[(df_visual['reversal'] == 'support reversal') & (df_visual['is_strong_hidden'] == 1) & (df_visual['support_win'] == 0)]['close'],
-    #             color='lightgreen', marker='^', label='Hidden Strong Support (Lose)', s=100)
-    # plt.scatter(df_visual[(df_visual['reversal'] == 'resistance reversal') & (df_visual['is_strong_hidden'] == 1) & (df_visual['resistance_win'] == 1)].index,
-    #             df_visual[(df_visual['reversal'] == 'resistance reversal') & (df_visual['is_strong_hidden'] == 1) & (df_visual['resistance_win'] == 1)]['close'],
-    #             color='darkred', marker='v', label='Hidden Strong Resistance (Win)', s=100)
-    # plt.scatter(df_visual[(df_visual['reversal'] == 'resistance reversal') & (df_visual['is_strong_hidden'] == 1) & (df_visual['resistance_win'] == 0)].index,
-    #             df_visual[(df_visual['reversal'] == 'resistance reversal') & (df_visual['is_strong_hidden'] == 1) & (df_visual['resistance_win'] == 0)]['close'],
-    #             color='salmon', marker='v', label='Hidden Strong Resistance (Lose)', s=100)
 
     # 强信号
     plt.scatter(df_visual[(df_visual['reversal'] == 'support reversal') & (df_visual['is_strong'] == 1) & (df_visual['support_win'] == 1)].index,
@@ -437,11 +364,8 @@ def display_kd_signals(df_visual, title, best_params, result):
     # 增强标题信息
     title = (
         f'{title}\n'
-        # f'k={best_params["k_period"]}, d={best_params["d_period"]}, overbought={best_params["overbought"]}, oversold={best_params["oversold"]}, support_ma={best_params["support_ma_period"]}, resistance_ma={best_params["resistance_ma_period"]}, atr_explicit={best_params["atr_period_explicit"]}, atr_hidden={best_params["atr_period_hidden"]}, threshold={best_params["strength_threshold"]:.1f}\n'
         f'k={best_params["k_period"]}, d={best_params["d_period"]}, overbought={best_params["overbought"]}, oversold={best_params["oversold"]}, support_ma={best_params["support_ma_period"]}, resistance_ma={best_params["resistance_ma_period"]}, threshold={best_params["strength_threshold"]:.1f}\n'
         f'Support Win Rate: {result["support_win_rate"]:.2%}, Resistance Win Rate: {result["resistance_win_rate"]:.2%}\n'
-        # f'Explicit Strong Support Win Rate: {result["explicit_strong_support_win_rate"]:.2%} (Signals: {result["explicit_strong_support_signals_count"]}) Explicit Strong Resistance Win Rate: {result["explicit_strong_resistance_win_rate"]:.2%} (Signals: {result["explicit_strong_resistance_signals_count"]})\n'
-        # f'Hidden Strong Support Win Rate: {result["hidden_strong_support_win_rate"]:.2%} (Signals: {result["hidden_strong_support_signals_count"]}) Hidden Strong Resistance Win Rate: {result["hidden_strong_resistance_win_rate"]:.2%} (Signals: {result["hidden_strong_resistance_signals_count"]})\n'
         f'Strong Support Win Rate: {result["strong_support_win_rate"]:.2%}, Strong Resistance Win Rate: {result["strong_resistance_win_rate"]:.2%}\n'
         f'Support Recall: {result["support_recall"]:.2%} Resistance Recall: {result["resistance_recall"]:.2%}'
     )
@@ -520,8 +444,6 @@ class OptimizationObjective:
             'oversold': params['oversold'],
             'support_ma_period': int(params['support_ma_period']),
             'resistance_ma_period': int(params['resistance_ma_period']),
-            # 'atr_period_explicit': int(params['atr_period_explicit']),
-            # 'atr_period_hidden': int(params['atr_period_hidden']),
             'strength_threshold': params['strength_threshold']
         }
         df_with_signals = detect_stochastic_signals_vectorized(self.df.copy(), params_int, mode='train')
@@ -548,8 +470,6 @@ def KD_analysis(df, name, evals=500, look_ahead:int=0):
         'oversold': hp.quniform('oversold', 10, 50, 5),
         'support_ma_period': hp.quniform('support_ma_period', 5, 60, 5),
         'resistance_ma_period': hp.quniform('resistance_ma_period', 5, 60, 5),
-        # 'atr_period_explicit': hp.quniform('atr_period_explicit', 5, 60, 5),
-        # 'atr_period_hidden': hp.quniform('atr_period_hidden', 5, 60, 5),
         'strength_threshold': hp.quniform('strength_threshold', 0.1, 4, 0.1)
     }
 
@@ -610,15 +530,13 @@ def KD_analysis(df, name, evals=500, look_ahead:int=0):
         'oversold': best['oversold'],
         'support_ma_period': int(best['support_ma_period']),
         'resistance_ma_period': int(best['resistance_ma_period']),
-        # 'atr_period_explicit': int(best['atr_period_explicit']),
-        # 'atr_period_hidden': int(best['atr_period_hidden']),
-        'strength_threshold': best['strength_threshold']
+        'strength_threshold': round(best['strength_threshold'], 1)
     }
 
     # 使用最佳参数计算最终信号
     print(f"\n--------Training signals for {name} with best params--------")
     df = detect_stochastic_signals_vectorized(df, best_params, mode='train')
-    result = calculate_win_rate(df)
+    result = calculate_win_rate(df, look_ahead=look_ahead, target_multiplier=target_multiplier, atr_period=atr_period)
     df_visual = result['detailed_df']
     title = f'{name} Stochastic Oscillator Signals (look_ahead:{look_ahead} signal_target_percent:{(signal_target_percentage*100):.1f}%)'
 
@@ -626,7 +544,7 @@ def KD_analysis(df, name, evals=500, look_ahead:int=0):
 
     print(f"\n--------Checked signals for {name} with best params--------")
     df_checked = detect_stochastic_signals_vectorized(df, best_params, mode='check')
-    result_checked = calculate_win_rate(df_checked)
+    result_checked = calculate_win_rate(df_checked, look_ahead=look_ahead, target_multiplier=target_multiplier, atr_period=atr_period)
     df_visual_checked = result_checked['detailed_df']
     checked_plot = display_kd_signals(df_visual_checked, f'Checked {title}', best_params, result_checked)
 
