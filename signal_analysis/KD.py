@@ -306,7 +306,7 @@ def calculate_win_rate(df, look_ahead=10, target_multiplier=1, atr_period=20):
         'detailed_df': df
     }
 
-def display_kd_signals(df_visual, title, best_params, result):
+def display_signals(df_visual, title, best_params, result):
     """
     绘制KD信号可视化图表
     
@@ -348,24 +348,25 @@ def display_kd_signals(df_visual, title, best_params, result):
                 
                 
     # 弱信号
-    plt.scatter(df_visual[(df_visual['reversal'] == 'support reversal') & (df_visual['is_strong'] == 0) & (df_visual['support_win'] == 1)].index,
-                df_visual[(df_visual['reversal'] == 'support reversal') & (df_visual['is_strong'] == 0) & (df_visual['support_win'] == 1)]['close'],
-                color='darkgreen', marker='o', label='Weak Support (Win)', s=30, alpha=0.3)
-    plt.scatter(df_visual[(df_visual['reversal'] == 'support reversal') & (df_visual['is_strong'] == 0) & (df_visual['support_win'] == 0)].index,
-                df_visual[(df_visual['reversal'] == 'support reversal') & (df_visual['is_strong'] == 0) & (df_visual['support_win'] == 0)]['close'],
-                color='lightgreen', marker='o', label='Weak Support (Lose)', s=30, alpha=0.3)
-    plt.scatter(df_visual[(df_visual['reversal'] == 'resistance reversal') & (df_visual['is_strong'] == 0) & (df_visual['resistance_win'] == 1)].index,
-                df_visual[(df_visual['reversal'] == 'resistance reversal') & (df_visual['is_strong'] == 0) & (df_visual['resistance_win'] == 1)]['close'],
-                color='darkred', marker='s', label='Weak Resistance (Win)', s=30, alpha=0.3)
-    plt.scatter(df_visual[(df_visual['reversal'] == 'resistance reversal') & (df_visual['is_strong'] == 0) & (df_visual['resistance_win'] == 0)].index,
-                df_visual[(df_visual['reversal'] == 'resistance reversal') & (df_visual['is_strong'] == 0) & (df_visual['resistance_win'] == 0)]['close'],
-                color='salmon', marker='s', label='Weak Resistance (Lose)', s=30, alpha=0.3)
+    if result["support_recall"] < 1 or result["resistance_recall"] < 1:
+        plt.scatter(df_visual[(df_visual['reversal'] == 'support reversal') & (df_visual['is_strong'] == 0) & (df_visual['support_win'] == 1)].index,
+                    df_visual[(df_visual['reversal'] == 'support reversal') & (df_visual['is_strong'] == 0) & (df_visual['support_win'] == 1)]['close'],
+                    color='darkgreen', marker='o', label='Weak Support (Win)', s=30, alpha=0.3)
+        plt.scatter(df_visual[(df_visual['reversal'] == 'support reversal') & (df_visual['is_strong'] == 0) & (df_visual['support_win'] == 0)].index,
+                    df_visual[(df_visual['reversal'] == 'support reversal') & (df_visual['is_strong'] == 0) & (df_visual['support_win'] == 0)]['close'],
+                    color='lightgreen', marker='o', label='Weak Support (Lose)', s=30, alpha=0.3)
+        plt.scatter(df_visual[(df_visual['reversal'] == 'resistance reversal') & (df_visual['is_strong'] == 0) & (df_visual['resistance_win'] == 1)].index,
+                    df_visual[(df_visual['reversal'] == 'resistance reversal') & (df_visual['is_strong'] == 0) & (df_visual['resistance_win'] == 1)]['close'],
+                    color='darkred', marker='s', label='Weak Resistance (Win)', s=30, alpha=0.3)
+        plt.scatter(df_visual[(df_visual['reversal'] == 'resistance reversal') & (df_visual['is_strong'] == 0) & (df_visual['resistance_win'] == 0)].index,
+                    df_visual[(df_visual['reversal'] == 'resistance reversal') & (df_visual['is_strong'] == 0) & (df_visual['resistance_win'] == 0)]['close'],
+                    color='salmon', marker='s', label='Weak Resistance (Lose)', s=30, alpha=0.3)
 
     # 增强标题信息
     title = (
         f'{title}\n'
-        f'k={best_params["k_period"]}, d={best_params["d_period"]}, overbought={best_params["overbought"]}, oversold={best_params["oversold"]}, support_ma={best_params["support_ma_period"]}, resistance_ma={best_params["resistance_ma_period"]}, threshold={best_params["strength_threshold"]:.1f}\n'
-        f'Support Win Rate: {result["support_win_rate"]:.2%}, Resistance Win Rate: {result["resistance_win_rate"]:.2%}\n'
+        f'{", ".join([f"{k}={v}" for k,v in best_params.items()])}\n'
+        f'Support Win Rate: {result["support_win_rate"]:.2%}({result["support_signals_count"]}), Resistance Win Rate: {result["resistance_win_rate"]:.2%}({result["resistance_signals_count"]})\n'
         f'Strong Support Win Rate: {result["strong_support_win_rate"]:.2%}, Strong Resistance Win Rate: {result["strong_resistance_win_rate"]:.2%}\n'
         f'Support Recall: {result["support_recall"]:.2%} Resistance Recall: {result["resistance_recall"]:.2%}'
     )
@@ -540,13 +541,13 @@ def KD_analysis(df, name, evals=500, look_ahead:int=0):
     df_visual = result['detailed_df']
     title = f'{name} Stochastic Oscillator Signals (look_ahead:{look_ahead} signal_target_percent:{(signal_target_percentage*100):.1f}%)'
 
-    original_plot = display_kd_signals(df_visual, title, best_params, result)
+    original_plot = display_signals(df_visual, title, best_params, result)
 
     print(f"\n--------Checked signals for {name} with best params--------")
     df_checked = detect_stochastic_signals_vectorized(df, best_params, mode='check')
     result_checked = calculate_win_rate(df_checked, look_ahead=look_ahead, target_multiplier=target_multiplier, atr_period=atr_period)
     df_visual_checked = result_checked['detailed_df']
-    checked_plot = display_kd_signals(df_visual_checked, f'Checked {title}', best_params, result_checked)
+    checked_plot = display_signals(df_visual_checked, f'Checked {title}', best_params, result_checked)
 
     del result["detailed_df"]
 

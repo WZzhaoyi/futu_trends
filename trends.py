@@ -4,13 +4,13 @@ from ft_config import get_config
 from data import get_kline_data
 from llm_client import generate_text_with_config
 from params_db import ParamsDB
-from signal_analysis import detect_stochastic_signals_vectorized, get_target_price
-from tools import *
+from signal_analysis import detect_stochastic_signals_vectorized, get_target_price, MACD, KD
+from tools import MA, EMA, RSI, KDJ, calc_momentum, code_in_futu_group, crossover_status, detect_divergence
+from tools import MACD as MACD_TOOLS
 import datetime
 import configparser
 from notification_engine import NotificationEngine
 from decimal import Decimal, ROUND_HALF_UP
-import sqlite3
 import pandas as pd
 
 def round_decimal(value, places=2):
@@ -49,15 +49,15 @@ def is_reverse(df: pd.DataFrame | None, code: str, config: configparser.ConfigPa
         performance = data['performance']
                 
         if not params:
-            print(f"No parameters found for {code}")
-            return 'No parameters'
+            print(f"No KD parameters found for {code}")
+            return 'No KD parameters'
             
     except Exception as e:
-        print(f"Error reading parameters for {code}: {str(e)}")
-        return 'Parameter error'
+        print(f"Error reading KD parameters for {code}: {str(e)}")
+        return 'KD parameter error'
     
     # 信号检测
-    result = detect_stochastic_signals_vectorized(df, params)
+    result = KD().calculate(df, params)
     
     # 获取最后一行的信号
     last_row = result.iloc[-1]
@@ -67,7 +67,7 @@ def is_reverse(df: pd.DataFrame | None, code: str, config: configparser.ConfigPa
     # 检查是否有反转信号
     msg = ''
     if reversal != 'none' and type(reversal) == str:
-        msg += reversal.replace(' reversal','')
+        msg += reversal.replace('reversal','kd')
         target = get_target_price(df, is_support='support' in reversal, target_multiplier=meta['target_multiplier'], atr_period=meta['atr_period'])
         if target is not None:
             msg += f' {target}'
@@ -75,57 +75,43 @@ def is_reverse(df: pd.DataFrame | None, code: str, config: configparser.ConfigPa
         msg += u'🚨'
     return None if msg == '' else msg
 
-def is_continue(data:pd.DataFrame)->str|None:# 检查macd趋势延续
-    assert len(data) >= 26
-    # 计算MACD
-    dif, dea = MACD(data['close'], 12, 26, 9)
-    data['DIF'] = dif
-    data['DEA'] = dea
+def is_continue(df:pd.DataFrame, code:str, config:configparser.ConfigParser)->str|None:# 检查macd趋势延续
+    assert len(df) >= 90
     
-    # 获取交叉状态
-    crossover = crossover_status(data['DIF'], data['DEA'])
-    golden_crosses = [i for i, c in enumerate(crossover) if c == 1]  # 金叉索引
-    dead_crosses = [i for i, c in enumerate(crossover) if c == -1]  # 死叉索引
+    # 从数据库读取参数
+    try:
+        db_path = config.get("CONFIG", "MACD_PARAMS_DB", fallback=None)
+        db = ParamsDB(db_path)
+        data = db.get_stock_params(code)
+        params = data['best_params']
+        meta = data['meta_info']
+        performance = data['performance']
+                
+        if not params:
+            print(f"No MACD parameters found for {code}")
+            return 'No MACD parameters'
+            
+    except Exception as e:
+        print(f"Error reading MACD parameters for {code}: {str(e)}")
+        return 'MACD parameter error'
     
+    # 信号检测
+    result = MACD().calculate(df, params)
+    
+    # 获取最后一行的信号
+    last_row = result.iloc[-1]
+    reversal =  last_row['reversal']
+    is_strong =  last_row['is_strong']
+    
+    # 检查是否有反转信号
     msg = ''
-    last_row_pos = len(data) - 1
-    
-    # 检测趋势延续信号
-    if golden_crosses and golden_crosses[-1] == last_row_pos and len(golden_crosses) > 1:
-        # 找到前一次金叉之后、当前金叉之前的死叉
-        prev_gc = golden_crosses[-2]
-        prev_dc = next((dc for dc in dead_crosses if prev_gc < dc < last_row_pos), None)
-        
-        if prev_dc is not None:
-            # 检查前一次死叉到当前金叉之间DEA是否都大于0
-            if data['DEA'].iloc[prev_dc:last_row_pos+1].min() > 0:
-                msg += '上升延续'
-    
-    if dead_crosses and dead_crosses[-1] == last_row_pos and len(dead_crosses) > 1:
-        # 找到前一次死叉之后、当前死叉之前的金叉
-        prev_dc = dead_crosses[-2]
-        prev_gc = next((gc for gc in golden_crosses if prev_dc < gc < last_row_pos), None)
-        
-        if prev_gc is not None:
-            # 检查前一次金叉到当前死叉之间DEA是否都小于0
-            if data['DEA'].iloc[prev_gc:last_row_pos+1].max() < 0:
-                msg += '下降延续'
-    
-    # 检测低位金叉和高位死叉
-    # if golden_crosses and golden_crosses[-1] == last_row_pos:
-    #     dif_high_threshold = data['DIF'].quantile(0.2)
-    #     dea_high_threshold = data['DEA'].quantile(0.2)
-        
-    #     if data['DIF'].iloc[last_row_pos] <= dif_high_threshold and data['DEA'].iloc[last_row_pos] <= dea_high_threshold:
-    #         msg += '低位金叉🚨'
-    
-    # if dead_crosses and dead_crosses[-1] == last_row_pos:
-    #     dif_low_threshold = data['DIF'].quantile(0.8)
-    #     dea_low_threshold = data['DEA'].quantile(0.8)
-        
-    #     if data['DIF'].iloc[last_row_pos] >= dif_low_threshold and data['DEA'].iloc[last_row_pos] >= dea_low_threshold:
-    #         msg += '高位死叉🚨'
-    
+    if reversal != 'none' and type(reversal) == str:
+        msg += reversal.replace('reversal','macd')
+        target = get_target_price(df, is_support='support' in reversal, target_multiplier=meta['target_multiplier'], atr_period=meta['atr_period'])
+        if target is not None:
+            msg += f' {target}'
+    if is_strong == 1:
+        msg += u'🚨'
     return None if msg == '' else msg
 
 def is_breakout(data:pd.DataFrame, N:int=10)->str|None:# K线突破/跌破均线
@@ -141,7 +127,7 @@ def is_breakout(data:pd.DataFrame, N:int=10)->str|None:# K线突破/跌破均线
         return f'跌破ema{N}'
     return None
 
-def is_top_down(data:pd.DataFrame) -> str|None:# KDJ顶部和底部信号/背离
+def is_top_down(data:pd.DataFrame) -> str|None:# KDJ顶部和底部背离
     assert len(data) >= 26
     last_row = len(data) - 1
     # 计算KDJ
@@ -152,10 +138,10 @@ def is_top_down(data:pd.DataFrame) -> str|None:# KDJ顶部和底部信号/背离
 
     msg = ''
 
-    if data['J'].iloc[-1]<100 and data['J'].iloc[-2]>=100 and data['J'].iloc[-3]>=100:
-        msg += f'KDJ顶消失'
-    elif data['J'].iloc[-1]>0 and data['J'].iloc[-2]<=0 and data['J'].iloc[-3]<=0:
-        msg += f'KDJ底消失'
+    # if data['J'].iloc[-1]<100 and data['J'].iloc[-2]>=100 and data['J'].iloc[-3]>=100:
+    #     msg += f'KDJ顶消失'
+    # elif data['J'].iloc[-1]>0 and data['J'].iloc[-2]<=0 and data['J'].iloc[-3]<=0:
+    #     msg += f'KDJ底消失'
     
     # KDJ背离
     crossover = crossover_status(data['K'], data['D'])
@@ -170,7 +156,7 @@ def is_top_down(data:pd.DataFrame) -> str|None:# KDJ顶部和底部信号/背离
         msg += 'KDJ底背离🚨'
     
     # MACD背离
-    dif, dea = MACD(data['close'], 12, 26, 9)
+    dif, dea = MACD_TOOLS(data['close'], 12, 26, 9)
     data['DIF'] = dif
     data['DEA'] = dea
     macd_crossover = crossover_status(data['DIF'], data['DEA'])
@@ -185,19 +171,19 @@ def is_top_down(data:pd.DataFrame) -> str|None:# KDJ顶部和底部信号/背离
         msg += 'MACD底背离🚨'
 
     # 检测MACD顶消失底消失
-    if macd_golden_crosses and macd_golden_crosses[-1] == last_row and macd_div_value == 0:
-        dif_high_threshold = data['DIF'].quantile(0.2)
-        dea_high_threshold = data['DEA'].quantile(0.2)
+    # if macd_golden_crosses and macd_golden_crosses[-1] == last_row and macd_div_value == 0:
+    #     dif_high_threshold = data['DIF'].quantile(0.2)
+    #     dea_high_threshold = data['DEA'].quantile(0.2)
         
-        if data['DIF'].iloc[last_row] <= dif_high_threshold and data['DEA'].iloc[last_row] <= dea_high_threshold:
-            msg += 'MACD底消失'
+    #     if data['DIF'].iloc[last_row] <= dif_high_threshold and data['DEA'].iloc[last_row] <= dea_high_threshold:
+    #         msg += 'MACD底消失'
     
-    elif macd_dead_crosses and macd_dead_crosses[-1] == last_row and macd_div_value == 0:
-        dif_low_threshold = data['DIF'].quantile(0.8)
-        dea_low_threshold = data['DEA'].quantile(0.8)
+    # elif macd_dead_crosses and macd_dead_crosses[-1] == last_row and macd_div_value == 0:
+    #     dif_low_threshold = data['DIF'].quantile(0.8)
+    #     dea_low_threshold = data['DEA'].quantile(0.8)
         
-        if data['DIF'].iloc[last_row] >= dif_low_threshold and data['DEA'].iloc[last_row] >= dea_low_threshold:
-            msg += 'MACD顶消失'
+    #     if data['DIF'].iloc[last_row] >= dif_low_threshold and data['DEA'].iloc[last_row] >= dea_low_threshold:
+    #         msg += 'MACD顶消失'
     
     # RSI检测
     rsi = RSI(data['close'], 6)
@@ -330,7 +316,7 @@ def check_trends(code_in_group, config: configparser.ConfigParser):
                 if rev is not None:
                     msg += f' | {rev}'
             elif i.lower() == 'continue':
-                co = is_continue(df) # 趋势延续
+                co = is_continue(df,futu_code,config) # 趋势延续
                 if co is not None:
                     msg += f' | {co}'
             elif i.lower() == 'topdown':

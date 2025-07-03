@@ -276,7 +276,7 @@ def MACD(close: pd.Series, fast_period=12, slow_period=26, signal_period=9): # �
     return dif, dea
 
 def detect_divergence(indicator_a: pd.Series, indicator_b: pd.Series, price: pd.Series, 
-                      golden_crosses: list = None, dead_crosses: list = None) -> pd.Series:
+                      golden_crosses: list|None = None, dead_crosses: list|None = None) -> pd.Series:
     """通用背离检测函数，接受预计算的交叉点"""
     divergence = pd.Series(0, index=price.index)
     idxs = price.index.to_list()

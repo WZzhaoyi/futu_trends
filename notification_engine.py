@@ -66,8 +66,8 @@ class NotificationEngine:
         self.futu_keyword = [keyword.strip() for keyword in futu_keyword.split(',') if keyword.strip()]
 
         # Google Sheet configuration
-        self.google_sheet_id = config.get("CONFIG", "GOOGLE_SHEET_ID")
-        self.google_api_json = config.get("CONFIG", "GOOGLE_API_JSON")
+        self.google_sheet_id = config.get("CONFIG", "GOOGLE_SHEET_ID", fallback="")
+        self.google_api_json = config.get("CONFIG", "GOOGLE_API_JSON", fallback="")
         self.google_sheet_cell_origin = config.get("CONFIG", "GOOGLE_SHEET_CELL_ORIGIN", fallback="B2")
 
     def send_futu_message(self, codes:list[str], messages:list[str], highs:list[float], lows:list[float]):

@@ -3,7 +3,7 @@ import os
 
 from matplotlib import pyplot as plt
 
-from signal_analysis import KD_analysis
+from signal_analysis import technical_analysis
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from configparser import ConfigParser
@@ -22,10 +22,19 @@ def run_analysis(code_list:pd.DataFrame, config:ConfigParser, output_dir='./outp
     results = {}
     name_list = code_list['name']
 
+    trend_type = config.get("CONFIG", "TREND_TYPE")
     look_ahead = config.get("CONFIG", "KD_LOOK_AHEAD")
     look_ahead = int(look_ahead) if look_ahead else 0
     ktype = config.get("CONFIG", "FUTU_PUSH_TYPE")
     timestamp = datetime.now().strftime('%Y%m%d')
+
+    indicator_dict = {
+        'reverse': 'KD',
+        'continue': 'MACD'
+    }
+    if trend_type not in indicator_dict:
+        raise ValueError(f"Invalid trend type: {trend_type}")
+    indicator_type = indicator_dict[trend_type]
 
     for idx, code in enumerate(code_list['code'].values):
         print(f"\n---- Analyzing {name_list[idx]} ----\n")
@@ -49,7 +58,7 @@ def run_analysis(code_list:pd.DataFrame, config:ConfigParser, output_dir='./outp
                 result = json.load(f)
         else:
             print(f"训练新结果: {result_file_name}")
-            result = KD_analysis(df, code, evals=500, look_ahead=look_ahead)
+            result = technical_analysis(df, code, indicator_type, evals=500, look_ahead=look_ahead)
 
             # 保存详细信号数据
             singal_file_name = os.path.join(output_dir, f'signals_{code.replace(".", "_")}_{timestamp}_{ktype}.csv')
