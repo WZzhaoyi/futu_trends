@@ -11,6 +11,8 @@ from scipy.signal import periodogram
 import os
 from tqdm import tqdm
 from multiprocessing import Pool, cpu_count
+import matplotlib.collections as mcoll
+import matplotlib.dates as mdates
 
 # 设置随机种子
 random_seed = 42  # 可以选择任意整数（如 42、2025 等）
@@ -308,18 +310,15 @@ def calculate_win_rate(df, look_ahead=10, target_multiplier=1, atr_period=20):
 
 def display_signals(df_visual, title, best_params, result):
     """
-    绘制KD信号可视化图表
-    
+    信号可视化
     Args:
         df_visual: 包含信号数据的DataFrame
         title: 图表标题
         best_params: 最佳参数字典
         result: 结果字典
-        
     Returns:
         BytesIO: 包含图表图像的缓冲区
     """
-
     print(f"Best Parameters: {best_params}")
     print(f"Overall Support Reversal Win Rate: {result['support_win_rate']:.2%} (Signals: {result['support_signals_count']})")
     print(f"Overall Resistance Reversal Win Rate: {result['resistance_win_rate']:.2%} (Signals: {result['resistance_signals_count']})")
@@ -328,41 +327,76 @@ def display_signals(df_visual, title, best_params, result):
     print(f"Support Recall: {result['support_recall']:.2%}")
     print(f"Resistance Recall: {result['resistance_recall']:.2%}")
 
-    fig = plt.figure(figsize=(20, 10))
-    plt.yscale('log')  # 设置y轴为对数坐标
-    plt.plot(df_visual.index, df_visual['close'], label='Close Price', color='blue', alpha=0.5)
+    fig, ax = plt.subplots(figsize=(20, 10))
+    plt.yscale('log')
+
+    # 大实体标记
+    atr = ATR(df_visual['high'], df_visual['low'], df_visual['close'], period=20).fillna(0)
+    change_pct = (df_visual['close'] - df_visual['open']) / df_visual['open']
+    threshold = 1.5 * atr / df_visual['open']
+    strength = change_pct.abs() / threshold
+    big_bull = change_pct > threshold
+    big_bear = change_pct < -threshold
+    bull_strength = np.clip(strength, 0.5, 1.0)
+    bear_strength = np.clip(strength, 0.5, 1.0)
+
+    x = mdates.date2num(df_visual.index.to_pydatetime())
+    y = np.array(df_visual['close'])
+    color_arr = []
+    alpha_arr = []
+    for i in range(1, len(df_visual)):
+        if big_bull.iloc[i]:
+            color_arr.append((1, 0, 0, bull_strength.iloc[i]))  # red, alpha by strength
+        elif big_bear.iloc[i]:
+            color_arr.append((0, 0.5, 0, bear_strength.iloc[i]))  # green, alpha by strength
+        else:
+            color_arr.append((0, 0, 1, 0.5))  # blue, normal alpha
+        alpha_arr.append(1)
+    # 绘制K线
+    points = np.array([x, y]).T.reshape(-1, 1, 2)
+    segments = np.concatenate([points[:-1], points[1:]], axis=1)
+    lc = mcoll.LineCollection(segments, colors=color_arr, linewidths=2)
+    ax.add_collection(lc)
+    ax.autoscale()
+    ax.xaxis_date()
+
+    # y轴自适应
+    ymin = np.nanmin(df_visual['close'])
+    ymax = np.nanmax(df_visual['close'])
+    ymin = ymin * 0.9
+    ymax = ymax * 1.1
+    ax.set_ylim(ymin, ymax)
 
     # 强信号
-    plt.scatter(df_visual[(df_visual['reversal'] == 'support reversal') & (df_visual['is_strong'] == 1) & (df_visual['support_win'] == 1)].index,
+    ax.scatter(df_visual[(df_visual['reversal'] == 'support reversal') & (df_visual['is_strong'] == 1) & (df_visual['support_win'] == 1)].index,
                 df_visual[(df_visual['reversal'] == 'support reversal') & (df_visual['is_strong'] == 1) & (df_visual['support_win'] == 1)]['close'],
                 color='darkgreen', marker='o', label='Strong Support (Win)', s=60)
-    plt.scatter(df_visual[(df_visual['reversal'] == 'support reversal') & (df_visual['is_strong'] == 1) & (df_visual['support_win'] == 0)].index,
+    ax.scatter(df_visual[(df_visual['reversal'] == 'support reversal') & (df_visual['is_strong'] == 1) & (df_visual['support_win'] == 0)].index,
                 df_visual[(df_visual['reversal'] == 'support reversal') & (df_visual['is_strong'] == 1) & (df_visual['support_win'] == 0)]['close'],
                 color='lightgreen', marker='o', label='Strong Support (Lose)', s=60)
-    plt.scatter(df_visual[(df_visual['reversal'] == 'resistance reversal') & (df_visual['is_strong'] == 1) & (df_visual['resistance_win'] == 1)].index,
+    ax.scatter(df_visual[(df_visual['reversal'] == 'resistance reversal') & (df_visual['is_strong'] == 1) & (df_visual['resistance_win'] == 1)].index,
                 df_visual[(df_visual['reversal'] == 'resistance reversal') & (df_visual['is_strong'] == 1) & (df_visual['resistance_win'] == 1)]['close'],
                 color='darkred', marker='s', label='Strong Resistance (Win)', s=60)
-    plt.scatter(df_visual[(df_visual['reversal'] == 'resistance reversal') & (df_visual['is_strong'] == 1) & (df_visual['resistance_win'] == 0)].index,
+    ax.scatter(df_visual[(df_visual['reversal'] == 'resistance reversal') & (df_visual['is_strong'] == 1) & (df_visual['resistance_win'] == 0)].index,
                 df_visual[(df_visual['reversal'] == 'resistance reversal') & (df_visual['is_strong'] == 1) & (df_visual['resistance_win'] == 0)]['close'],
                 color='salmon', marker='s', label='Strong Resistance (Lose)', s=60)
-                
-                
+    
     # 弱信号
     if result["support_recall"] < 1 or result["resistance_recall"] < 1:
-        plt.scatter(df_visual[(df_visual['reversal'] == 'support reversal') & (df_visual['is_strong'] == 0) & (df_visual['support_win'] == 1)].index,
+        ax.scatter(df_visual[(df_visual['reversal'] == 'support reversal') & (df_visual['is_strong'] == 0) & (df_visual['support_win'] == 1)].index,
                     df_visual[(df_visual['reversal'] == 'support reversal') & (df_visual['is_strong'] == 0) & (df_visual['support_win'] == 1)]['close'],
                     color='darkgreen', marker='o', label='Weak Support (Win)', s=30, alpha=0.3)
-        plt.scatter(df_visual[(df_visual['reversal'] == 'support reversal') & (df_visual['is_strong'] == 0) & (df_visual['support_win'] == 0)].index,
+        ax.scatter(df_visual[(df_visual['reversal'] == 'support reversal') & (df_visual['is_strong'] == 0) & (df_visual['support_win'] == 0)].index,
                     df_visual[(df_visual['reversal'] == 'support reversal') & (df_visual['is_strong'] == 0) & (df_visual['support_win'] == 0)]['close'],
                     color='lightgreen', marker='o', label='Weak Support (Lose)', s=30, alpha=0.3)
-        plt.scatter(df_visual[(df_visual['reversal'] == 'resistance reversal') & (df_visual['is_strong'] == 0) & (df_visual['resistance_win'] == 1)].index,
+        ax.scatter(df_visual[(df_visual['reversal'] == 'resistance reversal') & (df_visual['is_strong'] == 0) & (df_visual['resistance_win'] == 1)].index,
                     df_visual[(df_visual['reversal'] == 'resistance reversal') & (df_visual['is_strong'] == 0) & (df_visual['resistance_win'] == 1)]['close'],
                     color='darkred', marker='s', label='Weak Resistance (Win)', s=30, alpha=0.3)
-        plt.scatter(df_visual[(df_visual['reversal'] == 'resistance reversal') & (df_visual['is_strong'] == 0) & (df_visual['resistance_win'] == 0)].index,
+        ax.scatter(df_visual[(df_visual['reversal'] == 'resistance reversal') & (df_visual['is_strong'] == 0) & (df_visual['resistance_win'] == 0)].index,
                     df_visual[(df_visual['reversal'] == 'resistance reversal') & (df_visual['is_strong'] == 0) & (df_visual['resistance_win'] == 0)]['close'],
                     color='salmon', marker='s', label='Weak Resistance (Lose)', s=30, alpha=0.3)
 
-    # 增强标题信息
+    # 标题
     title = (
         f'{title}\n'
         f'{", ".join([f"{k}={v}" for k,v in best_params.items()])}\n'
@@ -370,15 +404,15 @@ def display_signals(df_visual, title, best_params, result):
         f'Strong Support Win Rate: {result["strong_support_win_rate"]:.2%}, Strong Resistance Win Rate: {result["strong_resistance_win_rate"]:.2%}\n'
         f'Support Recall: {result["support_recall"]:.2%} Resistance Recall: {result["resistance_recall"]:.2%}'
     )
-    plt.title(title, fontsize=12)
-    plt.xlabel('Date')
-    plt.ylabel('Close Price')
-    plt.grid(True, alpha=0.3)
-    plt.legend(loc='best')
+    ax.set_title(title, fontsize=12)
+    ax.set_xlabel('Date')
+    ax.set_ylabel('Close Price')
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc='best')
     img_buf = BytesIO()
     fig.savefig(img_buf, format='png', bbox_inches='tight')
-    plt.close(fig)  # 关闭图形，释放内存
-    img_buf.seek(0)  # 将缓冲区的指针重置到开始位置
+    plt.close(fig)
+    img_buf.seek(0)
     return img_buf
 
 def run_bayes_optimization(args):
