@@ -86,8 +86,8 @@ class NotificationEngine:
                 if keyword in msg:
                     code_list.append(code)
                     quote_ctx.set_price_reminder(code=code, op=SetPriceReminderOp.DEL_ALL)
-                    quote_ctx.set_price_reminder(code=code, op=SetPriceReminderOp.ADD, reminder_type=PriceReminderType.PRICE_UP,reminder_freq=PriceReminderFreq.ONCE,value=recent_high)
-                    quote_ctx.set_price_reminder(code=code, op=SetPriceReminderOp.ADD, reminder_type=PriceReminderType.PRICE_DOWN,reminder_freq=PriceReminderFreq.ONCE,value=recent_low)
+                    quote_ctx.set_price_reminder(code=code, op=SetPriceReminderOp.ADD, reminder_type=PriceReminderType.PRICE_UP,reminder_freq=PriceReminderFreq.ONCE,value=recent_high,note=msg)
+                    quote_ctx.set_price_reminder(code=code, op=SetPriceReminderOp.ADD, reminder_type=PriceReminderType.PRICE_DOWN,reminder_freq=PriceReminderFreq.ONCE,value=recent_low,note=msg)
                     self.plog(f'{code} 价格提醒 [{recent_low},{recent_high}]')
                     time.sleep(0.5)
             if code_list:
@@ -317,6 +317,6 @@ if __name__ == "__main__":
     config = configparser.ConfigParser()
     config.read(os.path.join(BASE_DIR, 'config.ini'), encoding='utf-8')
     notification = NotificationEngine(config)
-    notification.send_futu_message(['HK.00001','HK.00002'],['HK.00001 顶背离','HK.00002 底背离'])
+    notification.send_futu_message(['HK.00001','HK.00002'],['HK.00001 顶背离','HK.00002 底背离'],[100,200],[90,190])
     notification.send_telegram_message('{} test'.format(time.strftime("%Y-%m-%d %H:%M:%S",time.localtime(time.time()))))
     notification.send_email('group','{} test'.format(time.strftime("%Y-%m-%d %H:%M:%S",time.localtime(time.time())))) 

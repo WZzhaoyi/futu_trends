@@ -4,9 +4,8 @@ from ft_config import get_config
 from data import get_kline_data
 from llm_client import generate_text_with_config
 from params_db import ParamsDB
-from signal_analysis import detect_stochastic_signals_vectorized, get_target_price, MACD, KD
-from tools import MA, EMA, RSI, KDJ, calc_momentum, code_in_futu_group, crossover_status, detect_divergence
-from tools import MACD as MACD_TOOLS
+from signal_analysis import get_target_price, MACD, KD
+from tools import MA, EMA, RSI, calc_momentum, code_in_futu_group
 import datetime
 import configparser
 from notification_engine import NotificationEngine
@@ -127,14 +126,14 @@ def is_breakout(data:pd.DataFrame, N:int=10)->str|None:# K线突破/跌破均线
         return f'跌破ema{N}'
     return None
 
-def is_top_down(data:pd.DataFrame) -> str|None:# KDJ顶部和底部背离
+def is_top_down(data:pd.DataFrame) -> str|None:# 顶部和底部背离
     assert len(data) >= 26
     last_row = len(data) - 1
     # 计算KDJ
-    k,d,j = KDJ(data['close'], data['high'], data['low'])
-    data['K'] = k
-    data['D'] = d
-    data['J'] = j
+    # k,d,j = KDJ(data['close'], data['high'], data['low'])
+    # data['K'] = k
+    # data['D'] = d
+    # data['J'] = j
 
     msg = ''
 
@@ -144,31 +143,31 @@ def is_top_down(data:pd.DataFrame) -> str|None:# KDJ顶部和底部背离
     #     msg += f'KDJ底消失'
     
     # KDJ背离
-    crossover = crossover_status(data['K'], data['D'])
-    golden_crosses = [i for i, c in enumerate(crossover) if c == 1]  # 金叉索引
-    dead_crosses = [i for i, c in enumerate(crossover) if c == -1]  # 死叉索引
-    kdj_divergence = detect_divergence(data['K'], data['D'], data['close'], golden_crosses, dead_crosses)
-    kdj_div_value = kdj_divergence.iloc[-1]
+    # crossover = crossover_status(data['K'], data['D'])
+    # golden_crosses = [i for i, c in enumerate(crossover) if c == 1]  # 金叉索引
+    # dead_crosses = [i for i, c in enumerate(crossover) if c == -1]  # 死叉索引
+    # kdj_divergence = detect_divergence(data['K'], data['D'], data['close'], golden_crosses, dead_crosses)
+    # kdj_div_value = kdj_divergence.iloc[-1]
 
-    if kdj_div_value == 1:
-        msg += 'KDJ顶背离🚨'
-    if kdj_div_value == -1:
-        msg += 'KDJ底背离🚨'
+    # if kdj_div_value == 1:
+    #     msg += 'KDJ顶背离🚨'
+    # if kdj_div_value == -1:
+    #     msg += 'KDJ底背离🚨'
     
     # MACD背离
-    dif, dea = MACD_TOOLS(data['close'], 12, 26, 9)
-    data['DIF'] = dif
-    data['DEA'] = dea
-    macd_crossover = crossover_status(data['DIF'], data['DEA'])
-    macd_golden_crosses = [i for i, c in enumerate(macd_crossover) if c == 1]  # 金叉索引
-    macd_dead_crosses = [i for i, c in enumerate(macd_crossover) if c == -1]  # 死叉索引
-    macd_divergence = detect_divergence(data['DIF'], data['DEA'], data['close'], macd_golden_crosses, macd_dead_crosses)
-    macd_div_value = macd_divergence.iloc[-1]
+    # dif, dea = MACD_TOOLS(data['close'], 12, 26, 9)
+    # data['DIF'] = dif
+    # data['DEA'] = dea
+    # macd_crossover = crossover_status(data['DIF'], data['DEA'])
+    # macd_golden_crosses = [i for i, c in enumerate(macd_crossover) if c == 1]  # 金叉索引
+    # macd_dead_crosses = [i for i, c in enumerate(macd_crossover) if c == -1]  # 死叉索引
+    # macd_divergence = detect_divergence(data['DIF'], data['DEA'], data['close'], macd_golden_crosses, macd_dead_crosses)
+    # macd_div_value = macd_divergence.iloc[-1]
 
-    if macd_div_value == 1:
-        msg += 'MACD顶背离🚨'
-    if macd_div_value == -1:
-        msg += 'MACD底背离🚨'
+    # if macd_div_value == 1:
+    #     msg += 'MACD顶背离🚨'
+    # if macd_div_value == -1:
+    #     msg += 'MACD底背离🚨'
 
     # 检测MACD顶消失底消失
     # if macd_golden_crosses and macd_golden_crosses[-1] == last_row and macd_div_value == 0:
