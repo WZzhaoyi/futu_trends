@@ -262,8 +262,10 @@ class NotificationEngine:
             
             # 计算目标单元格位置
             start_col = ord(start_col_letter[0]) - ord('A')
+            first_day_of_month = datetime(today.year, today.month, 1)
+            first_weekday = first_day_of_month.weekday() # （0=周一，6=周日）
             day, weekday = today.day, today.weekday()
-            week = (day - 1) // 7
+            week = (day + first_weekday) // 7
             col_offset = (weekday + 1) % 7
             target_col = chr(ord('A') + start_col + col_offset)
             target_row = start_row + week + 1
