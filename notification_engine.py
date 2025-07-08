@@ -81,22 +81,20 @@ class NotificationEngine:
         quote_ctx = OpenQuoteContext(host=self.host, port=self.port)
         
         for keyword in self.futu_keyword:
-            code_list = []
             for code, msg, recent_high, recent_low in zip(codes, messages, highs, lows): 
                 if keyword in msg:
-                    code_list.append(code)
                     quote_ctx.set_price_reminder(code=code, op=SetPriceReminderOp.DEL_ALL)
                     quote_ctx.set_price_reminder(code=code, op=SetPriceReminderOp.ADD, reminder_type=PriceReminderType.PRICE_UP,reminder_freq=PriceReminderFreq.ONCE,value=recent_high,note=msg)
                     quote_ctx.set_price_reminder(code=code, op=SetPriceReminderOp.ADD, reminder_type=PriceReminderType.PRICE_DOWN,reminder_freq=PriceReminderFreq.ONCE,value=recent_low,note=msg)
                     self.plog(f'{code} 价格提醒 [{recent_low},{recent_high}]')
                     time.sleep(0.5)
-            if code_list:
-                ret, data = quote_ctx.modify_user_security(keyword, ModifyUserSecurityOp.ADD, code_list)
-                if ret == RET_OK:
-                    self.plog(f'{",".join(code_list)} 存入{keyword}')
-                else:
-                    self.plog(f'存入{keyword}失败 {data}')
-                time.sleep(1)
+                    
+                    ret, data = quote_ctx.modify_user_security(keyword, ModifyUserSecurityOp.ADD, [code])
+                    if ret == RET_OK:
+                        self.plog(f'{code} 存入{keyword}')
+                    else:
+                        self.plog(f'存入{keyword}失败 {data}')
+                    time.sleep(0.5)
         
         quote_ctx.close()
 
