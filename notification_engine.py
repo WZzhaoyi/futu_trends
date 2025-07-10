@@ -83,18 +83,20 @@ class NotificationEngine:
         for keyword in self.futu_keyword:
             for code, msg, recent_high, recent_low in zip(codes, messages, highs, lows): 
                 if keyword in msg:
-                    quote_ctx.set_price_reminder(code=code, op=SetPriceReminderOp.DEL_ALL)
-                    quote_ctx.set_price_reminder(code=code, op=SetPriceReminderOp.ADD, reminder_type=PriceReminderType.PRICE_UP,reminder_freq=PriceReminderFreq.ONCE,value=recent_high,note=msg)
-                    quote_ctx.set_price_reminder(code=code, op=SetPriceReminderOp.ADD, reminder_type=PriceReminderType.PRICE_DOWN,reminder_freq=PriceReminderFreq.ONCE,value=recent_low,note=msg)
-                    self.plog(f'{code} 价格提醒 [{recent_low},{recent_high}]')
-                    time.sleep(0.5)
+                    ret_del, data_del = quote_ctx.set_price_reminder(code=code, op=SetPriceReminderOp.DEL_ALL)
+                    ret_up, data_up = quote_ctx.set_price_reminder(code=code, op=SetPriceReminderOp.ADD, reminder_type=PriceReminderType.PRICE_UP,reminder_freq=PriceReminderFreq.ONCE,value=recent_high)
+                    ret_down, data_down = quote_ctx.set_price_reminder(code=code, op=SetPriceReminderOp.ADD, reminder_type=PriceReminderType.PRICE_DOWN,reminder_freq=PriceReminderFreq.ONCE,value=recent_low)
+                    if ret_del == RET_OK and ret_up == RET_OK and ret_down == RET_OK:
+                        self.plog(f'{code} 价格提醒 [{recent_low},{recent_high}]')
+                    else:
+                        self.plog(f'{code} 价格提醒失败 {data_del} {data_up} {data_down}')
                     
                     ret, data = quote_ctx.modify_user_security(keyword, ModifyUserSecurityOp.ADD, [code])
                     if ret == RET_OK:
                         self.plog(f'{code} 存入{keyword}')
                     else:
                         self.plog(f'存入{keyword}失败 {data}')
-                    time.sleep(0.5)
+                    time.sleep(3)
         
         quote_ctx.close()
 
