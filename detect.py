@@ -14,7 +14,7 @@ import json
 from datetime import datetime
 from tools import code_in_futu_group
 
-def run_analysis(code_list:pd.DataFrame, config:ConfigParser, output_dir='./output', data_dir='./data/detect', cache_expiry_days=1):
+def run_analysis(code_list:pd.DataFrame, indicator_type:str, config:ConfigParser, output_dir='./output', data_dir='./data/detect', cache_expiry_days=1):
     # 确保输出目录存在
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(data_dir, exist_ok=True)
@@ -22,19 +22,10 @@ def run_analysis(code_list:pd.DataFrame, config:ConfigParser, output_dir='./outp
     results = {}
     name_list = code_list['name']
 
-    trend_type = config.get("CONFIG", "TREND_TYPE")
     look_ahead = config.get("CONFIG", "KD_LOOK_AHEAD")
     look_ahead = int(look_ahead) if look_ahead else 0
     ktype = config.get("CONFIG", "FUTU_PUSH_TYPE")
     timestamp = datetime.now().strftime('%Y%m%d')
-
-    indicator_dict = {
-        'reverse': 'KD',
-        'continue': 'MACD'
-    }
-    if trend_type not in indicator_dict:
-        raise ValueError(f"Invalid trend type: {trend_type}")
-    indicator_type = indicator_dict[trend_type]
 
     for idx, code in enumerate(code_list['code'].values):
         print(f"\n---- Analyzing {name_list[idx]} ----\n")
@@ -99,22 +90,30 @@ if __name__ == '__main__':
     code_list = [code for code in code_list if code.strip()]
 
     # 获取股票列表
-    code_pd = pd.DataFrame(columns=['code','name'])
+    code_pd = pd.DataFrame(columns=pd.Index(['code','name']))
     if group:
         ls = code_in_futu_group(group,host,port)
-        if type(ls) == pd.DataFrame:
-            ls = ls[['code','name']]
-            code_pd = pd.concat([code_pd,ls])
+        if isinstance(ls, pd.DataFrame):
+            code_pd = pd.concat([code_pd, ls[['code','name']]])
     if len(code_list) > 0:
-        ls = pd.DataFrame(columns=['code','name'])
-        ls['code'] = code_list
-        ls['name'] = code_list
-        code_pd = pd.concat([code_pd,ls], ignore_index=True)
+        ls = pd.DataFrame({'code': code_list, 'name': code_list})
+        code_pd = pd.concat([code_pd, ls])
 
     if code_pd.empty:
         print('warning: no code in config')
         exit()
 
     timestamp = datetime.now().strftime('%Y%m%d')
-    output_dir = f'./output/detect_{timestamp}'
-    results = run_analysis(code_pd, config, output_dir=output_dir)
+    trend_types = config.get("CONFIG", "TREND_TYPE").split(',')
+    # 确保code_pd是DataFrame类型
+    assert isinstance(code_pd, pd.DataFrame), "code_pd must be a DataFrame"
+    for trend_type in trend_types:
+        indicator_dict = {
+            'reverse': 'KD',
+            'continue': 'MACD'
+        }
+        if trend_type not in indicator_dict:
+            raise ValueError(f"Invalid trend type: {trend_type}")
+        indicator_type = indicator_dict[trend_type]
+        output_dir = f'./output/detect_{indicator_type}_{timestamp}'
+        results = run_analysis(code_pd, indicator_type, config, output_dir=output_dir)

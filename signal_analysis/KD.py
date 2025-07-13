@@ -340,7 +340,8 @@ def display_signals(df_visual, title, best_params, result):
     bull_strength = np.clip(strength, 0.5, 1.0)
     bear_strength = np.clip(strength, 0.5, 1.0)
 
-    x = mdates.date2num(df_visual.index.to_pydatetime())
+    idx = df_visual.index.to_pydatetime() if hasattr(df_visual.index, 'to_pydatetime') else df_visual.index
+    x = mdates.date2num(idx)
     y = np.array(df_visual['close'])
     color_arr = []
     alpha_arr = []
