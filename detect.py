@@ -110,7 +110,8 @@ if __name__ == '__main__':
     for trend_type in trend_types:
         indicator_dict = {
             'reverse': 'KD',
-            'continue': 'MACD'
+            'continue': 'MACD',
+            'topdown': 'RSI'
         }
         if trend_type not in indicator_dict:
             raise ValueError(f"Invalid trend type: {trend_type}")

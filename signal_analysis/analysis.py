@@ -3,7 +3,7 @@ from multiprocessing import Pool, cpu_count
 import numpy as np
 from tqdm import tqdm
 from .KD import *
-from .indicators import Indicator, KD, MACD
+from .indicators import RSI, Indicator, KD, MACD
 
 class Optimization:
     def __init__(self, df, indicator:Indicator, look_ahead, target_multiplier, atr_period, signal_count_target):
@@ -28,7 +28,7 @@ def technical_analysis(df, name, indicator_type='KD', evals=500, look_ahead=0):
     指标分析
     """
     # 选择指标
-    indicators = {'KD': KD(), 'MACD': MACD()}
+    indicators = {'KD': KD(), 'MACD': MACD(), 'RSI': RSI()}
     indicator = indicators.get(indicator_type)
     if not indicator:
         raise ValueError(f"不支持的指标类型: {indicator_type}")

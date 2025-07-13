@@ -12,7 +12,7 @@ class Indicator(ABC):
         return self.__class__.__name__
     
     @abstractmethod
-    def calculate(self, df: pd.DataFrame, params: Dict) -> pd.DataFrame:
+    def calculate(self, df: pd.DataFrame, params: Dict, mode='train') -> pd.DataFrame:
         """计算指标并返回带信号的DataFrame"""
         pass
     
@@ -109,10 +109,10 @@ class KD(Indicator):
     def _future_confirmation(self, df, is_support):
         if is_support:
             return ((df['close'].shift(-1) > df['close']) & (df['open'].shift(-1) < df['close'].shift(-1))) | \
-                   ((df['close'] < df['close'].shift(-2)) & (df['close'].shift(-1) < df['close'].shift(-2)))
+                   ((df['close'] < df['close'].shift(-2)) & (df['open'].shift(-1) < df['close'].shift(-1)))
         else:
             return ((df['close'].shift(-1) < df['close']) & (df['open'].shift(-1) > df['close'].shift(-1))) | \
-                   ((df['close'] > df['close'].shift(-2)) & (df['close'].shift(-1) > df['close'].shift(-2)))
+                   ((df['close'] > df['close'].shift(-2)) & (df['open'].shift(-1) > df['close'].shift(-1)))
 
 class MACD(Indicator):
     """MACD指标"""
@@ -189,7 +189,79 @@ class MACD(Indicator):
     def _future_confirmation(self, df, is_support):
         if is_support:
             return ((df['close'].shift(-1) > df['close']) & (df['open'].shift(-1) < df['close'].shift(-1))) | \
-                   (df['close'] < df['close'].shift(-2))
+                   ((df['close'] < df['close'].shift(-2)) & (df['open'].shift(-1) < df['close'].shift(-2)))
         else:
             return ((df['close'].shift(-1) < df['close']) & (df['open'].shift(-1) > df['close'].shift(-1))) | \
-                   (df['close'] > df['close'].shift(-2))
+                   ((df['close'] > df['close'].shift(-2)) & (df['open'].shift(-1) > df['close'].shift(-2)))
+
+
+class RSI(Indicator):
+    """RSI指标"""
+    
+    def get_space(self):
+        return {
+            'rsi_period': hp.quniform('rsi_period', 5, 25, 1),
+            'oversold': hp.quniform('oversold', 10, 30, 5),
+            'overbought': hp.quniform('overbought', 70, 90, 5),
+        }
+    
+    def calculate(self, df: pd.DataFrame, params: Dict, mode='train') -> pd.DataFrame:
+        params = {
+            'rsi_period': int(params['rsi_period']),
+            'oversold': int(params['oversold']),
+            'overbought': int(params['overbought']),
+        }
+        df = df.copy()
+
+        # 计算RSI
+        rsi = self._rsi(df['close'], params['rsi_period'])
+
+        # 信号检测
+        support_cond = (rsi > params['oversold']) & (rsi > rsi.shift(1)) & (rsi.shift(1) < params['oversold'])
+        resistance_cond = (rsi < params['overbought']) & (rsi < rsi.shift(1)) & (rsi.shift(1) > params['overbought'])
+
+        # 未来确认
+        if mode == 'check':
+            support_cond &= self._future_confirmation(df, True)
+            resistance_cond &= self._future_confirmation(df, False)
+
+        # 生成信号
+        df['reversal'] = np.select([support_cond, resistance_cond], 
+                                  ['support reversal', 'resistance reversal'], 'none')
+        df['is_strong'] = ((df['reversal'] != 'none')).astype(int)
+
+        return df
+
+    def calculate_score(self, result: Dict, signal_count_target: float) -> float:
+        signal_count_target = signal_count_target / 4
+
+        support_f1 = result['strong_support_win_rate']
+        resistance_f1 = result['strong_resistance_win_rate']
+        
+        if support_f1 > 0 and resistance_f1 > 0:
+            score = 2 / (1/support_f1 + 1/resistance_f1)
+        else:
+            score = 0
+        
+        # 信号数量惩罚
+        signal_count_penalty = min(1.0, min(result['strong_support_signals_count'], 
+                                           result['strong_resistance_signals_count']) / signal_count_target)
+        
+        return score * signal_count_penalty
+
+    def _rsi(self, close, period):
+        delta = close.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
+    
+    def _future_confirmation(self, df, is_support):
+        if is_support:
+            return ((df['close'].shift(-1) > df['close']) & (df['open'].shift(-1) < df['close'].shift(-1))) | \
+                   ((df['close'] < df['close'].shift(-2)) & (df['open'].shift(-1) < df['close'].shift(-2)))
+        else:
+            return ((df['close'].shift(-1) < df['close']) & (df['open'].shift(-1) > df['close'].shift(-1))) | \
+                   ((df['close'] > df['close'].shift(-2)) & (df['open'].shift(-1) > df['close'].shift(-2)))
+
