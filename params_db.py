@@ -44,8 +44,18 @@ class ParamsDB:
             if init_db:
                 self._init_sqlite()
         elif self.db_uri.startswith('mongodb+srv://'):
-            # MongoDB数据库
-            self.mongo_client = MongoClient(self.db_uri)
+            # MongoDB数据库 连接错误和重试
+            mongo_options = {
+                'serverSelectionTimeoutMS': 30000,  # 服务器选择超时
+                'connectTimeoutMS': 20000,          # 连接超时
+                'socketTimeoutMS': 30000,           # Socket超时
+                'retryWrites': True,                # 启用重试写入
+                'retryReads': True,                 # 启用重试读取
+                'readPreference': 'secondaryPreferred',  # 优先从节点，提高可用性
+            }
+            
+            self.mongo_client = MongoClient(self.db_uri, **mongo_options)
+            
             # 从URI中提取数据库名称
             db_name = self.db_uri.split('/')[-1]
             self.mongo_db = self.mongo_client[db_name]
