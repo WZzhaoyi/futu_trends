@@ -4,8 +4,8 @@ from ft_config import get_config
 from data import get_kline_data
 from llm_client import generate_text_with_config
 from params_db import ParamsDB
-from signal_analysis import get_target_price, MACD, KD
-from tools import MA, EMA, RSI, calc_momentum, code_in_futu_group
+from signal_analysis import get_target_price, MACD, KD, RSI
+from tools import MA, EMA, calc_momentum, code_in_futu_group
 import datetime
 import configparser
 from notification_engine import NotificationEngine
@@ -34,15 +34,19 @@ def inside_MA(close, last_low, last_high): # 计算MA5,10,15中的最小值和�
     else:
         return True
 
-def is_reverse(df: pd.DataFrame | None, code: str, config: configparser.ConfigParser) -> str | None:
+def is_reverse(df: pd.DataFrame, code: str, config: configparser.ConfigParser) -> str | None:
     """检查是否出现反转信号"""
     assert len(df) >= 90
     
     # 从数据库读取参数
     try:
         db_path = config.get("CONFIG", "KD_PARAMS_DB", fallback=None)
+        if db_path is None:
+            return None
         db = ParamsDB(db_path)
         data = db.get_stock_params(code)
+        if data is None:
+            return 'No KD parameters'
         params = data['best_params']
         meta = data['meta_info']
         performance = data['performance']
@@ -71,7 +75,7 @@ def is_reverse(df: pd.DataFrame | None, code: str, config: configparser.ConfigPa
         if target is not None:
             msg += f' {target}'
     if is_strong == 1:
-        msg += u'🚨'
+        msg += u'📈' if 'support' in reversal else u'📉'
     return None if msg == '' else msg
 
 def is_continue(df:pd.DataFrame, code:str, config:configparser.ConfigParser)->str|None:# 检查macd趋势延续
@@ -80,8 +84,12 @@ def is_continue(df:pd.DataFrame, code:str, config:configparser.ConfigParser)->st
     # 从数据库读取参数
     try:
         db_path = config.get("CONFIG", "MACD_PARAMS_DB", fallback=None)
+        if db_path is None:
+            return None
         db = ParamsDB(db_path)
         data = db.get_stock_params(code)
+        if data is None:
+            return 'No MACD parameters'
         params = data['best_params']
         meta = data['meta_info']
         performance = data['performance']
@@ -110,7 +118,7 @@ def is_continue(df:pd.DataFrame, code:str, config:configparser.ConfigParser)->st
         if target is not None:
             msg += f' {target}'
     if is_strong == 1:
-        msg += u'🚨'
+        msg += u'📈' if 'support' in reversal else u'📉'
     return None if msg == '' else msg
 
 def is_breakout(data:pd.DataFrame, N:int=10)->str|None:# K线突破/跌破均线
@@ -126,106 +134,45 @@ def is_breakout(data:pd.DataFrame, N:int=10)->str|None:# K线突破/跌破均线
         return f'跌破ema{N}'
     return None
 
-def is_top_down(data:pd.DataFrame) -> str|None:# 顶部和底部背离
-    assert len(data) >= 26
-    last_row = len(data) - 1
-    # 计算KDJ
-    # k,d,j = KDJ(data['close'], data['high'], data['low'])
-    # data['K'] = k
-    # data['D'] = d
-    # data['J'] = j
+def is_top_down(df:pd.DataFrame, code:str, config:configparser.ConfigParser) -> str|None:# 顶部和底部
+    assert len(df) >= 90
+    # 从数据库读取参数
+    try:
+        db_path = config.get("CONFIG", "RSI_PARAMS_DB", fallback=None)
+        if db_path is None:
+            return None
+        db = ParamsDB(db_path)
+        data = db.get_stock_params(code)
+        if data is None:
+            return 'No RSI parameters'
+        params = data['best_params']
+        meta = data['meta_info']
+        performance = data['performance']
+                
+        if not params:
+            print(f"No RSI parameters found for {code}")
+            return 'No RSI parameters'
+            
+    except Exception as e:
+        print(f"Error reading RSI parameters for {code}: {str(e)}")
+        return 'RSI parameter error'
+    
+    # 信号检测
+    result = RSI().calculate(df, params)
+    last_row = result.iloc[-1]
+    reversal =  last_row['reversal']
+    is_strong =  last_row['is_strong']
 
     msg = ''
-
-    # if data['J'].iloc[-1]<100 and data['J'].iloc[-2]>=100 and data['J'].iloc[-3]>=100:
-    #     msg += f'KDJ顶消失'
-    # elif data['J'].iloc[-1]>0 and data['J'].iloc[-2]<=0 and data['J'].iloc[-3]<=0:
-    #     msg += f'KDJ底消失'
     
-    # KDJ背离
-    # crossover = crossover_status(data['K'], data['D'])
-    # golden_crosses = [i for i, c in enumerate(crossover) if c == 1]  # 金叉索引
-    # dead_crosses = [i for i, c in enumerate(crossover) if c == -1]  # 死叉索引
-    # kdj_divergence = detect_divergence(data['K'], data['D'], data['close'], golden_crosses, dead_crosses)
-    # kdj_div_value = kdj_divergence.iloc[-1]
-
-    # if kdj_div_value == 1:
-    #     msg += 'KDJ顶背离🚨'
-    # if kdj_div_value == -1:
-    #     msg += 'KDJ底背离🚨'
-    
-    # MACD背离
-    # dif, dea = MACD_TOOLS(data['close'], 12, 26, 9)
-    # data['DIF'] = dif
-    # data['DEA'] = dea
-    # macd_crossover = crossover_status(data['DIF'], data['DEA'])
-    # macd_golden_crosses = [i for i, c in enumerate(macd_crossover) if c == 1]  # 金叉索引
-    # macd_dead_crosses = [i for i, c in enumerate(macd_crossover) if c == -1]  # 死叉索引
-    # macd_divergence = detect_divergence(data['DIF'], data['DEA'], data['close'], macd_golden_crosses, macd_dead_crosses)
-    # macd_div_value = macd_divergence.iloc[-1]
-
-    # if macd_div_value == 1:
-    #     msg += 'MACD顶背离🚨'
-    # if macd_div_value == -1:
-    #     msg += 'MACD底背离🚨'
-
-    # 检测MACD顶消失底消失
-    # if macd_golden_crosses and macd_golden_crosses[-1] == last_row and macd_div_value == 0:
-    #     dif_high_threshold = data['DIF'].quantile(0.2)
-    #     dea_high_threshold = data['DEA'].quantile(0.2)
-        
-    #     if data['DIF'].iloc[last_row] <= dif_high_threshold and data['DEA'].iloc[last_row] <= dea_high_threshold:
-    #         msg += 'MACD底消失'
-    
-    # elif macd_dead_crosses and macd_dead_crosses[-1] == last_row and macd_div_value == 0:
-    #     dif_low_threshold = data['DIF'].quantile(0.8)
-    #     dea_low_threshold = data['DEA'].quantile(0.8)
-        
-    #     if data['DIF'].iloc[last_row] >= dif_low_threshold and data['DEA'].iloc[last_row] >= dea_low_threshold:
-    #         msg += 'MACD顶消失'
-    
-    # RSI检测
-    rsi = RSI(data['close'], 6)
-    data['RSI'] = rsi
-    
-    # 检测顶底消失位置
-    top_indices = []
-    bottom_indices = []
-    
-    for i in range(2, len(data)):
-        if ((data['RSI'].iloc[i-2]>=80 and data['RSI'].iloc[i-1]>=80 and data['RSI'].iloc[i]<80) or 
-            (data['RSI'].iloc[i-1]>=85 and data['RSI'].iloc[i]<85)):
-            top_indices.append(i)
-        if ((data['RSI'].iloc[i-2]<=20 and data['RSI'].iloc[i-1]<=20 and data['RSI'].iloc[i]>20) or 
-            (data['RSI'].iloc[i-1]<=15 and data['RSI'].iloc[i]>15)):
-            bottom_indices.append(i)
-    
-    has_top = top_indices and top_indices[-1] == last_row
-    has_bottom = bottom_indices and bottom_indices[-1] == last_row
-    
-    # 检测背离
-    has_divergence = False
-    i = len(top_indices) - 1
-    j = len(bottom_indices) - 1
-    if has_top and len(top_indices) >= 2 and 3 <= top_indices[i] - top_indices[i-1] < 14:
-        prev_high = max(data['high'].iloc[top_indices[i-1]], data['high'].iloc[top_indices[i-1]-1])
-        curr_high = max(data['high'].iloc[top_indices[i]], data['high'].iloc[top_indices[i]-1])
-        if curr_high > prev_high:
-            msg += 'RSI顶背离🚨'
-            has_divergence = True
-    elif has_bottom and len(bottom_indices) >= 2 and 3 <= bottom_indices[j] - bottom_indices[j-1] < 14:
-        prev_low = min(data['low'].iloc[bottom_indices[j-1]], data['low'].iloc[bottom_indices[j-1]-1])
-        curr_low = min(data['low'].iloc[bottom_indices[j]], data['low'].iloc[bottom_indices[j]-1])
-        if curr_low < prev_low:
-            msg += 'RSI底背离🚨'
-            has_divergence = True
-    
-    # 添加消失信号
-    if not has_divergence:
-        if has_top:
-            msg += 'RSI顶消失'
-        if has_bottom:
-            msg += 'RSI底消失'
+    # 检查是否有反转信号
+    if reversal != 'none' and type(reversal) == str:
+        msg += reversal.replace('reversal','rsi')
+        target = get_target_price(df, is_support='support' in reversal, target_multiplier=meta['target_multiplier'], atr_period=meta['atr_period'])
+        if target is not None:
+            msg += f' {target}'
+    if is_strong == 1:
+        msg += u'📈' if 'support' in reversal else u'📉'
     
     return None if msg == '' else msg
 
@@ -273,7 +220,7 @@ def is_balance(data: pd.DataFrame, M: int = 3, N: int = 5) -> str | None: # 量�
     
     return None if msg == '' else msg
 
-def check_trends(code_in_group, config: configparser.ConfigParser):
+def check_trends(code_in_group: pd.DataFrame, config: configparser.ConfigParser):
     """
     检查股票趋势并返回DataFrame格式的结果
     返回的DataFrame包含以下列：
@@ -283,7 +230,7 @@ def check_trends(code_in_group, config: configparser.ConfigParser):
     """
     trend_type = config.get("CONFIG", "TREND_TYPE").split(',')
     if not (code_in_group.size and len(trend_type)):
-        return pd.DataFrame(columns=['name', 'msg', 'momentum'])
+        return pd.DataFrame(columns=pd.Index(['futu_code', 'name', 'msg', 'momentum', 'high', 'low']))
         
     results = []
     for idx, futu_code in enumerate(code_in_group['code'].values):
@@ -319,7 +266,7 @@ def check_trends(code_in_group, config: configparser.ConfigParser):
                 if co is not None:
                     msg += f' | {co}'
             elif i.lower() == 'topdown':
-                td = is_top_down(df) # 顶底结构
+                td = is_top_down(df,futu_code,config) # 顶底结构
                 if td is not None:
                     msg += f' | {td}'
             elif i.lower() == 'balance':
@@ -328,7 +275,8 @@ def check_trends(code_in_group, config: configparser.ConfigParser):
                     msg += f' | {bal}'
         
         # 计算动量因子
-        momentum = calc_momentum(df['close'])
+        close = df['close']
+        momentum = calc_momentum(close) if isinstance(close, pd.Series) else pd.Series([0.000])
         
         # 获取最后两个动量值，用于判断方向
         last_momentum = momentum.iloc[-1]
@@ -336,11 +284,9 @@ def check_trends(code_in_group, config: configparser.ConfigParser):
         msg += f' | {last_momentum:.3f}'
 
         if last_momentum > prev_momentum:
-            msg += f'↑'
+            msg += u'↑'
         elif last_momentum < prev_momentum:
-            msg += f'↓'
-        else:
-            msg += f'→'
+            msg += u'↓'
         
         # 添加到结果列表
 
@@ -373,7 +319,7 @@ def check_trends(code_in_group, config: configparser.ConfigParser):
         result_df.sort_values('momentum', ascending=False, inplace=True)
         return result_df
     else:
-        return pd.DataFrame(columns=['name', 'msg', 'momentum', 'high', 'low'])
+        return pd.DataFrame(columns=pd.Index(['futu_code', 'name', 'msg', 'momentum', 'high', 'low']))
 
 if __name__ == "__main__":
     config = get_config()
@@ -385,30 +331,31 @@ if __name__ == "__main__":
     push_type = config.get("CONFIG", "FUTU_PUSH_TYPE")
 
     # 获取股票列表
-    code_pd = pd.DataFrame(columns=['code','name'])
+    code_pd = pd.DataFrame(columns=pd.Index(['code','name']))
     if group:
         ls = code_in_futu_group(group,host,port)
-        if type(ls) == pd.DataFrame:
-            ls = ls[['code','name']]
-            code_pd = pd.concat([code_pd,ls])
+        if isinstance(ls, pd.DataFrame):
+            code_pd = pd.concat([code_pd, ls[['code','name']]])
     if len(code_list) > 0:
-        ls = pd.DataFrame(columns=['code','name'])
-        ls['code'] = code_list
-        ls['name'] = code_list
-        code_pd = pd.concat([code_pd,ls], ignore_index=True)
+        ls = pd.DataFrame({'code': code_list, 'name': code_list})
+        code_pd = pd.concat([code_pd, ls])
 
     if code_pd.empty:
         print('warning: no code in config')
         exit()
 
+    assert isinstance(code_pd, pd.DataFrame), "code_pd must be a DataFrame"
     trends_df = check_trends(code_pd,config)
+    if trends_df.empty:
+        print('warning: no trends data')
+        exit()
     raw_msg = '{} {} {}:\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group if group else '', push_type, '\n'.join(trends_df['msg']))
     filter_df = trends_df[trends_df['msg'].str.count('\\|') >= 2]
 
     notification = NotificationEngine(config)
 
     # futu分组/到价提醒
-    notification.send_futu_message(filter_df.index.tolist(),filter_df['msg'].tolist(),filter_df['high'].tolist(),filter_df['low'].tolist())
+    notification.send_futu_message([str(code) for code in filter_df.index.tolist()],filter_df['msg'].tolist(),filter_df['high'].tolist(),filter_df['low'].tolist())
 
     # LLM消息
     msg = generate_text_with_config(config, raw_msg)

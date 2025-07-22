@@ -378,6 +378,30 @@ def calc_momentum(close: pd.Series, N=21, method='linear')->pd.Series:
     
     return result
 
+# 在文件开头添加路径清理函数
+def sanitize_path_component(path_component: str) -> str:
+    """
+    清理路径组件，移除所有可能导致路径遍历问题的字符
+    """
+    if not path_component:
+        return "default"
+    
+    # 移除所有可能导致路径遍历问题的字符
+    # 包括: / \ : * ? " < > | .. 
+    sanitized = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '', path_component)
+    
+    # 移除连续的点号（防止 .. 攻击）
+    sanitized = re.sub(r'\.{2,}', '', sanitized)
+    
+    # 移除开头和结尾的点号
+    sanitized = sanitized.strip('.')
+    
+    # 如果清理后为空，使用默认值
+    if not sanitized:
+        return "default"
+    
+    return sanitized
+
 if __name__ == "__main__":
     code = 'SH.510880'
     

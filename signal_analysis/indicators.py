@@ -4,6 +4,8 @@ import numpy as np
 from typing import Dict, Any
 from hyperopt import hp
 
+from signal_analysis.tool import calculate_win_rate
+
 class Indicator(ABC):
     """技术指标基类"""
 
@@ -22,13 +24,26 @@ class Indicator(ABC):
         pass
 
     def get_params(self, params: Dict) -> Dict:
+        """将参数转换为整数或浮点数"""
         return {k: int(v) if k.endswith('_period') else round(v, 1) if k == 'strength_threshold' else v 
                   for k, v in params.items()}
+
+    def calculate_win_rate(self, df: pd.DataFrame, look_ahead=10, target_multiplier=1.1, atr_period=20) -> Dict:
+        """计算胜率"""
+        return calculate_win_rate(df, look_ahead, target_multiplier, atr_period, check_high_low=True)
 
     @abstractmethod
     def calculate_score(self, result: Dict, signal_count_target: float) -> float:
         """计算优化评分 - 每个指标可以有自己的评分策略"""
         pass
+
+    def _future_confirmation(self, df, is_support):
+        if is_support:
+            return ((df['close'].shift(-1) > df['close']) & (df['open'].shift(-1) < df['close'].shift(-1))) | \
+                   ((df['high'] < df['close'].shift(-2)))
+        else:
+            return ((df['close'].shift(-1) < df['close']) & (df['open'].shift(-1) > df['close'].shift(-1))) | \
+                   ((df['low'] > df['close'].shift(-2)))
 
 class KD(Indicator):
     """KD随机指标"""
@@ -37,38 +52,33 @@ class KD(Indicator):
         return {
             'k_period': hp.quniform('k_period', 9, 21, 1),
             'd_period': hp.quniform('d_period', 3, 7, 1),
-            'overbought': hp.quniform('overbought', 50, 90, 5),
-            'oversold': hp.quniform('oversold', 10, 50, 5),
-            'support_ma_period': hp.quniform('support_ma_period', 5, 60, 5),
-            'resistance_ma_period': hp.quniform('resistance_ma_period', 5, 60, 5),
-            'strength_threshold': hp.quniform('strength_threshold', 0.1, 4, 0.1)
+            'overbought': hp.quniform('overbought', 55, 90, 1),
+            'oversold': hp.quniform('oversold', 10, 45, 1),
+            # 'support_ma_period': hp.quniform('support_ma_period', 10, 50, 5),
+            # 'resistance_ma_period': hp.quniform('resistance_ma_period', 10, 50, 5),
+            # 'strength_threshold': hp.quniform('strength_threshold', 0.1, 4, 0.1)
         }
     
     def calculate(self, df: pd.DataFrame, params: Dict, mode='train') -> pd.DataFrame:
-        params = {
-            'k_period': int(params['k_period']),
-            'd_period': int(params['d_period']),
-            'overbought': int(params['overbought']),
-            'oversold': int(params['oversold']),
-            'support_ma_period': int(params['support_ma_period']),
-            'resistance_ma_period': int(params['resistance_ma_period']),
-            'strength_threshold': round(params['strength_threshold'], 1)
-        }
+        params = self.get_params(params)
         df = df.copy()
         
         # 计算KD
         k, d = self._stochastic(df['high'], df['low'], df['close'], 
                                int(params['k_period']), int(params['d_period']))
         df['k'], df['d'] = k, d
-        df['signal_strength'] = abs(k - d)
+        # df['signal_strength'] = abs(k - d)
         
         # 计算MA
-        support_ma = df['close'].rolling(window=int(params['support_ma_period'])).mean()
-        resistance_ma = df['close'].rolling(window=int(params['resistance_ma_period'])).mean()
+        # support_ma = df['close'].rolling(window=int(params['support_ma_period'])).mean()
+        # resistance_ma = df['close'].rolling(window=int(params['resistance_ma_period'])).mean()
         
         # 信号检测
-        support_cond = (k > d) & (k.shift(1) <= d.shift(1)) & (k < params['oversold']) & (df['close'] < support_ma)
-        resistance_cond = (k < d) & (k.shift(1) >= d.shift(1)) & (k > params['overbought']) & (df['close'] > resistance_ma)
+        # support_cond = (k > d) & (k.shift(1) <= d.shift(1)) & (k < params['oversold']) & (df['close'] < support_ma)
+        # resistance_cond = (k < d) & (k.shift(1) >= d.shift(1)) & (k > params['overbought']) & (df['close'] > resistance_ma)
+
+        support_cond = (k > d) & (k.shift(1) <= d.shift(1)) & (d < params['oversold'])
+        resistance_cond = (k < d) & (k.shift(1) >= d.shift(1)) & (d > params['overbought'])
         
         # 未来确认
         if mode == 'check':
@@ -78,9 +88,9 @@ class KD(Indicator):
         # 生成信号
         df['reversal'] = np.select([support_cond, resistance_cond], 
                                   ['support reversal', 'resistance reversal'], 'none')
-        df['is_strong'] = ((df['reversal'] != 'none') & 
-                          (df['signal_strength'] >= round(params['strength_threshold'], 1))).astype(int)
-        
+        # df['is_strong'] = ((df['reversal'] != 'none') & 
+                        #   (df['signal_strength'] >= round(params['strength_threshold'], 1))).astype(int)
+        df['is_strong'] = ((df['reversal'] != 'none')).astype(int)
         return df
     
     def calculate_score(self, result: Dict, signal_count_target: float) -> float:
@@ -91,7 +101,10 @@ class KD(Indicator):
                        (result['strong_resistance_win_rate'] + result['resistance_recall']) if \
                        (result['strong_resistance_win_rate'] + result['resistance_recall']) > 0 else 0
         
-        score = (support_f1 + resistance_f1) / 2
+        if support_f1 > 0 and resistance_f1 > 0:
+            score = 2 / (1/support_f1 + 1/resistance_f1)
+        else:
+            score = 0
         
         # 信号数量惩罚
         signal_count_penalty = min(1.0, min(result['strong_support_signals_count'], 
@@ -105,33 +118,20 @@ class KD(Indicator):
         k = 100 * (close - low_min) / (high_max - low_min)
         d = k.rolling(window=d_period).mean()
         return k, d
-    
-    def _future_confirmation(self, df, is_support):
-        if is_support:
-            return ((df['close'].shift(-1) > df['close']) & (df['open'].shift(-1) < df['close'].shift(-1))) | \
-                   ((df['close'] < df['close'].shift(-2)) & (df['open'].shift(-1) < df['close'].shift(-1)))
-        else:
-            return ((df['close'].shift(-1) < df['close']) & (df['open'].shift(-1) > df['close'].shift(-1))) | \
-                   ((df['close'] > df['close'].shift(-2)) & (df['open'].shift(-1) > df['close'].shift(-1)))
 
 class MACD(Indicator):
     """MACD指标"""
     
     def get_space(self):
         return {
-            'fast_period': hp.quniform('fast_period', 5, 20, 1),
-            'slow_period': hp.quniform('slow_period', 10, 40, 1),
-            'signal_period': hp.quniform('signal_period', 3, 15, 1),
-            'ma_period': hp.quniform('ma_period', 10, 60, 5)
+            'fast_period': hp.quniform('fast_period', 7, 15, 1),
+            'slow_period': hp.quniform('slow_period', 15, 30, 1),
+            'signal_period': hp.quniform('signal_period', 6, 10, 1),
+            'ma_period': hp.quniform('ma_period', 10, 120, 5)
         }
     
     def calculate(self, df: pd.DataFrame, params: Dict, mode='train') -> pd.DataFrame:
-        params = {
-            'fast_period': int(params['fast_period']),
-            'slow_period': int(params['slow_period']),
-            'signal_period': int(params['signal_period']),
-            'ma_period': int(params['ma_period'])
-        }
+        params = self.get_params(params)
         df = df.copy()
         
         # 计算MACD
@@ -163,7 +163,7 @@ class MACD(Indicator):
         return df
     
     def calculate_score(self, result: Dict, signal_count_target: float) -> float:
-        signal_count_target = signal_count_target / 2
+        signal_count_target = signal_count_target / 3
 
         support_f1 = result['strong_support_win_rate']
         resistance_f1 = result['strong_resistance_win_rate']
@@ -185,14 +185,6 @@ class MACD(Indicator):
         macd = ema_fast - ema_slow
         signal = macd.ewm(span=signal_period).mean()
         return macd, signal
-    
-    def _future_confirmation(self, df, is_support):
-        if is_support:
-            return ((df['close'].shift(-1) > df['close']) & (df['open'].shift(-1) < df['close'].shift(-1))) | \
-                   ((df['close'] < df['close'].shift(-2)) & (df['open'].shift(-1) < df['close'].shift(-2)))
-        else:
-            return ((df['close'].shift(-1) < df['close']) & (df['open'].shift(-1) > df['close'].shift(-1))) | \
-                   ((df['close'] > df['close'].shift(-2)) & (df['open'].shift(-1) > df['close'].shift(-2)))
 
 
 class RSI(Indicator):
@@ -200,25 +192,21 @@ class RSI(Indicator):
     
     def get_space(self):
         return {
-            'rsi_period': hp.quniform('rsi_period', 5, 25, 1),
-            'oversold': hp.quniform('oversold', 10, 30, 5),
-            'overbought': hp.quniform('overbought', 70, 90, 5),
+            'rsi_period': hp.quniform('rsi_period', 10, 25, 1),
+            'oversold': hp.quniform('oversold', 10, 30, 1),
+            'overbought': hp.quniform('overbought', 70, 90, 1),
         }
     
     def calculate(self, df: pd.DataFrame, params: Dict, mode='train') -> pd.DataFrame:
-        params = {
-            'rsi_period': int(params['rsi_period']),
-            'oversold': int(params['oversold']),
-            'overbought': int(params['overbought']),
-        }
+        params = self.get_params(params)
         df = df.copy()
 
         # 计算RSI
-        rsi = self._rsi(df['close'], params['rsi_period'])
+        df['rsi'] = self._rsi(df['close'], params['rsi_period'])
 
         # 信号检测
-        support_cond = (rsi > params['oversold']) & (rsi > rsi.shift(1)) & (rsi.shift(1) < params['oversold'])
-        resistance_cond = (rsi < params['overbought']) & (rsi < rsi.shift(1)) & (rsi.shift(1) > params['overbought'])
+        support_cond = (df['rsi'] < params['oversold']) & (df['rsi'] < df['rsi'].shift(1)) & (df['rsi'].shift(1) < params['oversold'])
+        resistance_cond = (df['rsi'] > params['overbought']) & (df['rsi'] > df['rsi'].shift(1)) & (df['rsi'].shift(1) > params['overbought'])
 
         # 未来确认
         if mode == 'check':
@@ -232,8 +220,12 @@ class RSI(Indicator):
 
         return df
 
+    def calculate_win_rate(self, df: pd.DataFrame, look_ahead=10, target_multiplier=1.1, atr_period=20) -> Dict:
+        """计算胜率"""
+        return calculate_win_rate(df, look_ahead, target_multiplier, atr_period, check_high_low=False)
+
     def calculate_score(self, result: Dict, signal_count_target: float) -> float:
-        signal_count_target = signal_count_target / 4
+        signal_count_target = signal_count_target / 3
 
         support_f1 = result['strong_support_win_rate']
         resistance_f1 = result['strong_resistance_win_rate']
@@ -259,9 +251,7 @@ class RSI(Indicator):
     
     def _future_confirmation(self, df, is_support):
         if is_support:
-            return ((df['close'].shift(-1) > df['close']) & (df['open'].shift(-1) < df['close'].shift(-1))) | \
-                   ((df['close'] < df['close'].shift(-2)) & (df['open'].shift(-1) < df['close'].shift(-2)))
+            return (df['close'].shift(-1) > df['high']) | (df['high'] < df['close'].shift(-2))
         else:
-            return ((df['close'].shift(-1) < df['close']) & (df['open'].shift(-1) > df['close'].shift(-1))) | \
-                   ((df['close'] > df['close'].shift(-2)) & (df['open'].shift(-1) > df['close'].shift(-2)))
+            return (df['close'].shift(-1) < df['low']) | (df['low'] > df['close'].shift(-2))
 

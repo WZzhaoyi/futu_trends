@@ -101,7 +101,7 @@ def calculate_trend_duration(df, min_trend_days=5):
                 }
     
     # 转换为DataFrame，使用趋势终结日期作为索引
-    trends_df = pd.DataFrame(trends_data, index=[trend['end_date'] for trend in trends_data])
+    trends_df = pd.DataFrame(trends_data, index=pd.Index([trend['end_date'] for trend in trends_data]))
     
     # 丢弃首尾趋势
     if len(trends_df) > 2:
@@ -188,69 +188,9 @@ def calculate_atr_period(df, max_period=60):
     dominant_period = periods[valid_idx][np.argmax(power[valid_idx])]
     return int(dominant_period) if dominant_period else 20
 
-# 随机指标计算（矢量化）
-def Stochastic(high, low, close, k_period, d_period):
-    low_min = low.rolling(window=int(k_period), min_periods=1).min()
-    high_max = high.rolling(window=int(k_period), min_periods=1).max()
-    k = 100 * (close - low_min) / (high_max - low_min)
-    d = k.rolling(window=int(d_period), min_periods=1).mean()
-    return k, d
-
-# 矢量化信号检测，区分显性和隐秘强信号
-def detect_stochastic_signals_vectorized(df: pd.DataFrame, params: dict, mode='train'):
-    """
-    使用随机指标检测信号
-    
-    Args:
-        df: 包含OHLCV数据的DataFrame
-        params: 参数字典，包含以下字段：
-            - k_period: K线周期
-            - d_period: D线周期
-            - overbought: 超买阈值
-            - oversold: 超卖阈值
-            - support_ma_period: 支撑位MA周期
-            - resistance_ma_period: 阻力位MA周期
-            # - atr_period_explicit: 显性信号ATR周期
-            # - atr_period_hidden: 隐性信号ATR周期
-            - strength_threshold: 信号强度阈值
-        mode: 模式，'train'或'eval', 训练时无未来函数, 推理时考虑未来确认
-    """
+def get_target_price(df, is_support=True, target_multiplier=1.1, atr_period=20):
     df = df.copy()
-    k, d = Stochastic(df['high'], df['low'], df['close'], 
-                      params['k_period'], params['d_period'])
-    support_ma = df['close'].rolling(window=int(params['support_ma_period']), min_periods=1).mean()
-    resistance_ma = df['close'].rolling(window=int(params['resistance_ma_period']), min_periods=1).mean()
-    
-    df['signal_strength'] = abs(k - d)
-
-    support_condition = (k > d) & (k.shift(1) <= d.shift(1)) & (k < params['oversold']) & (df['close'] < support_ma)
-    resistance_condition = (k < d) & (k.shift(1) >= d.shift(1)) & (k > params['overbought']) & (df['close'] > resistance_ma)
-
-    if mode == 'check':
-        # 推理考虑未来阳线
-        support_condition = support_condition & (((df['close'].shift(-1) > df['close'])&(df['open'].shift(-1) < df['close'].shift(-1))) | ((df['close'] < df['close'].shift(-2))&(df['close'].shift(-1) < df['close'].shift(-2))))
-        resistance_condition = resistance_condition & (((df['close'].shift(-1) < df['close'])&(df['open'].shift(-1) > df['close'].shift(-1))) | ((df['close'] > df['close'].shift(-2))&(df['close'].shift(-1) > df['close'].shift(-2))))
-    elif mode == 'train':
-        # 训练无未来函数
-        pass
-    
-    df['reversal'] = np.select(
-        [support_condition, resistance_condition],
-        ['support reversal', 'resistance reversal'],
-        default='none'
-    )
-    
-    df['is_strong'] = np.where(
-        (df['reversal'] != 'none') & 
-        (df['signal_strength'] >= round(params['strength_threshold'],1)),
-        1, 0
-    )
-
-    return df
-
-def get_target_price(df, is_support=True, target_multiplier=1, atr_period=20):
-    df = df.copy()
-    atr = ATR(df['high'], df['low'], df['close'], period=atr_period).fillna(0).iloc[-1]
+    atr = ATR(df['high'], df['low'], df['close'], period=atr_period).iloc[-1]
     close = df['close'].iloc[-1]
     target = None
     if is_support:
@@ -259,7 +199,7 @@ def get_target_price(df, is_support=True, target_multiplier=1, atr_period=20):
         target = close - atr * target_multiplier
     return round(target, 3) if isinstance(target, float) and target > 0 else None
 
-def calculate_win_rate(df, look_ahead=10, target_multiplier=1, atr_period=20):
+def calculate_win_rate(df, look_ahead=10, target_multiplier=1.1, atr_period=20, check_high_low=True):
     df = df.copy()
     df['atr'] = ATR(df['high'], df['low'], df['close'], period=atr_period)
     
@@ -272,14 +212,24 @@ def calculate_win_rate(df, look_ahead=10, target_multiplier=1, atr_period=20):
     df['recent_high'] = df['high'].rolling(window=3, min_periods=1).max()
     df['recent_low'] = df['low'].rolling(window=3, min_periods=1).min()
     
-    df['support_win'] = np.where(
-        (df['reversal'] == 'support reversal') & (df['future_high'] >= df['support_target']) & (df['recent_low'] <= df['future_low']),
-        1, 0
-    )
-    df['resistance_win'] = np.where(
-        (df['reversal'] == 'resistance reversal') & (df['future_low'] <= df['resistance_target']) & (df['recent_high'] >= df['future_high']),
-        1, 0
-    )
+    if check_high_low:
+        df['support_win'] = np.where(
+            (df['reversal'] == 'support reversal') & (df['future_high'] >= df['support_target']) & (df['recent_low'] <= df['future_low']),
+            1, 0
+        )
+        df['resistance_win'] = np.where(
+            (df['reversal'] == 'resistance reversal') & (df['future_low'] <= df['resistance_target']) & (df['recent_high'] >= df['future_high']),
+            1, 0
+        )
+    else:
+        df['support_win'] = np.where(
+            (df['reversal'] == 'support reversal') & (df['future_high'] >= df['support_target']),
+            1, 0
+        )
+        df['resistance_win'] = np.where(
+            (df['reversal'] == 'resistance reversal') & (df['future_low'] <= df['resistance_target']),
+            1, 0
+        )
     
     support_signals = df[df['reversal'] == 'support reversal']
     resistance_signals = df[df['reversal'] == 'resistance reversal']
@@ -462,145 +412,3 @@ def run_bayes_optimization(args):
     
     score = -trials.best_trial['result']['loss']
     return score, best
-
-class OptimizationObjective:
-    def __init__(self, df, look_ahead, target_multiplier, atr_period, signal_count_target):
-        self.df = df
-        self.look_ahead = look_ahead
-        self.target_multiplier = target_multiplier
-        self.atr_period = atr_period
-        self.signal_count_target = signal_count_target
-
-    def __call__(self, params):
-        # 转换为整数值
-        params_int = {
-            'k_period': int(params['k_period']),
-            'd_period': int(params['d_period']),
-            'overbought': params['overbought'],
-            'oversold': params['oversold'],
-            'support_ma_period': int(params['support_ma_period']),
-            'resistance_ma_period': int(params['resistance_ma_period']),
-            'strength_threshold': params['strength_threshold']
-        }
-        df_with_signals = detect_stochastic_signals_vectorized(self.df.copy(), params_int, mode='train')
-        result = calculate_win_rate(df_with_signals, look_ahead=self.look_ahead, 
-                                  target_multiplier=self.target_multiplier, 
-                                  atr_period=self.atr_period)
-        
-        support_f1 = 2 * (result['strong_support_win_rate'] * result['support_recall']) / (result['strong_support_win_rate'] + result['support_recall']) if (result['strong_support_win_rate'] + result['support_recall']) > 0 else 0
-        resistance_f1 = 2 * (result['strong_resistance_win_rate'] * result['resistance_recall']) / (result['strong_resistance_win_rate'] + result['resistance_recall']) if (result['strong_resistance_win_rate'] + result['resistance_recall']) > 0 else 0
-        score = (support_f1 + resistance_f1) / 2
-        
-        # 添加信号数量惩罚项
-        signal_count_penalty = min(1.0, min(result['strong_support_signals_count'], result['strong_resistance_signals_count']) / self.signal_count_target)
-        adjusted_score = score * signal_count_penalty
-        
-        return -adjusted_score  # 负值用于最小化
-
-def KD_analysis(df, name, evals=500, look_ahead:int=0):
-    # 参数空间
-    space = {
-        'k_period': hp.quniform('k_period', 9, 21, 1),  #聚焦有效范围
-        'd_period': hp.quniform('d_period', 3, 7, 1),
-        'overbought': hp.quniform('overbought', 50, 90, 5),
-        'oversold': hp.quniform('oversold', 10, 50, 5),
-        'support_ma_period': hp.quniform('support_ma_period', 5, 60, 5),
-        'resistance_ma_period': hp.quniform('resistance_ma_period', 5, 60, 5),
-        'strength_threshold': hp.quniform('strength_threshold', 0.1, 4, 0.1)
-    }
-
-    # 主流atr_period
-    atr_period = calculate_atr_period(df)
-    # 分析市场状态
-    df_states = analyze_market_states(df, period=atr_period)
-    # 最近市场状态
-    current_state = df_states.iloc[-1]
-    currnet_look_ahead = determine_look_ahead(current_state['Historical_Volatility'], current_state['Trend_Length'])
-    if look_ahead <= 0:
-       look_ahead = currnet_look_ahead
-    target_multiplier = calculate_target_multiplier(df, atr_period=atr_period, look_ahead=look_ahead)
-
-    # 根据市场状态调整目标百分比
-    signal_target_percentage = get_signal_target_percentage(current_state['Historical_Volatility'])
-    signal_count_target = len(df) * signal_target_percentage
-
-    print(f"\n--------KD analysis for {name}--------")
-    print(f"Current Market State: {current_state['Period']}")
-    print(f"Current Market State Volatility: {current_state['Historical_Volatility']}")
-    print(f"Current Market signal target percentage: {signal_target_percentage*100}%")
-    print(f"Recommended look_ahead for {current_state['Period']}: {currnet_look_ahead} days")
-    print(f"Pre-calculated: look_ahead={look_ahead}, target_multiplier={target_multiplier:.2f}, atr_period={atr_period}")
-
-    # 创建目标函数对象
-    objective = OptimizationObjective(df, look_ahead, target_multiplier, atr_period, signal_count_target)
-
-    # 进程池并行优化
-    scores = []
-    best_params = []
-    n_optimizations = 20
-
-    optimization_args = [
-        (i, space, objective, evals, 100, 0.001, np.random.randint(0, 1000000))
-        for i in range(n_optimizations)
-    ]
-
-    n_processes = max(1, cpu_count() - 1)  # 保留一个CPU核心
-    with Pool(processes=n_processes) as pool:
-        results = list(tqdm(
-            pool.imap(run_bayes_optimization, optimization_args),
-            total=n_optimizations
-        ))
-
-    scores, best_params = zip(*results)
-
-    best_idx = np.argmax(scores)
-    print(f"best score: {scores[best_idx]:.4f} best params: {best_params[best_idx]}")
-
-    best = best_params[best_idx]
-
-    # 将best参数转换为实际值
-    best_params = {
-        'k_period': int(best['k_period']),
-        'd_period': int(best['d_period']),
-        'overbought': best['overbought'],
-        'oversold': best['oversold'],
-        'support_ma_period': int(best['support_ma_period']),
-        'resistance_ma_period': int(best['resistance_ma_period']),
-        'strength_threshold': round(best['strength_threshold'], 1)
-    }
-
-    # 使用最佳参数计算最终信号
-    print(f"\n--------Training signals for {name} with best params--------")
-    df = detect_stochastic_signals_vectorized(df, best_params, mode='train')
-    result = calculate_win_rate(df, look_ahead=look_ahead, target_multiplier=target_multiplier, atr_period=atr_period)
-    df_visual = result['detailed_df']
-    title = f'{name} Stochastic Oscillator Signals (look_ahead:{look_ahead} signal_target_percent:{(signal_target_percentage*100):.1f}%)'
-
-    original_plot = display_signals(df_visual, title, best_params, result)
-
-    print(f"\n--------Checked signals for {name} with best params--------")
-    df_checked = detect_stochastic_signals_vectorized(df, best_params, mode='check')
-    result_checked = calculate_win_rate(df_checked, look_ahead=look_ahead, target_multiplier=target_multiplier, atr_period=atr_period)
-    df_visual_checked = result_checked['detailed_df']
-    checked_plot = display_signals(df_visual_checked, f'Checked {title}', best_params, result_checked)
-
-    del result["detailed_df"]
-
-    meta_info = {
-        'strategy': 'KD',
-        'period_end': current_state['Period'].strftime('%Y-%m-%d %H:%M:%S %Z'),
-        'signal_target_percent': signal_target_percentage,
-        'volatility': current_state['Historical_Volatility'],
-        'look_ahead': look_ahead,
-        'target_multiplier': target_multiplier,
-        'atr_period': atr_period
-    }
-
-    return {
-            'performance': result,
-            'best_params': best_params,
-            'signal': df_visual,
-            'plot': original_plot,
-            'checked_plot': checked_plot,
-            'meta_info': meta_info
-            }

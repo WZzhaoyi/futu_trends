@@ -12,7 +12,7 @@ from data import get_kline_data
 from ft_config import get_config
 import json
 from datetime import datetime
-from tools import code_in_futu_group
+from tools import code_in_futu_group, sanitize_path_component
 
 def run_analysis(code_list:pd.DataFrame, indicator_type:str, config:ConfigParser, output_dir='./output', data_dir='./data/detect', cache_expiry_days=1):
     # 确保输出目录存在
@@ -20,7 +20,7 @@ def run_analysis(code_list:pd.DataFrame, indicator_type:str, config:ConfigParser
     os.makedirs(data_dir, exist_ok=True)
     
     results = {}
-    name_list = code_list['name']
+    name_list = code_list['name'].values
 
     look_ahead = config.get("CONFIG", "KD_LOOK_AHEAD")
     look_ahead = int(look_ahead) if look_ahead else 0
@@ -116,5 +116,5 @@ if __name__ == '__main__':
         if trend_type not in indicator_dict:
             raise ValueError(f"Invalid trend type: {trend_type}")
         indicator_type = indicator_dict[trend_type]
-        output_dir = f'./output/detect_{indicator_type}_{timestamp}'
+        output_dir = f'./output/detect_{timestamp}_{sanitize_path_component(group)}_{indicator_type}'
         results = run_analysis(code_pd, indicator_type, config, output_dir=output_dir)

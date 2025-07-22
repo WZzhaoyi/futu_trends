@@ -2,7 +2,7 @@ from multiprocessing import Pool, cpu_count
 
 import numpy as np
 from tqdm import tqdm
-from .KD import *
+from .tool import *
 from .indicators import RSI, Indicator, KD, MACD
 
 class Optimization:
@@ -16,7 +16,7 @@ class Optimization:
 
     def __call__(self, params):
         df_with_signals = self.indicator.calculate(self.df.copy(), params, mode='train')
-        result = calculate_win_rate(df_with_signals, look_ahead=self.look_ahead, 
+        result = self.indicator.calculate_win_rate(df_with_signals, look_ahead=self.look_ahead, 
                                   target_multiplier=self.target_multiplier, atr_period=self.atr_period)
         
         score = self.indicator.calculate_score(result, self.signal_count_target)
@@ -36,7 +36,7 @@ def technical_analysis(df, name, indicator_type='KD', evals=500, look_ahead=0):
     # 获取参数空间
     space = indicator.get_space()
     
-    # 计算市场参数（复用原有逻辑）
+    # 计算市场参数
     atr_period = calculate_atr_period(df)
     df_states = analyze_market_states(df, period=atr_period)
     current_state = df_states.iloc[-1]
@@ -78,14 +78,14 @@ def technical_analysis(df, name, indicator_type='KD', evals=500, look_ahead=0):
     
     print(f"\n--------Training signals for {name} with best params--------")
     df_final = indicator.calculate(df, best_params, mode='train')
-    result = calculate_win_rate(df_final, look_ahead=look_ahead, 
+    result = indicator.calculate_win_rate(df_final, look_ahead=look_ahead, 
                                target_multiplier=target_multiplier, atr_period=atr_period)
     df_visual = result['detailed_df']
     original_plot = display_signals(df_visual, title, best_params, result)
     
     print(f"\n--------Checked signals for {name} with best params--------")
     df_checked = indicator.calculate(df, best_params, mode='check')
-    result_checked = calculate_win_rate(df_checked, look_ahead=look_ahead, 
+    result_checked = indicator.calculate_win_rate(df_checked, look_ahead=look_ahead, 
                                        target_multiplier=target_multiplier, atr_period=atr_period)
     checked_plot = display_signals(result_checked['detailed_df'], f'Checked {title}', best_params, result_checked)
 
