@@ -176,48 +176,35 @@ def is_top_down(df:pd.DataFrame, code:str, config:configparser.ConfigParser) -> 
     
     return None if msg == '' else msg
 
-def is_balance(data: pd.DataFrame, M: int = 3, N: int = 5) -> str | None: # 量价关系平衡
-    assert len(data) >= max(M*6, N*6)
-    
-    # 成交量变化率
-    data['vol_change'] = data['volume'] / data['volume'].shift(1) - 1
-    
-    # K线实体绝对值
-    data['entity'] = abs(data['close'] - data['open'])
-    
-    # K线实体变化率
-    data['entity_change'] = data['entity'] / data['entity'].shift(1) - 1
-    data.loc[data['entity'].shift(1) == 0, 'entity_change'] = 0  # 处理分母为0的情况
-    
-    data['ma_short'] = MA(data['close'], N)  # 短期均线
-    data['ma_mid'] = MA(data['close'], N*2)  # 中期均线
-    data['ma_long'] = MA(data['close'], N*3)  # 长期均线
-    
-    # 判断上涨/下跌趋势
-    data['up_trend'] = (data['ma_short'] > data['ma_mid']) & (data['ma_mid'] > data['ma_long']) & (data['ma_short'] > data['ma_short'].shift(1))
-    data['down_trend'] = (data['ma_short'] < data['ma_mid']) & (data['ma_mid'] < data['ma_long']) & (data['ma_short'] < data['ma_short'].shift(1))
-    
-    # 综合趋势判断
-    data['trend'] = data['up_trend'] | data['down_trend']
-    
-    # 判断放量/缩量
-    data['vol_up'] = data['vol_change'].shift(1).rolling(M-1).sum() >= M-1
-    data['vol_down'] = (data['vol_change'].shift(1) < 0).rolling(M-1).sum() >= M-1
-    
-    last_row = data.iloc[-1]
+def is_balance(data: pd.DataFrame, M: int = 5, N: int = 28, R: int = 20) -> str | None: # 量价关系平衡
+    assert len(data) >= max(M, N, R)*6
+
+    sum_cvol = (data['close'] * data['volume']).rolling(N, min_periods=N).sum()
+    sum_vol = data['volume'].rolling(N, min_periods=N).sum()
+    ma_c = data['close'].rolling(N, min_periods=N).mean()
+    vpc = sum_cvol / sum_vol - ma_c
+
+    sum_cvol = (data['close'] * data['volume']).rolling(M, min_periods=M).sum()
+    sum_vol = data['volume'].rolling(M, min_periods=M).sum()
+    ma_c = data['close'].rolling(M, min_periods=M).mean()
+    vpr = (sum_cvol / sum_vol) / ma_c
+
+    vm = data['volume'].rolling(M, min_periods=M).mean() / data['volume'].rolling(N, min_periods=N).mean()
+
+    vpci = vpc*vpr*vm
+
+    dis = vpci.rolling(R, min_periods=R).std()
+    mid = vpci.rolling(R, min_periods=R).mean()
+    upper = mid + 2 * dis
+    lower = mid - 2 * dis
+
     msg = ''
-    
-    # 检测成交量反转
-    if ((last_row['vol_up'] and last_row['vol_change'] < 0 and last_row['trend']) or 
-        (last_row['vol_down'] and last_row['vol_change'] > 0 and last_row['trend'])):
-        msg += '成交量反转🚨'
-    
-    # 检测量价失衡
-    if (last_row['entity_change'] < -0.4 and 
-        last_row['vol_change'] > -0.1 and 
-        last_row['trend']):
-        msg += '量价失衡🚨'
-    
+
+    if vpci.iloc[-1] > lower.iloc[-1] and vpci.iloc[-2] < lower.iloc[-2] and vpci.iloc[-3] < lower.iloc[-3]:
+        msg += 'support vpci📈'
+    elif vpci.iloc[-1] < upper.iloc[-1] and vpci.iloc[-2] > upper.iloc[-2] and vpci.iloc[-3] > upper.iloc[-3]:
+        msg += 'resistance vpci📉'
+
     return None if msg == '' else msg
 
 def check_trends(code_in_group: pd.DataFrame, config: configparser.ConfigParser):

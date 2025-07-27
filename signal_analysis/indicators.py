@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 import pandas as pd
 import numpy as np
-from typing import Dict, Any
+from typing import Dict
 from hyperopt import hp
 
 from signal_analysis.tool import calculate_win_rate
@@ -34,16 +34,13 @@ class Indicator(ABC):
 
     @abstractmethod
     def calculate_score(self, result: Dict, signal_count_target: float) -> float:
-        """计算优化评分 - 每个指标可以有自己的评分策略"""
+        """计算优化评分"""
         pass
-
+    
+    @abstractmethod
     def _future_confirmation(self, df, is_support):
-        if is_support:
-            return ((df['close'].shift(-1) > df['close']) & (df['open'].shift(-1) < df['close'].shift(-1))) | \
-                   ((df['high'] < df['close'].shift(-2)))
-        else:
-            return ((df['close'].shift(-1) < df['close']) & (df['open'].shift(-1) > df['close'].shift(-1))) | \
-                   ((df['low'] > df['close'].shift(-2)))
+        """未来确认 - 不能直接用作胜率计算"""
+        pass
 
 class KD(Indicator):
     """KD随机指标"""
@@ -119,36 +116,47 @@ class KD(Indicator):
         d = k.rolling(window=d_period).mean()
         return k, d
 
+    def _future_confirmation(self, df, is_support):
+        if is_support:
+            return ((df['close'].shift(-1) > df['close']) & (df['open'].shift(-1) <= df['close'].shift(-1))) | \
+                   ((df['close'].shift(-1) > df['high']) & (df['open'].shift(-1) >= df['high'])) | \
+                   ((df['close'].shift(-2) > df['high']) & (df['close'].shift(-2) > df['high'].shift(-1)))
+        else:
+            return ((df['close'].shift(-1) < df['close']) & (df['open'].shift(-1) >= df['close'].shift(-1))) | \
+                   ((df['close'].shift(-1) < df['low']) & (df['open'].shift(-1) <= df['low'])) | \
+                   ((df['close'].shift(-2) < df['low']) & (df['close'].shift(-2) < df['low'].shift(-1)))
+
 class MACD(Indicator):
     """MACD指标"""
     
     def get_space(self):
         return {
-            'fast_period': hp.quniform('fast_period', 7, 15, 1),
-            'slow_period': hp.quniform('slow_period', 15, 30, 1),
-            'signal_period': hp.quniform('signal_period', 6, 10, 1),
-            'ma_period': hp.quniform('ma_period', 10, 120, 5)
+            'fast_period': hp.quniform('fast_period', 6, 18, 1),
+            'slow_period': hp.quniform('slow_period', 12, 36, 1),
+            'signal_period': hp.quniform('signal_period', 6, 12, 1),
         }
     
     def calculate(self, df: pd.DataFrame, params: Dict, mode='train') -> pd.DataFrame:
         params = self.get_params(params)
         df = df.copy()
+
+        if params['fast_period'] * 1.5 > params['slow_period']:
+            df['reversal'] = 'none'
+            df['is_strong'] = 0
+            return df
         
         # 计算MACD
-        macd, signal = self._macd(df['close'], 
+        macd, signal = self._macd(df['close'],
                                             params['fast_period'], 
                                             params['slow_period'], 
                                             params['signal_period'])
         df['macd'], df['signal'] = macd, signal
         
-        # 计算MA
-        ma = df['close'].rolling(window=params['ma_period']).mean()
-        
         # 信号检测
         support_cond = (macd > signal) & (macd.shift(1) <= signal.shift(1)) & \
-                      (df['close'] > ma)
+                      (macd > 0)
         resistance_cond = (macd < signal) & (macd.shift(1) >= signal.shift(1)) & \
-                         (df['close'] < ma)
+                         (macd < 0)
         
         # 未来确认
         if mode == 'check':
@@ -180,11 +188,19 @@ class MACD(Indicator):
         return score * signal_count_penalty
     
     def _macd(self, close, fast_period, slow_period, signal_period):
-        ema_fast = close.ewm(span=fast_period).mean()
-        ema_slow = close.ewm(span=slow_period).mean()
+        ema_fast = close.ewm(span=fast_period,adjust=False).mean()
+        ema_slow = close.ewm(span=slow_period,adjust=False).mean()
         macd = ema_fast - ema_slow
-        signal = macd.ewm(span=signal_period).mean()
+        signal = macd.ewm(span=signal_period,adjust=False).mean()
         return macd, signal
+
+    def _future_confirmation(self, df, is_support):
+        if is_support:
+            return ((df['close'].shift(-1) > df['close']) & (df['open'].shift(-1) <= df['close'].shift(-1))) | \
+                   ((df['close'].shift(-2) > df['close']) & (df['close'].shift(-2) > df['close'].shift(-1)))
+        else:
+            return ((df['close'].shift(-1) < df['close']) & (df['open'].shift(-1) >= df['close'].shift(-1))) | \
+                   ((df['close'].shift(-2) < df['close']) & (df['close'].shift(-2) < df['close'].shift(-1)))
 
 
 class RSI(Indicator):
