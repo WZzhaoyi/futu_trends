@@ -330,7 +330,7 @@ def fetch_akshare_data(code: str, ktype: str, max_count: int) -> pd.DataFrame:
         
         return df
 
-def get_kline_data(code: str, config: configparser.ConfigParser, max_count: int = 250) -> pd.DataFrame:
+def get_kline_data(code: str, config: configparser.ConfigParser, max_count: int = 270) -> pd.DataFrame:
     """
     统一的K线获取接口
     
