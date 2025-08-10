@@ -43,6 +43,14 @@
             "program": "./trends.py",
             "console": "integratedTerminal",
             "args": ["--config","./env/signal_cn.ini"]
+        },
+        {
+            "name": "rs_rating",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "./market_analysis/rating.py",
+            "console": "integratedTerminal",
+            "args": ["--market","A500","--code_list","A500"]
         }
     ]
 }

@@ -12,6 +12,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import argparse
+from tqdm import tqdm
 from trend_emotion_timing import anchored_trend_score, trend_score, emotion_score
 
 # 配置日志
@@ -40,6 +41,7 @@ class RSRatingCalculator:
         self.cpu_core = cpu_count()
         # 全局网络请求锁，确保同一时间只有一个网络请求
         self._network_lock = threading.Lock()
+        self.memory_cache = {}
 
     def _get_us_stocks(self) -> pd.DataFrame:
         """获取美股代码列表，带缓存功能"""
@@ -68,6 +70,10 @@ class RSRatingCalculator:
         elif market == 'HK':
             # 港股代码需要补零
             return f'HK.{code.zfill(5)}'
+        elif market == 'SH':
+            return f'SH.{code}'
+        elif market == 'SZ':
+            return f'SZ.{code}'
         else:
             raise ValueError(f"不支持的市场类型: {market}")
             
@@ -88,14 +94,20 @@ class RSRatingCalculator:
         
         cache_path = self.cache_dir / f"{ak_ticker}.csv"
         
-        # 检查文件缓存
-        if cache_path.exists():
-            cache_time = datetime.fromtimestamp(cache_path.stat().st_mtime)
-            if (datetime.now() - cache_time).days < self.cache_expiry_days:
-                return pd.read_csv(cache_path, index_col=0, parse_dates=True)
-        
         # 网络请求加锁
         with self._network_lock:
+            # 检查文件缓存 内存数据过期？
+            if ak_ticker in self.memory_cache:
+                logger.debug(f"Successfully load cache {ak_ticker}")
+                return self.memory_cache[ak_ticker]
+            if cache_path.exists():
+                cache_time = datetime.fromtimestamp(cache_path.stat().st_mtime)
+                if (datetime.now() - cache_time).days < self.cache_expiry_days:
+                    logger.debug(f"Successfully load cache {ak_ticker}")
+                    df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+                    self.memory_cache[ak_ticker] = df
+                    return df
+
             delta_days = 365 * 5
             # 从akshare获取数据
             if ak_ticker.startswith('SH.') or ak_ticker.startswith('SZ.'):
@@ -151,7 +163,8 @@ class RSRatingCalculator:
                 df.to_csv(cache_path)
                 
             time.sleep(0.5)  # 避免请求过于频繁
-            logger.info(f"Successfully download data {ak_ticker} {df.shape}")
+            logger.debug(f"Successfully download data {ak_ticker} {df.shape}")
+            self.memory_cache[ak_ticker] = df
             return df
     
     def _calculate_period_return(self, data: pd.DataFrame, period: str) -> float:
@@ -180,8 +193,8 @@ class RSRatingCalculator:
         
         # 获取新的基准个股列表
         if market == 'A500':
-            from utility import zz500_generator
-            tickers = list(zz500_generator())
+            from utility import a500_generator
+            tickers = list(a500_generator())
         elif market == 'CSI300':
             from utility import hs300_generator
             tickers = list(hs300_generator())
@@ -204,6 +217,8 @@ class RSRatingCalculator:
     
     def _get_benchmark_returns(self, market: str) -> Dict[str, List[float]]:
         """获取基准指数成分股收益率"""
+        if f'benchmark_{market}_returns' in self.memory_cache:
+            return self.memory_cache[f'benchmark_{market}_returns']
         tickers = self._get_benchmark_tickers(market)
         
         # 计算所有成分股的收益率
@@ -216,7 +231,7 @@ class RSRatingCalculator:
                     benchmark_returns[period].append(
                         self._calculate_period_return(data, period)
                     )
-        
+        self.memory_cache[f'benchmark_{market}_returns'] = benchmark_returns
         return benchmark_returns
     
     def _calculate_rs_rating(self, ticker: str, market: str = 'CSI300') -> Dict[str, float]:
@@ -366,6 +381,10 @@ class RSRatingCalculator:
         
         results = {}
         
+        # 预加载数据
+        for ticker in tqdm(self.code_list, desc="load stock data"):
+            self._get_stock_data(ticker, market)
+        
         # 使用线程池进行并行处理
         assert self.cpu_core is not None and self.cpu_core > 1
         with ThreadPoolExecutor(max_workers=self.cpu_core*2) as executor:
@@ -376,7 +395,7 @@ class RSRatingCalculator:
             }
             
             # 收集结果
-            for future in as_completed(future_to_ticker):
+            for future in tqdm(as_completed(future_to_ticker), total=len(future_to_ticker), desc="calculate rating/trend/emotion/timing"):
                 ticker = future_to_ticker[future]
                 try:
                     ticker, result = future.result()
@@ -391,9 +410,9 @@ class RSRatingCalculator:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Rating calculator')
-    parser.add_argument('--market', type=str, default='',
+    parser.add_argument('--market', type=str, default='HSI',
                        help='Market type: A500, CSI300, HSI, SP500, GGT')
-    parser.add_argument('--code_list', type=str, default='',
+    parser.add_argument('--code_list', type=str, default='GGT',
                        help='Code list file path or name')
     parser.add_argument('--output_dir', type=str, default='./output',
                        help='Output directory')
