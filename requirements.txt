@@ -98,7 +98,6 @@ Pygments==2.19.1
 pyluach==2.2.0
 pymongo==4.12.1
 pyparsing==3.2.1
-pyppeteer==2.0.0
 pyquery==2.0.1
 PySocks==1.7.1
 python-dateutil==2.9.0.post0
@@ -127,7 +126,6 @@ urllib3==1.26.20
 w3lib==2.2.1
 wcwidth==0.2.13
 webencodings==0.5.1
-websockets==15.0.1
 xlrd==2.0.1
 yarl==1.20.0
 yfinance==0.2.64

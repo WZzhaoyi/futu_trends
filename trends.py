@@ -39,25 +39,20 @@ def is_reverse(df: pd.DataFrame, code: str, config: configparser.ConfigParser) -
     assert len(df) >= 90
     
     # 从数据库读取参数
-    try:
-        db_path = config.get("CONFIG", "KD_PARAMS_DB", fallback=None)
-        if db_path is None:
-            return None
-        db = ParamsDB(db_path)
-        data = db.get_stock_params(code)
-        if data is None:
-            return 'No KD parameters'
-        params = data['best_params']
-        meta = data['meta_info']
-        performance = data['performance']
-                
-        if not params:
-            print(f"No KD parameters found for {code}")
-            return 'No KD parameters'
+    db_path = config.get("CONFIG", "KD_PARAMS_DB", fallback=None)
+    if db_path is None:
+        return None
+    db = ParamsDB(db_path)
+    data = db.get_stock_params(code)
+    if data is None:
+        return 'No KD parameters'
+    params = data['best_params']
+    meta = data['meta_info']
+    performance = data['performance']
             
-    except Exception as e:
-        print(f"Error reading KD parameters for {code}: {str(e)}")
-        return 'KD parameter error'
+    if not params:
+        print(f"No KD parameters found for {code}")
+        return 'No KD parameters'
     
     # 信号检测
     result = KD().calculate(df, params)
@@ -82,26 +77,21 @@ def is_continue(df:pd.DataFrame, code:str, config:configparser.ConfigParser)->st
     assert len(df) >= 90
     
     # 从数据库读取参数
-    try:
-        db_path = config.get("CONFIG", "MACD_PARAMS_DB", fallback=None)
-        if db_path is None:
-            return None
-        db = ParamsDB(db_path)
-        data = db.get_stock_params(code)
-        if data is None:
-            return 'No MACD parameters'
-        params = data['best_params']
-        meta = data['meta_info']
-        performance = data['performance']
-                
-        if not params:
-            print(f"No MACD parameters found for {code}")
-            return 'No MACD parameters'
+    db_path = config.get("CONFIG", "MACD_PARAMS_DB", fallback=None)
+    if db_path is None:
+        return None
+    db = ParamsDB(db_path)
+    data = db.get_stock_params(code)
+    if data is None:
+        return 'No MACD parameters'
+    params = data['best_params']
+    meta = data['meta_info']
+    performance = data['performance']
             
-    except Exception as e:
-        print(f"Error reading MACD parameters for {code}: {str(e)}")
-        return 'MACD parameter error'
-    
+    if not params:
+        print(f"No MACD parameters found for {code}")
+        return 'No MACD parameters'
+            
     # 信号检测
     result = MACD().calculate(df, params)
     
@@ -121,42 +111,45 @@ def is_continue(df:pd.DataFrame, code:str, config:configparser.ConfigParser)->st
         msg += u'📈' if 'support' in reversal else u'📉'
     return None if msg == '' else msg
 
-def is_breakout(data:pd.DataFrame, N:int=10)->str|None:# K线突破/跌破均线
+def is_breakout(data:pd.DataFrame, N:int=240)->str|None:# K线突破/跌破均线
+    assert len(data) >= N
+    
     close = data['close']
     close_ema = EMA(close, N)
     last_close = round_decimal(close.iloc[-1])
     last_ema = round_decimal(close_ema[-1])
     prev_close = round_decimal(close.iloc[-2])
     prev_ema = round_decimal(close_ema[-2])
+    prev_prev_ema = round_decimal(close_ema[-3])
+    msg = ''
     if last_close > last_ema and prev_close <= prev_ema:
-        return f'突破ema{N}'
-    if last_close < last_ema and prev_close >= prev_ema:
-        return f'跌破ema{N}'
-    return None
+        msg = f'breakthrough ema{N}📈'
+    elif last_close < last_ema and prev_close >= prev_ema:
+        msg = f'breakdown ema{N}📉'
+    elif prev_prev_ema < prev_ema and prev_ema > last_ema:
+        msg = f'decline ema{N}📉'
+    elif prev_prev_ema > prev_ema and prev_ema < last_ema:
+        msg = f'rise ema{N}📈'
+    return None if msg == '' else msg
 
 def is_top_down(df:pd.DataFrame, code:str, config:configparser.ConfigParser) -> str|None:# 顶部和底部
     assert len(df) >= 90
     # 从数据库读取参数
-    try:
-        db_path = config.get("CONFIG", "RSI_PARAMS_DB", fallback=None)
-        if db_path is None:
-            return None
-        db = ParamsDB(db_path)
-        data = db.get_stock_params(code)
-        if data is None:
-            return 'No RSI parameters'
-        params = data['best_params']
-        meta = data['meta_info']
-        performance = data['performance']
-                
-        if not params:
-            print(f"No RSI parameters found for {code}")
-            return 'No RSI parameters'
+    db_path = config.get("CONFIG", "RSI_PARAMS_DB", fallback=None)
+    if db_path is None:
+        return None
+    db = ParamsDB(db_path)
+    data = db.get_stock_params(code)
+    if data is None:
+        return 'No RSI parameters'
+    params = data['best_params']
+    meta = data['meta_info']
+    performance = data['performance']
             
-    except Exception as e:
-        print(f"Error reading RSI parameters for {code}: {str(e)}")
-        return 'RSI parameter error'
-    
+    if not params:
+        print(f"No RSI parameters found for {code}")
+        return 'No RSI parameters'
+            
     # 信号检测
     result = RSI().calculate(df, params)
     last_row = result.iloc[-1]
@@ -177,7 +170,7 @@ def is_top_down(df:pd.DataFrame, code:str, config:configparser.ConfigParser) -> 
     return None if msg == '' else msg
 
 def is_balance(data: pd.DataFrame, M: int = 5, N: int = 28, R: int = 20) -> str | None: # 量价关系平衡
-    assert len(data) >= max(M, N, R)*6
+    assert len(data) >= 90
 
     sum_cvol = (data['close'] * data['volume']).rolling(N, min_periods=N).sum()
     sum_vol = data['volume'].rolling(N, min_periods=N).sum()
@@ -221,73 +214,78 @@ def check_trends(code_in_group: pd.DataFrame, config: configparser.ConfigParser)
         
     results = []
     for idx, futu_code in enumerate(code_in_group['code'].values):
-        df = get_kline_data(futu_code, config)
+        print(f"Processing {futu_code}")
+        try:
+            df = get_kline_data(futu_code, config, max_count=300)
 
-        # 添加对 df 的检查
-        if df is None:
-            print(f"Warning: Failed to get data for {futu_code}")
-            continue
+            # 添加对 df 的检查
+            if df is None:
+                print(f"Warning: Failed to get data for {futu_code}")
+                continue
+                
+            if len(df) == 0:
+                print(f"Warning: Empty data for {futu_code}")
+                continue
+
+            name = code_in_group['name'].iloc[idx]
+
+            if len(df['high']) == 0 or len(df['low']) == 0 or len(df['close']) == 0:
+                print(f"Warning: No data for {futu_code}")
+                continue
+
+            msg = f'{futu_code} {name}'
+            for i in trend_type:
+                if i.lower() == 'breakout':
+                    bo = is_breakout(df) # 突破/跌破EMA均线
+                    if bo is not None:
+                        msg += f' | {bo}'
+                elif i.lower() == 'reverse':
+                    rev = is_reverse(df,futu_code,config) # 趋势反转
+                    if rev is not None:
+                        msg += f' | {rev}'
+                elif i.lower() == 'continue':
+                    co = is_continue(df,futu_code,config) # 趋势延续
+                    if co is not None:
+                        msg += f' | {co}'
+                elif i.lower() == 'topdown':
+                    td = is_top_down(df,futu_code,config) # 顶底结构
+                    if td is not None:
+                        msg += f' | {td}'
+                elif i.lower() == 'balance':
+                    bal = is_balance(df) # 量价关系平衡
+                    if bal is not None:
+                        msg += f' | {bal}'
             
-        if len(df) == 0:
-            print(f"Warning: Empty data for {futu_code}")
+            # 计算动量因子
+            close = df['close']
+            momentum = calc_momentum(close) if isinstance(close, pd.Series) else pd.Series([0.000])
+            
+            # 获取最后两个动量值，用于判断方向
+            last_momentum = momentum.iloc[-1]
+            prev_momentum = momentum.iloc[-2]
+            msg += f' | {last_momentum:.3f}'
+
+            if last_momentum > prev_momentum:
+                msg += u'↑'
+            elif last_momentum < prev_momentum:
+                msg += u'↓'
+            
+            # 添加到结果列表
+
+            recent_high = df['high'].iloc[-3:].max()
+            recent_low = df['low'].iloc[-3:].min()
+
+            results.append({
+                'futu_code': futu_code,
+                'name': name,
+                'msg': msg,
+                'momentum': last_momentum,
+                'high': recent_high,
+                'low': recent_low
+            })
+        except Exception as e:
+            print(f"Error processing {futu_code}: {str(e)}")
             continue
-
-        name = code_in_group['name'].iloc[idx]
-
-        if len(df['high']) == 0 or len(df['low']) == 0 or len(df['close']) == 0:
-            print(f"Warning: No data for {futu_code}")
-            continue
-
-        msg = f'{futu_code} {name}'
-        for i in trend_type:
-            if i.lower() == 'breakout':
-                bo = is_breakout(df) # 突破/跌破EMA均线
-                if bo is not None:
-                    msg += f' | {bo}'
-            elif i.lower() == 'reverse':
-                rev = is_reverse(df,futu_code,config) # 趋势反转
-                if rev is not None:
-                    msg += f' | {rev}'
-            elif i.lower() == 'continue':
-                co = is_continue(df,futu_code,config) # 趋势延续
-                if co is not None:
-                    msg += f' | {co}'
-            elif i.lower() == 'topdown':
-                td = is_top_down(df,futu_code,config) # 顶底结构
-                if td is not None:
-                    msg += f' | {td}'
-            elif i.lower() == 'balance':
-                bal = is_balance(df) # 量价关系平衡
-                if bal is not None:
-                    msg += f' | {bal}'
-        
-        # 计算动量因子
-        close = df['close']
-        momentum = calc_momentum(close) if isinstance(close, pd.Series) else pd.Series([0.000])
-        
-        # 获取最后两个动量值，用于判断方向
-        last_momentum = momentum.iloc[-1]
-        prev_momentum = momentum.iloc[-2]
-        msg += f' | {last_momentum:.3f}'
-
-        if last_momentum > prev_momentum:
-            msg += u'↑'
-        elif last_momentum < prev_momentum:
-            msg += u'↓'
-        
-        # 添加到结果列表
-
-        recent_high = df['high'].iloc[-3:].max()
-        recent_low = df['low'].iloc[-3:].min()
-
-        results.append({
-            'futu_code': futu_code,
-            'name': name,
-            'msg': msg,
-            'momentum': last_momentum,
-            'high': recent_high,
-            'low': recent_low
-        })
     
     # 创建DataFrame并按动量因子排序
     if results:
