@@ -4,7 +4,7 @@ import numpy as np
 from typing import Dict
 from hyperopt import hp
 
-from signal_analysis.tool import calculate_win_rate
+from signal_analysis.tool import ATR, calculate_win_rate
 
 class Indicator(ABC):
     """技术指标基类"""
@@ -51,9 +51,6 @@ class KD(Indicator):
             'd_period': hp.quniform('d_period', 3, 7, 1),
             'overbought': hp.quniform('overbought', 55, 90, 1),
             'oversold': hp.quniform('oversold', 10, 45, 1),
-            # 'support_ma_period': hp.quniform('support_ma_period', 10, 50, 5),
-            # 'resistance_ma_period': hp.quniform('resistance_ma_period', 10, 50, 5),
-            # 'strength_threshold': hp.quniform('strength_threshold', 0.1, 4, 0.1)
         }
     
     def calculate(self, df: pd.DataFrame, params: Dict, mode='train') -> pd.DataFrame:
@@ -64,15 +61,6 @@ class KD(Indicator):
         k, d = self._stochastic(df['high'], df['low'], df['close'], 
                                int(params['k_period']), int(params['d_period']))
         df['k'], df['d'] = k, d
-        # df['signal_strength'] = abs(k - d)
-        
-        # 计算MA
-        # support_ma = df['close'].rolling(window=int(params['support_ma_period'])).mean()
-        # resistance_ma = df['close'].rolling(window=int(params['resistance_ma_period'])).mean()
-        
-        # 信号检测
-        # support_cond = (k > d) & (k.shift(1) <= d.shift(1)) & (k < params['oversold']) & (df['close'] < support_ma)
-        # resistance_cond = (k < d) & (k.shift(1) >= d.shift(1)) & (k > params['overbought']) & (df['close'] > resistance_ma)
 
         support_cond = (k > d) & (k.shift(1) <= d.shift(1)) & (d < params['oversold'])
         resistance_cond = (k < d) & (k.shift(1) >= d.shift(1)) & (d > params['overbought'])
@@ -85,8 +73,6 @@ class KD(Indicator):
         # 生成信号
         df['reversal'] = np.select([support_cond, resistance_cond], 
                                   ['support reversal', 'resistance reversal'], 'none')
-        # df['is_strong'] = ((df['reversal'] != 'none') & 
-                        #   (df['signal_strength'] >= round(params['strength_threshold'], 1))).astype(int)
         df['is_strong'] = ((df['reversal'] != 'none')).astype(int)
         return df
     
@@ -131,9 +117,11 @@ class MACD(Indicator):
     
     def get_space(self):
         return {
-            'fast_period': hp.quniform('fast_period', 6, 18, 1),
-            'slow_period': hp.quniform('slow_period', 12, 36, 1),
-            'signal_period': hp.quniform('signal_period', 6, 12, 1),
+            'fast_period': hp.quniform('fast_period', 10, 13, 1),
+            'slow_period': hp.quniform('slow_period', 20, 26, 1),
+            'signal_period': hp.quniform('signal_period', 6, 10, 1),
+            'overbought': hp.quniform('overbought', 50, 150, 10),
+            'oversold': hp.quniform('oversold', -150, -50, 10),
         }
     
     def calculate(self, df: pd.DataFrame, params: Dict, mode='train') -> pd.DataFrame:
@@ -146,7 +134,7 @@ class MACD(Indicator):
             return df
         
         # 计算MACD
-        macd, signal = self._macd(df['close'],
+        macd, signal = self._macd_atr(df['close'], df['high'], df['low'],
                                             params['fast_period'], 
                                             params['slow_period'], 
                                             params['signal_period'])
@@ -154,9 +142,9 @@ class MACD(Indicator):
         
         # 信号检测
         support_cond = (macd > signal) & (macd.shift(1) <= signal.shift(1)) & \
-                      (macd > 0)
+                      (macd < params['oversold'])
         resistance_cond = (macd < signal) & (macd.shift(1) >= signal.shift(1)) & \
-                         (macd < 0)
+                         (macd > params['overbought'])
         
         # 未来确认
         if mode == 'check':
@@ -187,12 +175,12 @@ class MACD(Indicator):
         
         return score * signal_count_penalty
     
-    def _macd(self, close, fast_period, slow_period, signal_period):
+    def _macd_atr(self, close, high, low, fast_period, slow_period, signal_period):
         ema_fast = close.ewm(span=fast_period,adjust=False).mean()
         ema_slow = close.ewm(span=slow_period,adjust=False).mean()
-        macd = ema_fast - ema_slow
-        signal = macd.ewm(span=signal_period,adjust=False).mean()
-        return macd, signal
+        vmacd = 100 * (ema_fast - ema_slow) / ATR(high, low, close, slow_period)
+        signal = vmacd.ewm(span=signal_period,adjust=False).mean()
+        return vmacd, signal
 
     def _future_confirmation(self, df, is_support):
         if is_support:
