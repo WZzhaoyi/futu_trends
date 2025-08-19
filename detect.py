@@ -22,7 +22,7 @@ def run_analysis(code_list:pd.DataFrame, indicator_type:str, config:ConfigParser
     results = {}
     name_list = code_list['name'].values
 
-    look_ahead = config.get("CONFIG", "KD_LOOK_AHEAD")
+    look_ahead = config.get("CONFIG", "KD_LOOK_AHEAD", fallback=0)
     look_ahead = int(look_ahead) if look_ahead else 0
     ktype = config.get("CONFIG", "FUTU_PUSH_TYPE")
     timestamp = datetime.now().strftime('%Y%m%d')
@@ -89,6 +89,10 @@ if __name__ == '__main__':
     code_list = config.get("CONFIG", "FUTU_CODE_LIST", fallback='').split(',')
     code_list = [code for code in code_list if code.strip()]
 
+    ktype = config.get("CONFIG", "FUTU_PUSH_TYPE")
+    if ktype not in ['K_DAY', 'K_WEEK', 'K_60M', 'K_HALF_DAY']:
+        raise ValueError(f"Invalid ktype: {ktype}")
+
     # 获取股票列表
     code_pd = pd.DataFrame(columns=pd.Index(['code','name']))
     if group:
@@ -116,5 +120,5 @@ if __name__ == '__main__':
         if trend_type not in indicator_dict:
             raise ValueError(f"Invalid trend type: {trend_type}")
         indicator_type = indicator_dict[trend_type]
-        output_dir = f'./output/detect_{timestamp}_{sanitize_path_component(group)}_{indicator_type}'
+        output_dir = f'./output/detect_{timestamp}_{ktype}_{sanitize_path_component(group)}_{indicator_type}'
         results = run_analysis(code_pd, indicator_type, config, output_dir=output_dir)
