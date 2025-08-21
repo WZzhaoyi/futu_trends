@@ -93,17 +93,19 @@ class RSRatingCalculator:
             ak_ticker = self._convert_ticker_format(ticker)
         
         cache_path = self.cache_dir / f"{ak_ticker}.csv"
+
+        # 内存数据过期？
+        if ak_ticker in self.memory_cache:
+            logger.debug(f"Successfully load cache {ak_ticker} from memory")
+            return self.memory_cache[ak_ticker]
         
         # 网络请求加锁
         with self._network_lock:
-            # 检查文件缓存 内存数据过期？
-            if ak_ticker in self.memory_cache:
-                logger.debug(f"Successfully load cache {ak_ticker}")
-                return self.memory_cache[ak_ticker]
+            # 检查文件缓存
             if cache_path.exists():
                 cache_time = datetime.fromtimestamp(cache_path.stat().st_mtime)
                 if (datetime.now() - cache_time).days < self.cache_expiry_days:
-                    logger.debug(f"Successfully load cache {ak_ticker}")
+                    logger.debug(f"Successfully load cache {ak_ticker} from file")
                     df = pd.read_csv(cache_path, index_col=0, parse_dates=True)
                     self.memory_cache[ak_ticker] = df
                     return df
@@ -234,13 +236,13 @@ class RSRatingCalculator:
         self.memory_cache[f'benchmark_{market}_returns'] = benchmark_returns
         return benchmark_returns
     
-    def _calculate_rs_rating(self, ticker: str, market: str = 'CSI300') -> Dict[str, float]:
+    def _calculate_rs_rating(self, ticker: str, benchmark_returns: Dict[str, List[float]], market: str) -> Dict[str, float]:
         """计算股票的RS Rating"""
         if market not in self.market_index_map.keys():
             raise ValueError(f"市场类型必须是 {self.market_index_map.keys()}")
         
         # 获取基准指数成分股收益率
-        benchmark_returns = self._get_benchmark_returns(market)
+        # benchmark_returns = self._get_benchmark_returns(market)
         
         # 获取目标股票数据
         data = self._get_stock_data(ticker, market)
@@ -336,7 +338,7 @@ class RSRatingCalculator:
         else:
             return 0
     
-    def _process_single_stock(self, ticker: str) -> tuple:
+    def _process_single_stock(self, ticker: str, benchmark_returns: Dict[str, List[float]]) -> tuple:
         """处理单个股票的计算，用于并行执行"""
         try:
             stock_data = self._get_stock_data(ticker, self.market)
@@ -350,7 +352,7 @@ class RSRatingCalculator:
                 raise ValueError(f"Failed to get market index data {market_index}")
                 
             # 相对大盘表现、beta值、趋势情绪择时
-            rs_ratings = self._calculate_rs_rating(ticker, self.market)
+            rs_ratings = self._calculate_rs_rating(ticker, benchmark_returns, self.market)
             beta = self._calculate_beta(stock_data, market_data)
             trend_emotion_timing = self._calculate_trend_emotion_timing(ticker, self.market)
             
@@ -380,17 +382,19 @@ class RSRatingCalculator:
             raise ValueError(f"Market type must be one of {self.market_index_map.keys()}")
         
         results = {}
+        print(f"get benchmark returns for {market}")
+        benchmark_returns = self._get_benchmark_returns(market)
         
         # 预加载数据
         for ticker in tqdm(self.code_list, desc="load stock data"):
             self._get_stock_data(ticker, market)
         
         # 使用线程池进行并行处理
-        assert self.cpu_core is not None and self.cpu_core > 1
-        with ThreadPoolExecutor(max_workers=self.cpu_core*2) as executor:
+        assert self.cpu_core is not None and self.cpu_core >= 1
+        with ThreadPoolExecutor(max_workers=self.cpu_core*4) as executor:
             # 提交所有任务
             future_to_ticker = {
-                executor.submit(self._process_single_stock, ticker): ticker 
+                executor.submit(self._process_single_stock, ticker, benchmark_returns): ticker 
                 for ticker in self.code_list
             }
             
@@ -401,7 +405,7 @@ class RSRatingCalculator:
                     ticker, result = future.result()
                     if result is not None:
                         results[ticker] = result
-                        logger.info(f"Completed calculation for {ticker}")
+                        logger.debug(f"Completed calculation for {ticker}")
                 except Exception as e:
                     logger.error(f"Exception occurred while processing stock {ticker}: {str(e)}")
         
