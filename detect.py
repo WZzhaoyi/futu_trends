@@ -36,7 +36,7 @@ def run_analysis(code_list:pd.DataFrame, indicator_type:str, config:ConfigParser
         if not os.path.exists(data_file) or (datetime.now() - datetime.fromtimestamp(os.path.getmtime(data_file))).days > cache_expiry_days:
             # 文件不存在，下载数据
             print(f"下载新数据: {data_file}")
-            df = get_kline_data(code, config, max_count=1100)
+            df = get_kline_data(code, config, max_count=1200)
             df.to_csv(data_file)
         else:
             print(f"使用本地数据文件: {data_file}")

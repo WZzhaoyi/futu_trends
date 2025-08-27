@@ -28,7 +28,7 @@ def technical_analysis(df, name, indicator_type='KD', evals=500, look_ahead=0):
     指标分析
     """
     # 选择指标
-    indicators = {'KD': KD(), 'MACD': MACD(), 'RSI': RSI()}
+    indicators:dict[str, Indicator] = {'KD': KD(), 'MACD': MACD(), 'RSI': RSI()}
     indicator = indicators.get(indicator_type)
     if not indicator:
         raise ValueError(f"不支持的指标类型: {indicator_type}")

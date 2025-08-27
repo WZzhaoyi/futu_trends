@@ -117,22 +117,15 @@ class MACD(Indicator):
     
     def get_space(self):
         return {
-            'fast_period': hp.quniform('fast_period', 10, 13, 1),
+            'fast_period': hp.quniform('fast_period', 10, 12, 1),
             'slow_period': hp.quniform('slow_period', 20, 26, 1),
-            'signal_period': hp.quniform('signal_period', 6, 10, 1),
-            'overbought': hp.quniform('overbought', 50, 150, 10),
-            'oversold': hp.quniform('oversold', -150, -50, 10),
+            'signal_period': hp.quniform('signal_period', 7, 9, 1),
         }
     
     def calculate(self, df: pd.DataFrame, params: Dict, mode='train') -> pd.DataFrame:
         params = self.get_params(params)
         df = df.copy()
 
-        if params['fast_period'] * 1.5 > params['slow_period']:
-            df['reversal'] = 'none'
-            df['is_strong'] = 0
-            return df
-        
         # 计算MACD
         macd, signal = self._macd_atr(df['close'], df['high'], df['low'],
                                             params['fast_period'], 
@@ -141,11 +134,8 @@ class MACD(Indicator):
         df['macd'], df['signal'] = macd, signal
         
         # 信号检测
-        support_cond = (macd > signal) & (macd.shift(1) <= signal.shift(1)) & \
-                      (macd < params['oversold'])
-        resistance_cond = (macd < signal) & (macd.shift(1) >= signal.shift(1)) & \
-                         (macd > params['overbought'])
-        
+        support_cond = (macd > signal) & (macd.shift(1) <= signal.shift(1)) & (macd > 0) & (macd < 150)
+        resistance_cond = (macd < signal) & (macd.shift(1) >= signal.shift(1)) & (macd < 0) & (macd > -150)
         # 未来确认
         if mode == 'check':
             support_cond &= self._future_confirmation(df, True)
@@ -170,8 +160,7 @@ class MACD(Indicator):
             score = 0
         
         # 信号数量惩罚
-        signal_count_penalty = min(1.0, min(result['strong_support_signals_count'], 
-                                           result['strong_resistance_signals_count']) / signal_count_target)
+        signal_count_penalty = min(1.0, (max(result['strong_support_signals_count'], result['strong_resistance_signals_count']))/signal_count_target)
         
         return score * signal_count_penalty
     
@@ -184,11 +173,9 @@ class MACD(Indicator):
 
     def _future_confirmation(self, df, is_support):
         if is_support:
-            return ((df['close'].shift(-1) > df['close']) & (df['open'].shift(-1) <= df['close'].shift(-1))) | \
-                   ((df['close'].shift(-2) > df['close']) & (df['close'].shift(-2) > df['close'].shift(-1)))
+            return ((df['close'].shift(-1) > df['close']) & (df['open'].shift(-1) <= df['close'].shift(-1)))
         else:
-            return ((df['close'].shift(-1) < df['close']) & (df['open'].shift(-1) >= df['close'].shift(-1))) | \
-                   ((df['close'].shift(-2) < df['close']) & (df['close'].shift(-2) < df['close'].shift(-1)))
+            return ((df['close'].shift(-1) < df['close']) & (df['open'].shift(-1) >= df['close'].shift(-1)))
 
 
 class RSI(Indicator):

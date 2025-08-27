@@ -188,16 +188,14 @@ def calculate_atr_period(df, max_period=60):
     dominant_period = periods[valid_idx][np.argmax(power[valid_idx])]
     return int(dominant_period) if dominant_period else 20
 
-def get_target_price(df, is_support=True, target_multiplier=1.1, atr_period=20):
+def get_target_price(df, target_multiplier=1.1, atr_period=20)->tuple[float, float]:
+    # 获取目标价格 [low, high]
     df = df.copy()
     atr = ATR(df['high'], df['low'], df['close'], period=atr_period).iloc[-1]
     close = df['close'].iloc[-1]
-    target = None
-    if is_support:
-        target = close + atr * target_multiplier
-    else:
-        target = close - atr * target_multiplier
-    return round(target, 3) if isinstance(target, float) and target > 0 else None
+    target_high = close + atr * target_multiplier
+    target_low = close - atr * target_multiplier
+    return round(target_low, 3), round(target_high, 3)
 
 def calculate_win_rate(df, look_ahead=10, target_multiplier=1.1, atr_period=20, check_high_low=True):
     df = df.copy()

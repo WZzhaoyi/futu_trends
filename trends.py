@@ -66,11 +66,12 @@ def is_reverse(df: pd.DataFrame, code: str, config: configparser.ConfigParser) -
     msg = ''
     if reversal != 'none' and type(reversal) == str:
         msg += reversal.replace('reversal','kd')
-        target = get_target_price(df, is_support='support' in reversal, target_multiplier=meta['target_multiplier'], atr_period=meta['atr_period'])
-        if target is not None:
-            msg += f' {target}'
-    if is_strong == 1:
-        msg += u'📈' if 'support' in reversal else u'📉'
+        target_low, target_high = get_target_price(df, target_multiplier=meta['target_multiplier'], atr_period=meta['atr_period'])
+        msg += f' [{target_low},{target_high}]'
+    if 'support' in reversal:
+        msg += u'📈'
+    elif 'resistance' in reversal:
+        msg += u'📉'
     return None if msg == '' else msg
 
 def is_continue(df:pd.DataFrame, code:str, config:configparser.ConfigParser)->str|None:# 检查macd趋势延续
@@ -104,11 +105,12 @@ def is_continue(df:pd.DataFrame, code:str, config:configparser.ConfigParser)->st
     msg = ''
     if reversal != 'none' and type(reversal) == str:
         msg += reversal.replace('reversal','macd')
-        target = get_target_price(df, is_support='support' in reversal, target_multiplier=meta['target_multiplier'], atr_period=meta['atr_period'])
-        if target is not None:
-            msg += f' {target}'
-    if is_strong == 1:
-        msg += u'📈' if 'support' in reversal else u'📉'
+        target_low, target_high = get_target_price(df, target_multiplier=meta['target_multiplier'], atr_period=meta['atr_period'])
+        msg += f' [{target_low},{target_high}]'
+    if 'support' in reversal:
+        msg += u'📈'
+    elif 'resistance' in reversal:
+        msg += u'📉'
     return None if msg == '' else msg
 
 def is_breakout(data:pd.DataFrame, N:int=240)->str|None:# K线突破/跌破均线
@@ -161,11 +163,12 @@ def is_top_down(df:pd.DataFrame, code:str, config:configparser.ConfigParser) -> 
     # 检查是否有反转信号
     if reversal != 'none' and type(reversal) == str:
         msg += reversal.replace('reversal','rsi')
-        target = get_target_price(df, is_support='support' in reversal, target_multiplier=meta['target_multiplier'], atr_period=meta['atr_period'])
-        if target is not None:
-            msg += f' {target}'
-    if is_strong == 1:
-        msg += u'📈' if 'support' in reversal else u'📉'
+        target_low, target_high = get_target_price(df, target_multiplier=meta['target_multiplier'], atr_period=meta['atr_period'])
+        msg += f' [{target_low},{target_high}]'
+    if 'support' in reversal:
+        msg += u'📈'
+    elif 'resistance' in reversal:
+        msg += u'📉'
     
     return None if msg == '' else msg
 

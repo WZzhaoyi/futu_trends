@@ -226,7 +226,7 @@ class RSRatingCalculator:
         # 计算所有成分股的收益率
         benchmark_returns = {period: [] for period in self.periods}
         
-        for ticker in tickers:
+        for ticker in tqdm(tickers, desc="load benchmark data"):
             data = self._get_stock_data(ticker, market)
             if not data.empty:
                 for period in self.periods:
