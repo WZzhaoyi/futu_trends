@@ -343,7 +343,9 @@ if __name__ == "__main__":
     notification = NotificationEngine(config)
 
     # futu分组/到价提醒
-    notification.send_futu_message([str(code) for code in filter_df.index.tolist()],filter_df['msg'].tolist(),filter_df['high'].tolist(),filter_df['low'].tolist())
+    if len(filter_df) > 0:
+        target_prices = filter_df['msg'].str.extract(r'\[(\d+\.\d+),(\d+\.\d+)\]')
+        notification.send_futu_message([str(code) for code in filter_df.index.tolist()],filter_df['msg'].tolist(),target_prices[1].tolist(),target_prices[0].tolist())
 
     # LLM消息
     msg = generate_text_with_config(config, raw_msg)

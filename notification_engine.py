@@ -84,8 +84,8 @@ class NotificationEngine:
             for code, msg, recent_high, recent_low in zip(codes, messages, highs, lows): 
                 if keyword in msg:
                     ret_del, data_del = quote_ctx.set_price_reminder(code=code, op=SetPriceReminderOp.DEL_ALL)
-                    ret_up, data_up = quote_ctx.set_price_reminder(code=code, op=SetPriceReminderOp.ADD, reminder_type=PriceReminderType.PRICE_UP,reminder_freq=PriceReminderFreq.ONCE,value=recent_high)
-                    ret_down, data_down = quote_ctx.set_price_reminder(code=code, op=SetPriceReminderOp.ADD, reminder_type=PriceReminderType.PRICE_DOWN,reminder_freq=PriceReminderFreq.ONCE,value=recent_low)
+                    ret_up, data_up = quote_ctx.set_price_reminder(code=code, op=SetPriceReminderOp.ADD, reminder_type=PriceReminderType.PRICE_UP,reminder_freq=PriceReminderFreq.ONCE,value=float(recent_high))
+                    ret_down, data_down = quote_ctx.set_price_reminder(code=code, op=SetPriceReminderOp.ADD, reminder_type=PriceReminderType.PRICE_DOWN,reminder_freq=PriceReminderFreq.ONCE,value=float(recent_low))
                     if ret_del == RET_OK and ret_up == RET_OK and ret_down == RET_OK:
                         self.plog(f'{code} 价格提醒 [{recent_low},{recent_high}]')
                     else:
