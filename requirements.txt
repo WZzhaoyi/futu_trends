@@ -123,10 +123,12 @@ tzdata==2024.2
 tzlocal==5.3.1
 uritemplate==4.2.0
 urllib3==1.26.20
+vnpy==4.1.0
 w3lib==2.2.1
 wcwidth==0.2.13
 webencodings==0.5.1
 xlrd==2.0.1
+xtquant==250516.1.1
 yarl==1.20.0
 yfinance==0.2.64
 zipp==3.21.0

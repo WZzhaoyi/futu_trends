@@ -51,6 +51,14 @@
             "program": "./market_analysis/rating.py",
             "console": "integratedTerminal",
             "args": ["--market","A500","--code_list","A500"]
-        }
+        },
+        {
+            "name": "order_engine",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "./order_engine.py",
+            "console": "integratedTerminal",
+            "args": ["--config","./env/trade.ini"]
+        },
     ]
 }

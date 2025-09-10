@@ -338,18 +338,14 @@ class RSRatingCalculator:
         else:
             return 0
     
-    def _process_single_stock(self, ticker: str, benchmark_returns: Dict[str, List[float]]) -> tuple:
+    def _process_single_stock(self, ticker: str, benchmark_returns: Dict[str, List[float]], stock_data: pd.DataFrame, market_data: pd.DataFrame) -> tuple:
         """处理单个股票的计算，用于并行执行"""
         try:
-            stock_data = self._get_stock_data(ticker, self.market)
             if stock_data.empty:
                 raise ValueError(f"Failed to get stock data {ticker}")
                 
-            # 获取大盘指数数据
-            market_index = self.market_index_map[self.market]
-            market_data = self._get_stock_data(market_index, self.market)
             if market_data.empty:
-                raise ValueError(f"Failed to get market index data {market_index}")
+                raise ValueError(f"Failed to get market index data {self.market}")
                 
             # 相对大盘表现、beta值、趋势情绪择时
             rs_ratings = self._calculate_rs_rating(ticker, benchmark_returns, self.market)
@@ -386,15 +382,17 @@ class RSRatingCalculator:
         benchmark_returns = self._get_benchmark_returns(market)
         
         # 预加载数据
+        stock_data = {}
         for ticker in tqdm(self.code_list, desc="load stock data"):
-            self._get_stock_data(ticker, market)
+            stock_data[ticker] = self._get_stock_data(ticker, market)
+        market_data = self._get_stock_data(self.market_index_map[market], market)
         
         # 使用线程池进行并行处理
         assert self.cpu_core is not None and self.cpu_core >= 1
-        with ThreadPoolExecutor(max_workers=self.cpu_core*4) as executor:
+        with ThreadPoolExecutor(max_workers=min(self.cpu_core, len(self.code_list))) as executor:
             # 提交所有任务
             future_to_ticker = {
-                executor.submit(self._process_single_stock, ticker, benchmark_returns): ticker 
+                executor.submit(self._process_single_stock, ticker, benchmark_returns, stock_data[ticker], market_data): ticker 
                 for ticker in self.code_list
             }
             
