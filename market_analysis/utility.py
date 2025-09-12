@@ -1,15 +1,8 @@
 from asyncio.log import logger
 
-import sqlalchemy
-import yfinance as yf
-import numpy as np
-import pandas_ta as pandas_ta
 import pandas as pd
-import talib as tb
 from io import BytesIO
 import requests
-import os
-import glob
 
 """
 Hong Kong, Shenzhen, Shanghai stocks used number + exch appendix (e.g. HK, SZ, SS)
