@@ -1,4 +1,5 @@
 from io import BytesIO
+import math
 import random
 import pandas as pd
 import numpy as np
@@ -13,6 +14,10 @@ from tqdm import tqdm
 from multiprocessing import Pool, cpu_count
 import matplotlib.collections as mcoll
 import matplotlib.dates as mdates
+import warnings
+
+# 过滤 FutureWarning 警告
+warnings.filterwarnings('ignore', category=FutureWarning, message='.*DataFrame.swapaxes.*')
 
 # 设置随机种子
 random_seed = 42  # 可以选择任意整数（如 42、2025 等）
@@ -183,8 +188,18 @@ def calculate_target_multiplier(df, atr_period=20, look_ahead=10):
 def calculate_atr_period(df, max_period=60):
     daily_range = df['high'] - df['low']
     freqs, power = periodogram(daily_range.dropna())
+    
+    # 过滤掉频率为0的值
+    non_zero_mask = freqs > 0
+    freqs = freqs[non_zero_mask]
+    power = power[non_zero_mask]
+    
     periods = 1 / freqs
     valid_idx = np.where((periods > 5) & (periods <= max_period))
+    
+    if len(valid_idx[0]) == 0:
+        return 20  # 如果没有有效周期，返回默认值
+    
     dominant_period = periods[valid_idx][np.argmax(power[valid_idx])]
     return int(dominant_period) if dominant_period else 20
 
@@ -253,8 +268,48 @@ def calculate_win_rate(df, look_ahead=10, target_multiplier=1.1, atr_period=20, 
         'strong_resistance_signals_count': len(strong_resistance_signals),
         'support_recall': support_recall,
         'resistance_recall': resistance_recall,
+        'support_z_score': trading_system_z_score(df[df['reversal'] == 'support reversal']['support_win'].tolist()),
+        'resistance_z_score': trading_system_z_score(df[df['reversal'] == 'resistance reversal']['resistance_win'].tolist()),
         'detailed_df': df
     }
+
+def trading_system_z_score(trades: list, win_value=1, loss_value=0):
+  """
+  计算交易系统盈亏序列的Z-score。
+
+  参数:
+    trades (list): 一个由1（盈利）和0（亏损）组成的列表。
+                   例如: [1, 1, 0, 1, 0, 0, 1]
+
+  返回:
+    float or 0: 计算出的Z-score或错误信息。
+  """
+  n = len(trades)
+  if n < 30:
+    return 0
+
+  wins = trades.count(win_value)
+  losses = trades.count(loss_value)
+
+  if wins == 0 or losses == 0:
+      return 0
+
+  # 计算R（序列总数）
+  r = 1
+  for i in range(1, n):
+    if trades[i] != trades[i-1]:
+      r += 1
+
+  p = 2.0 * wins * losses
+  
+  numerator = n * (r - 0.5) - p
+  denominator = math.sqrt((p * (p - n)) / (n - 1))
+  
+  if denominator == 0:
+    return 0
+      
+  z_score = numerator / denominator
+  return z_score
 
 def display_signals(df_visual, title, best_params, result):
     """
@@ -272,8 +327,8 @@ def display_signals(df_visual, title, best_params, result):
     print(f"Overall Resistance Reversal Win Rate: {result['resistance_win_rate']:.2%} (Signals: {result['resistance_signals_count']})")
     print(f"Strong Support Reversal Win Rate: {result['strong_support_win_rate']:.2%} (Signals: {result['strong_support_signals_count']})")
     print(f"Strong Resistance Reversal Win Rate: {result['strong_resistance_win_rate']:.2%} (Signals: {result['strong_resistance_signals_count']})")
-    print(f"Support Recall: {result['support_recall']:.2%}")
-    print(f"Resistance Recall: {result['resistance_recall']:.2%}")
+    print(f"Support Recall: {result['support_recall']:.2%} Resistance Recall: {result['resistance_recall']:.2%}")
+    print(f"Support Z-Score: {result['support_z_score']:.2f} Resistance Z-Score: {result['resistance_z_score']:.2f}")
 
     fig, ax = plt.subplots(figsize=(20, 10))
     plt.yscale('log')
@@ -351,7 +406,7 @@ def display_signals(df_visual, title, best_params, result):
         f'{", ".join([f"{k}={v}" for k,v in best_params.items()])}\n'
         f'Support Win Rate: {result["support_win_rate"]:.2%}({result["support_signals_count"]}), Resistance Win Rate: {result["resistance_win_rate"]:.2%}({result["resistance_signals_count"]})\n'
         f'Strong Support Win Rate: {result["strong_support_win_rate"]:.2%}, Strong Resistance Win Rate: {result["strong_resistance_win_rate"]:.2%}\n'
-        f'Support Recall: {result["support_recall"]:.2%} Resistance Recall: {result["resistance_recall"]:.2%}'
+        f'Support Recall: {result["support_recall"]:.2%} Resistance Recall: {result["resistance_recall"]:.2%} Support Z-Score: {result["support_z_score"]:.2f} Resistance Z-Score: {result["resistance_z_score"]:.2f}'
     )
     ax.set_title(title, fontsize=12)
     ax.set_xlabel('Date')
