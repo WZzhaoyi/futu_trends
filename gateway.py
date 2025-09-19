@@ -26,11 +26,10 @@ EXCHANGE_VT2FUTU = {
     Exchange.SEHK: "HK", 
     Exchange.SSE: "SH",
     Exchange.SZSE: "SZ",
-    Exchange.HKFE: "HK_FUTURE",
 }
 EXCHANGE_FUTU2VT = {v: k for k, v in EXCHANGE_VT2FUTU.items()}
 
-# QMT交易所映射
+# QMT交易所映射 不支持US
 QMT_EXCHANGE_MAP = {
     Exchange.SSE: 'SH',
     Exchange.SZSE: 'SZ',
@@ -308,7 +307,7 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
             
             # 发送异步订单
             qmt_code = convert_symbol_vt2qmt(req.symbol, req.exchange)
-            self.trader.order_stock_async(
+            seq = self.trader.order_stock_async(
                 account=self.account,
                 stock_code=qmt_code,
                 order_type=QMT_TRADE_TYPE[req.direction],
@@ -317,6 +316,9 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
                 price=req.price,
                 order_remark=order_id,
             )
+
+            if seq == -1:
+                raise Exception(f"{qmt_code} {order_id}")
             
             # 创建订单对象
             order = OrderData(

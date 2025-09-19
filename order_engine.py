@@ -25,9 +25,20 @@ from vnpy.trader.engine import BaseEngine
 from gateway import FutuGateway, QmtGateway
 
 EXCHANGE_MAP = {
-    "SSE": Exchange.SSE,
-    "SZSE": Exchange.SZSE,
-    "SEHK": Exchange.SEHK,
+    "SH": Exchange.SSE,
+    "SZ": Exchange.SZSE,
+    "HK": Exchange.SEHK,
+    "US": Exchange.SMART,
+}
+
+DIRECTION_MAP = {
+    "buy": Direction.LONG,
+    "sell": Direction.SHORT,
+}
+
+ORDER_TYPE_MAP = {
+    "limit": OrderType.LIMIT,
+    "market": OrderType.MARKET,
 }
 
 class ConditionOrderEngine(BaseEngine):
@@ -56,12 +67,12 @@ class ConditionOrderEngine(BaseEngine):
                 if order_config.get('enabled', False):
                     self.active_orders[order_config['id']] = order_config
             
-            # 注册事件
-            def process_log(event: Event):
-                log: LogData = event.data
-                notify_calc(log.msg)
             self.event_engine.register(EVENT_TICK, self.process_tick)
             if isinstance(notify_calc, Callable):
+                # 注册LOG事件回调
+                def process_log(event: Event):
+                    log: LogData = event.data
+                    notify_calc(log.msg)
                 self.event_engine.register(EVENT_LOG, process_log)
             
             # 订阅行情
@@ -88,7 +99,7 @@ class ConditionOrderEngine(BaseEngine):
             if self._check_condition(order, tick):
                 self.write_log(f"条件单 '{order['description']}' 触发")
                 self._execute_actions(order)
-                if order.get('trigger_once', False):
+                if order.get('trigger_once', True):
                     del self.active_orders[order_id]
 
     def _check_condition(self, order: dict, tick: TickData):
@@ -150,8 +161,8 @@ class ConditionOrderEngine(BaseEngine):
                 req = OrderRequest(
                     symbol=order['symbol'],
                     exchange=EXCHANGE_MAP[order['exchange']],
-                    direction=Direction(action['action']),
-                    type=OrderType(action['type']),
+                    direction=DIRECTION_MAP[action['action']],
+                    type=ORDER_TYPE_MAP[action['type']],
                     volume=action['quantity'],
                     price=action.get('price', 0),
                     offset=Offset.OPEN
@@ -182,7 +193,7 @@ def main():
 
     # 远程通知
     notification_engine = NotificationEngine(config)
-    def notify_calc(msg):
+    def notify_calc(msg:str):
         print(f'{datetime.now().strftime("%Y-%m-%d %H:%M:%S")} {msg}')
         notification_engine.send_telegram_message(msg)
         notification_engine.send_email(msg,msg)
