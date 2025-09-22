@@ -33,9 +33,20 @@ EXCHANGE_FUTU2VT = {v: k for k, v in EXCHANGE_VT2FUTU.items()}
 QMT_EXCHANGE_MAP = {
     Exchange.SSE: 'SH',
     Exchange.SZSE: 'SZ',
-    Exchange.SEHK: 'HK',  # 港股通
+    Exchange.SEHK: 'HK',  # 港股 港股通归入港股
+    Exchange.SHHK: 'HGT',  # 沪港通
+    Exchange.SZHK: 'SGT',  # 深港通
 }
 QMT_TO_VN_EXCHANGE = {v: k for k, v in QMT_EXCHANGE_MAP.items()}
+
+# 交易所到账号类型映射
+EXCHANGE_TO_ACCOUNT_TYPE = {
+    Exchange.SSE: 'STOCK',      # 上交所A股
+    Exchange.SZSE: 'STOCK',     # 深交所A股
+    Exchange.SEHK: 'HUGANGTONG', # 港股（默认使用港股通）
+    Exchange.SHHK: 'HUGANGTONG', # 沪港通
+    Exchange.SZHK: 'HUGANGTONG', # 深港通（默认使用港股通）
+}
 
 # QMT交易类型映射
 QMT_TRADE_TYPE = {
@@ -77,17 +88,38 @@ def convert_symbol_futu2vt(code: str) -> tuple:
     exchange = EXCHANGE_FUTU2VT.get(futu_exchange, Exchange.LOCAL)
     return futu_symbol, exchange
 
-def convert_symbol_vt2qmt(symbol: str, exchange: Exchange) -> str:
+def convert_symbol_vt2qmt(symbol: str, exchange: Exchange, market: str) -> str:
     """将vnpy合约名称转换为QMT格式"""
     qmt_exchange = QMT_EXCHANGE_MAP.get(exchange)
+    # qmt为国内券商提供服务，需要将港股映射为沪港通或深港通
+    if market == 'HUGANGTONG' and (exchange == Exchange.SEHK or exchange == Exchange.SHHK):
+        qmt_exchange = 'HGT'
+    if market == 'SHENGANGTONG' and (exchange == Exchange.SEHK or exchange == Exchange.SZHK):
+        qmt_exchange = 'SGT'
     if not qmt_exchange:
         raise ValueError(f"不支持的交易所: {exchange}")
     return f"{symbol}.{qmt_exchange}"
 
-def convert_symbol_qmt2vt(code: str) -> tuple:
+def convert_symbol_qmt2vt(code: str, market: str = None) -> tuple:
     """将QMT合约名称转换为vnpy格式"""
     symbol, suffix = code.rsplit('.')
-    exchange = QMT_TO_VN_EXCHANGE.get(suffix)
+    
+    # 如果market参数未提供，从代码后缀自动推断
+    if market is None:
+        if suffix in ['SH', 'SZ']:
+            market = 'STOCK'
+        elif suffix in ['HK', 'HGT', 'SGT']:
+            market = 'HUGANGTONG'
+        else:
+            market = 'STOCK'  # 默认
+    
+    # 根据market参数调整交易所映射
+    if market == 'HUGANGTONG' and suffix == 'HK':
+        # 港股通交易，HK后缀映射到SHHK
+        exchange = Exchange.SHHK
+    else:
+        exchange = QMT_TO_VN_EXCHANGE.get(suffix)
+    
     if not exchange:
         raise ValueError(f"不支持的QMT交易所: {suffix}")
     return symbol, exchange
@@ -226,16 +258,16 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
     default_setting = {
         "path": "C:/Users/Administrator/mini_qmt/",
         "session_id": 123456,
-        "account_id": "YOUR_ACCOUNT_ID"
+        "account_id": "YOUR_ACCOUNT_ID",
     }
-    exchanges = [Exchange.SSE, Exchange.SZSE, Exchange.SEHK]
+    exchanges = [Exchange.SSE, Exchange.SZSE, Exchange.SHHK, Exchange.SZHK, Exchange.SEHK]
     TRADE_TYPE = (Product.ETF, Product.EQUITY, Product.BOND, Product.INDEX)
 
     def __init__(self, event_engine, name="QMT"):
         super().__init__(event_engine, name)
         self.contracts: Dict[str, ContractData] = {}
         self.trader: XtQuantTrader = None
-        self.account = None
+        self.accounts: Dict[str, StockAccount] = {}
         self.orders: Dict[str, OrderData] = {}
         self.trades: Dict[str, TradeData] = {}
         self.limit_ups = {}
@@ -243,6 +275,7 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
         self.count = -1
         self.session_id = int(datetime.now().strftime('%H%M%S'))
         self.inited = False
+        self.account_id = None
         
         # 注册定时事件
         self.event_engine.register(EVENT_TIMER, self.process_timer_event)
@@ -252,9 +285,8 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
         try:
             account = setting['account_id']
             path = setting['path']
+            self.account_id = account
             
-            # 创建账户和交易对象
-            self.account = StockAccount(account)
             self.trader = XtQuantTrader(path=path, session=self.session_id)
             self.trader.register_callback(self)
             self.trader.start()
@@ -267,13 +299,25 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
                 self.write_log(f'QMT连接失败：{cnn_msg}')
                 return
             
-            # 订阅账户
-            sub_msg = self.trader.subscribe(account=self.account)
-            if sub_msg == 0:
-                self.write_log(f'订阅账户成功')
+            account_types = ['STOCK', 'HUGANGTONG']
+            for account_type in account_types:
+                try:
+                    account_obj = StockAccount(account, account_type)
+                    sub_msg = self.trader.subscribe(account=account_obj)
+                    if sub_msg == 0:
+                        self.accounts[account_type] = account_obj
+                        self.write_log(f'订阅{account_type}账户成功')
+                    else:
+                        self.write_log(f'订阅{account_type}账户失败：{sub_msg}')
+                except Exception as e:
+                    self.write_log(f'创建{account_type}账户失败：{e}')
+            
+            if self.accounts:
                 self.inited = True
+                self.write_log(f'成功初始化{len(self.accounts)}个账户类型')
             else:
-                self.write_log(f'订阅账户失败：{sub_msg}')
+                self.write_log('未能成功初始化任何账户')
+                return
             
             # 获取合约信息
             self._get_contracts()
@@ -281,13 +325,25 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
         except Exception as e:
             self.write_log(f"QMT连接异常: {e}")
 
+    def _get_account_by_exchange(self, exchange: Exchange) -> StockAccount:
+        """根据交易所获取对应的账号对象"""
+        account_type = EXCHANGE_TO_ACCOUNT_TYPE.get(exchange, 'STOCK')
+        account = self.accounts.get(account_type)
+        if not account:
+            account = self.accounts.get('STOCK')
+            if not account:
+                raise ValueError(f"未找到适合交易所{exchange}的账号")
+        return account
+
     def subscribe(self, req: SubscribeRequest):
         """订阅行情"""
         try:
             if req.exchange not in self.exchanges:
                 self.write_log(f"qmt不支持订阅行情: {req.symbol} {req.exchange}")
                 return
-            qmt_code = convert_symbol_vt2qmt(req.symbol, req.exchange)
+            
+            account_type = EXCHANGE_TO_ACCOUNT_TYPE.get(req.exchange, 'STOCK')
+            qmt_code = convert_symbol_vt2qmt(req.symbol, req.exchange, account_type)
             return xtquant.xtdata.subscribe_quote(
                 stock_code=qmt_code,
                 period='tick',
@@ -302,13 +358,17 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
             if req.exchange not in self.exchanges:
                 self.write_log(f"qmt不支持交易: {req.symbol} {req.exchange}")
                 return
-            # 生成订单ID
+            
+            # 根据交易所获取对应的账号
+            account = self._get_account_by_exchange(req.exchange)
+            account_type = EXCHANGE_TO_ACCOUNT_TYPE.get(req.exchange, 'STOCK')
+            
             order_id = self._get_order_id()
             
             # 发送异步订单
-            qmt_code = convert_symbol_vt2qmt(req.symbol, req.exchange)
+            qmt_code = convert_symbol_vt2qmt(req.symbol, req.exchange, account_type)
             seq = self.trader.order_stock_async(
-                account=self.account,
+                account=account,
                 stock_code=qmt_code,
                 order_type=QMT_TRADE_TYPE[req.direction],
                 price_type=xtconstant.FIX_PRICE if req.type == OrderType.LIMIT else xtconstant.LATEST_PRICE,
@@ -334,6 +394,7 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
                 status=Status.SUBMITTING
             )
             self.orders[order_id] = order
+            self.write_log(f"使用{account_type}账号发送订单: {req.symbol} {req.exchange}")
             return order.vt_orderid
             
         except Exception as e:
@@ -345,8 +406,9 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
         try:
             order = self.orders.get(req.orderid)
             if order and hasattr(order, 'reference'):
+                account = self._get_account_by_exchange(order.exchange)
                 return self.trader.cancel_order_stock_async(
-                    account=self.account, 
+                    account=account, 
                     order_id=order.reference
                 )
         except Exception as e:
@@ -354,23 +416,27 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
 
     def query_account(self):
         """查询账户信息"""
-        if self.trader and self.account:
-            self.trader.query_stock_asset_async(self.account, callback=self._on_account)
+        if self.trader and self.accounts:
+            for account_type, account in self.accounts.items():
+                self.trader.query_stock_asset_async(account, callback=self._on_account)
 
     def query_position(self):
         """查询持仓信息"""
-        if self.trader and self.account:
-            self.trader.query_stock_positions_async(self.account, callback=self._on_positions)
+        if self.trader and self.accounts:
+            for account_type, account in self.accounts.items():
+                self.trader.query_stock_positions_async(account, callback=self._on_positions)
 
     def query_order(self):
         """查询订单信息"""
-        if self.trader and self.account:
-            self.trader.query_stock_orders_async(self.account, callback=self._on_orders)
+        if self.trader and self.accounts:
+            for account_type, account in self.accounts.items():
+                self.trader.query_stock_orders_async(account, callback=self._on_orders)
 
     def query_trade(self):
         """查询成交信息"""
-        if self.trader and self.account:
-            self.trader.query_stock_trades_async(self.account, callback=self._on_trades)
+        if self.trader and self.accounts:
+            for account_type, account in self.accounts.items():
+                self.trader.query_stock_trades_async(account, callback=self._on_trades)
 
     def process_timer_event(self, event):
         """定时事件处理"""

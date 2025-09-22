@@ -75,7 +75,7 @@ class ConditionOrderEngine(BaseEngine):
                     notify_calc(log.msg)
                 self.event_engine.register(EVENT_LOG, process_log)
             
-            # 订阅行情
+            # 订阅行情 暂定futu
             symbols_to_subscribe = set()
             for order in self.active_orders.values():
                 req = SubscribeRequest(symbol=order['symbol'], exchange=EXCHANGE_MAP[order['exchange']])
