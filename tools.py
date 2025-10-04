@@ -24,7 +24,7 @@ from scipy import stats
 from datetime import datetime, timedelta
 import re
 import yfinance as yf
-from longport.openapi import Period
+from ib_insync import Contract
 
 def get_kline_seconds(k_type:str): #根据K_1M,K_5M,K_15M,K_30M,K_60M时间含义输出秒数
     if k_type == 'K_DAY':
@@ -42,6 +42,81 @@ def get_kline_seconds(k_type:str): #根据K_1M,K_5M,K_15M,K_30M,K_60M时间含�
             return int(k_type.split('_')[1][:-1]) * 60
         except ValueError:
             raise ValueError(f"Unsupported k_type: {k_type}")
+
+def ib_code_to_futu_code(contract: Contract) -> str or None:
+    """
+    将 ib_insync 的 Contract 对象转换为富途的代码格式。
+
+    :param contract: ib_insync 的 Contract 对象
+    :return: 富途格式的代码字符串，如果无法转换则返回 None
+    """
+    sec_type = contract.secType
+    symbol = contract.symbol
+    exchange = contract.exchange
+    currency = contract.currency
+
+    # 1. 股票 (STK)
+    if sec_type == 'STK':
+        # 美股 (通常在 NASDAQ, NYSE, ARCA, ISLAND 交易)
+        if currency == 'USD':
+            # 富途的美股代码通常不区分具体交易所，直接用 US. 开头
+            return f"US.{symbol}"
+            
+        # 港股 (在 SEHK 交易所)
+        elif exchange == 'SEHK' and currency == 'HKD':
+            # 港股代码需要补齐到5位，例如 700 -> 00700
+            futu_symbol = symbol.zfill(5)
+            return f"HK.{futu_symbol}"
+
+        # A股 - 沪市
+        elif exchange == 'SSE' and currency == 'CNH':
+            return f"SH.{symbol}"
+            
+        # A股 - 深市
+        elif exchange == 'SZSE' and currency == 'CNH':
+            return f"SZ.{symbol}"
+
+    # 2. 期权 (OPT) - 以美股期权为例
+    if sec_type == 'OPT' and currency == 'USD':
+        # 格式: US.TICKERYYMMDD(C/P)00STRIKE000
+        last_trade_date = contract.lastTradeDateOrContractMonth
+        strike = int(contract.strike * 1000) # 行权价乘以1000
+        right = contract.right[0].upper() # 'Call' -> 'C', 'Put' -> 'P'
+        
+        # 格式化日期和行权价
+        yy = last_trade_date[2:4]
+        mm = last_trade_date[4:6]
+        dd = last_trade_date[6:8]
+        date_str = f"{yy}{mm}{dd}"
+        strike_str = str(strike).zfill(8) # 补齐到8位
+
+        return f"US.{symbol}{date_str}{right}{strike_str}"
+        
+    # 3. 期货 (FUT) - 转换较为复杂
+    if sec_type == 'FUT':
+        # 期货转换需要一个映射表，因为交易所和品种的名称可能不同
+        # IB: symbol='ES', exchange='GLOBEX' -> Futu: 'ES' (小 E 标普)
+        # IB: symbol='HSI', exchange='HKFE' -> Futu: 'HSI' (恒指)
+        
+        # 这是一个简化的例子，实际应用中可能需要更完善的映射
+        ib_fut_map = {
+            'GLOBEX': {
+                'ES': 'ES',
+                'NQ': 'NQ',
+            },
+            'HKFE': {
+                'HSI': 'HSI',
+                'MHI': 'MHI',
+            }
+        }
+        
+        if exchange in ib_fut_map and symbol in ib_fut_map[exchange]:
+            futu_symbol = ib_fut_map[exchange][symbol]
+            contract_month = contract.lastTradeDateOrContractMonth[-4:] # 取 YYMM, e.g., "202312" -> "2312"
+            return f"{futu_symbol}{contract_month}"
+
+    # 如果以上规则都不匹配，则返回 None
+    return None
 
 def futu_code_to_yfinance_code(futu_code: str) -> str:
     """
