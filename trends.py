@@ -212,6 +212,7 @@ def check_trends(code_in_group: pd.DataFrame, config: configparser.ConfigParser)
     - momentum: 动量因子值
     """
     trend_type = config.get("CONFIG", "TREND_TYPE").split(',')
+    momentum_period = int(config.get("CONFIG", "MOMENTUM_PERIOD", fallback=21))
     if not (code_in_group.size and len(trend_type)):
         return pd.DataFrame(columns=pd.Index(['futu_code', 'name', 'msg', 'momentum', 'high', 'low']))
         
@@ -261,7 +262,7 @@ def check_trends(code_in_group: pd.DataFrame, config: configparser.ConfigParser)
             
             # 计算动量因子
             close = df['close']
-            momentum = calc_momentum(close) if isinstance(close, pd.Series) else pd.Series([0.000])
+            momentum = calc_momentum(close, momentum_period) if isinstance(close, pd.Series) else pd.Series([0.000,0.000])
             
             # 获取最后两个动量值，用于判断方向
             last_momentum = momentum.iloc[-1]
@@ -295,8 +296,8 @@ def check_trends(code_in_group: pd.DataFrame, config: configparser.ConfigParser)
         # 添加一行动量值为0的记录作为0轴指示
         results.append({
             'futu_code': 'ZERO_AXIS',
-            'name': '动量0轴',
-            'msg': '━━━动量0轴━━━',
+            'name': f'{momentum_period}动量0轴',
+            'msg': f'━━━{momentum_period}动量0轴━━━',
             'momentum': 0.000,
             'high': 0.000,
             'low': 0.000

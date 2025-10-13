@@ -57,12 +57,12 @@ QMT_TO_VN_TRADE_TYPE = {v: k for k, v in QMT_TRADE_TYPE.items()}
 
 # QMT订单状态映射
 QMT_ORDER_STATUS = {
-    0: Status.SUBMITTING,
-    1: Status.NOTTRADED,
-    2: Status.PARTTRADED,
-    3: Status.ALLTRADED,
-    4: Status.CANCELLED,
-    5: Status.REJECTED,
+    49: Status.SUBMITTING,
+    50: Status.NOTTRADED,
+    55: Status.PARTTRADED,
+    56: Status.ALLTRADED,
+    54: Status.CANCELLED,
+    57: Status.REJECTED,
 }
 
 # 产品类型映射
@@ -206,6 +206,8 @@ class FutuGateway(BaseGateway):
             # 解析时间
             date = row["data_date"].replace("-", "")
             time_str = row["data_time"]
+            if '.' in time_str:
+                time_str = time_str.split('.')[0]
             dt = datetime.strptime(f"{date} {time_str}", "%Y%m%d %H:%M:%S")
             dt = dt.replace(tzinfo=CHINA_TZ)
             
@@ -371,7 +373,7 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
                 account=account,
                 stock_code=qmt_code,
                 order_type=QMT_TRADE_TYPE[req.direction],
-                price_type=xtconstant.FIX_PRICE if req.type == OrderType.LIMIT else xtconstant.LATEST_PRICE,
+                price_type=xtconstant.FIX_PRICE if req.type == OrderType.LIMIT else xtconstant.MARKET_PEER_PRICE_FIRST,
                 order_volume=int(req.volume),
                 price=req.price,
                 order_remark=order_id,
@@ -579,7 +581,7 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
         )
         self.on_account(account)
 
-    def _on_positions(self, pos_list):
+    def _on_positions(self, pos_list: list[XtPosition]):
         """持仓信息回调"""
         for pos in pos_list:
             try:
@@ -598,7 +600,7 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
             except Exception as e:
                 self.write_log(f"处理持仓信息失败: {e}")
 
-    def _on_orders(self, order_list):
+    def _on_orders(self, order_list: list[XtOrder]):
         """订单信息回调"""
         for order in order_list:
             try:
@@ -616,12 +618,40 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
                     datetime=timestamp_to_datetime(order.order_time),
                     reference=order.order_id
                 )
+                
+                # 检查订单状态变化
+                old_order = self.orders.get(vn_order.orderid)
+                if old_order:
+                    old_status = old_order.status
+                    old_traded = old_order.traded
+                else:
+                    old_status = None
+                    old_traded = 0
+                
                 self.orders[vn_order.orderid] = vn_order
                 self.on_order(vn_order)
+                
+                # 如果有成交变化，输出成交信息
+                if vn_order.traded > old_traded and old_status != Status.ALLTRADED:
+                    new_traded = vn_order.traded - old_traded
+                    self.write_log(f'订单成交: {vn_order.symbol} {vn_order.exchange} {vn_order.direction} '
+                                f'成交{new_traded}股，累计{vn_order.traded}/{vn_order.volume}股')
+                
+                # 如果订单完成，输出完成信息
+                if vn_order.status == Status.ALLTRADED:
+                    self.write_log(f'✅ 订单完成: {vn_order.symbol} {vn_order.exchange} {vn_order.direction} '
+                                    f'全部成交{vn_order.traded}股')
+                elif vn_order.status == Status.CANCELLED:
+                    self.write_log(f'⏹️ 订单撤销: {vn_order.symbol} {vn_order.exchange} {vn_order.direction} '
+                                    f'已撤销，成交{vn_order.traded}股')
+                elif vn_order.status == Status.REJECTED:
+                    self.write_log(f'❌ 订单拒绝: {vn_order.symbol} {vn_order.exchange} {vn_order.direction} '
+                                    f'被拒绝')
+
             except Exception as e:
                 self.write_log(f"处理订单信息失败: {e}")
 
-    def _on_trades(self, trade_list):
+    def _on_trades(self, trade_list: list[XtTrade]):
         """成交信息回调"""
         for trade in trade_list:
             try:

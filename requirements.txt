@@ -46,6 +46,7 @@ httpcore==1.0.9
 httplib2==0.22.0
 httpx==0.28.1
 hyperopt==0.2.7
+ib_insync==0.9.86
 idna==3.10
 importlib_metadata==8.5.0
 ipython==8.32.0

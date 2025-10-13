@@ -35,7 +35,7 @@ _us_stocks_cache = None
 # 数据保存目录
 _DATA_DIR = './data'
 # 缓存有效期（天）
-_CACHE_EXPIRE_DAYS = 7
+_CACHE_EXPIRE_DAYS = 30
 
 # 添加锁机制 确保同一时间只有一个调用
 _futu_lock = threading.Lock()
