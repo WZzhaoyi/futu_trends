@@ -123,6 +123,19 @@ def hk_ticker_generator():
     for i in range(10001, 19999):
         yield str(i)[1:] + ".HK"
 
+def hk_all_ticker_generator():
+    xlsx_url = 'https://www.hkex.com.hk/eng/services/trading/securities/securitieslists/ListOfSecurities.xlsx'
+    
+    response = requests.get(xlsx_url, timeout=30, stream=True)
+    response.raise_for_status()
+    content = BytesIO(response.content)
+    
+    table = pd.read_excel(content, header=2)
+    stock_codes = table[table['Sub-Category'] == 'Equity Securities (Main Board)']['Stock Code'].tolist()
+    for t in stock_codes:
+        ticker_code = str(t).zfill(4)
+        yield ticker_code + ".HK"
+
 # 恒生科技指数
 def hktech_ticker_generator():
     table = pd.read_html('https://zh.wikipedia.org/wiki/%E6%81%92%E7%94%9F%E7%A7%91%E6%8A%80%E6%8C%87%E6%95%B8')
@@ -477,12 +490,12 @@ def process_stock_data(ticker_list_path: str, database_path: str) -> None:
         raise
 
 if __name__ == "__main__":
-    a500 = ggt_generator()
+    code_generator = hk_all_ticker_generator()
     
     print("前10个成分股代码:")
     for _ in range(10):
         try:
-            print(next(a500))
+            print(next(code_generator))
         except StopIteration:
             print("已遍历所有成分股")
             break
