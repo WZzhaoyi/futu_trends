@@ -199,7 +199,7 @@ def main():
         notification_engine.send_email(msg,msg)
     
     # 添加条件单配置
-    condition_engine = main_engine.add_engine(ConditionOrderEngine)
+    condition_engine: ConditionOrderEngine = main_engine.add_engine(ConditionOrderEngine)
     condition_engine.load(config, notify_calc)
     # main_window = MainWindow(main_engine, event_engine)
     # main_window.showMaximized()

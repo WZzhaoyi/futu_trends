@@ -37,10 +37,15 @@ def sync_qmt_futu_position(config:configparser.ConfigParser):
         raise Exception(f"订阅账户失败: {subscribe_result}")
     positions = xt_trader.query_stock_positions(a_stock_acc)
     
-    for position in positions:
-        if position.m_nVolume > 0:
-            code_list.append('.'.join(reversed(position.stock_code.split('.'))))
-            print(position.stock_code, position.m_nVolume)
+    if positions:
+        print("A股持仓信息:")
+        for position in positions:
+            if position.m_nVolume > 0:
+                code_list.append('.'.join(reversed(position.stock_code.split('.'))))
+                print(f"合约: {position.stock_code} 数量: {position.m_nVolume}")
+    else:
+        print("当前没有持仓。")
+        return []
 
     # 沪港通账户
     hk_stock_acc = StockAccount(account_id, 'HUGANGTONG')
@@ -49,10 +54,15 @@ def sync_qmt_futu_position(config:configparser.ConfigParser):
         raise Exception(f"订阅账户失败: {subscribe_result}")
     positions = xt_trader.query_stock_positions(hk_stock_acc)
     
-    for position in positions:
-        if position.m_nVolume > 0:
-            code_list.append('HK.' + position.stock_code.split('.')[0])
-            print(position.stock_code, position.m_nVolume)
+    if positions:
+        print("港股持仓信息:")
+        for position in positions:
+            if position.m_nVolume > 0:
+                code_list.append('HK.' + position.stock_code.split('.')[0])
+                print(f"合约: {position.stock_code} 数量: {position.m_nVolume}")
+    else:
+        print("当前没有持仓。")
+        return []
     
     xt_trader.stop()
     return code_list

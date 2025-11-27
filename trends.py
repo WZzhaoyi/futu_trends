@@ -2,7 +2,6 @@ import json
 import os
 from ft_config import get_config
 from data import get_kline_data
-from llm_client import generate_text_with_config
 from params_db import ParamsDB
 from signal_analysis import get_target_price, MACD, KD, RSI
 from tools import MA, EMA, calc_momentum, code_in_futu_group
@@ -113,9 +112,17 @@ def is_continue(df:pd.DataFrame, code:str, config:configparser.ConfigParser)->st
         msg += u'📉'
     return None if msg == '' else msg
 
-def is_breakout(data:pd.DataFrame, N:int=240)->str|None:# K线突破/跌破均线
-    assert len(data) >= N
-    
+def is_breakout(data:pd.DataFrame, code:str, config:configparser.ConfigParser)->str|None:# K线突破/跌破均线
+    assert len(data) >= 90
+    N = 240
+    # 从数据库读取参数 默认N=240
+    db_path = config.get("CONFIG", "EMA_PARAMS_DB", fallback=None)
+    if db_path is not None:
+        db = ParamsDB(db_path)
+        data = db.get_stock_params(code)
+        if data is not None:
+            N = data['best_params']['ema_period']
+
     close = data['close']
     close_ema = EMA(close, N)
     last_close = round_decimal(close.iloc[-1])
@@ -220,7 +227,7 @@ def check_trends(code_in_group: pd.DataFrame, config: configparser.ConfigParser)
     for idx, futu_code in enumerate(code_in_group['code'].values):
         print(f"Processing {futu_code}")
         try:
-            df = get_kline_data(futu_code, config, max_count=300)
+            df = get_kline_data(futu_code, config, max_count=1000)
 
             # 添加对 df 的检查
             if df is None:
@@ -240,7 +247,7 @@ def check_trends(code_in_group: pd.DataFrame, config: configparser.ConfigParser)
             msg = f'{futu_code} {name}'
             for i in trend_type:
                 if i.lower() == 'breakout':
-                    bo = is_breakout(df) # 突破/跌破EMA均线
+                    bo = is_breakout(df,futu_code,config) # 突破/跌破EMA均线
                     if bo is not None:
                         msg += f' | {bo}'
                 elif i.lower() == 'reverse':
@@ -347,12 +354,6 @@ if __name__ == "__main__":
     if len(filter_df) > 0:
         target_prices = filter_df['msg'].str.extract(r'\[(\d+\.\d+),(\d+\.\d+)\]')
         notification.send_futu_message([str(code) for code in filter_df.index.tolist()],filter_df['msg'].tolist(),target_prices[1].tolist(),target_prices[0].tolist())
-
-    # LLM消息
-    msg = generate_text_with_config(config, raw_msg)
-    if raw_msg != msg:
-        notification.send_telegram_message(msg,'https://www.futunn.com/')
-        notification.send_email(f'{group} {push_type}',msg)
 
     # 原始消息
     notification.send_telegram_message(raw_msg,'https://www.futunn.com/')
