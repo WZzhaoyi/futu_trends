@@ -28,7 +28,7 @@ def run_analysis(code_list:pd.DataFrame, indicator_type:str, config:ConfigParser
     timestamp = datetime.now().strftime('%Y%m%d')
 
     for idx, code in enumerate(code_list['code'].values):
-        print(f"\n---- Analyzing {name_list[idx]} ----\n")
+        print(f"\n---- Analyzing {idx+1}/{len(code_list)} {name_list[idx]} {code} {ktype}----\n")
         
         # 检查本地数据文件
         data_file_name = f'data_{code.replace(".", "_")}_{ktype}.csv'
@@ -36,7 +36,7 @@ def run_analysis(code_list:pd.DataFrame, indicator_type:str, config:ConfigParser
         if not os.path.exists(data_file) or (datetime.now() - datetime.fromtimestamp(os.path.getmtime(data_file))).days > cache_expiry_days:
             # 文件不存在，下载数据
             print(f"下载新数据: {data_file}")
-            df = get_kline_data(code, config, max_count=1200)
+            df = get_kline_data(code, config, max_count=1300)
             df.to_csv(data_file)
         else:
             print(f"使用本地数据文件: {data_file}")

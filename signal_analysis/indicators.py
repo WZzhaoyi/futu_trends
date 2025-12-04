@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 import pandas as pd
 import numpy as np
-from typing import Dict
+from typing import Dict, Tuple
 from hyperopt import hp
 
 from signal_analysis.tool import ATR, calculate_win_rate
@@ -42,6 +42,11 @@ class Indicator(ABC):
         """未来确认 - 不能直接用作胜率计算"""
         pass
 
+    @abstractmethod
+    def indicator_calculate(self, df: pd.DataFrame, params: Dict) -> pd.Series | Tuple[pd.Series]:
+        """计算指标"""
+        pass
+
 class KD(Indicator):
     """KD随机指标"""
     
@@ -58,8 +63,7 @@ class KD(Indicator):
         df = df.copy()
         
         # 计算KD
-        k, d = self._stochastic(df['high'], df['low'], df['close'], 
-                               int(params['k_period']), int(params['d_period']))
+        k, d = self.indicator_calculate(df, params)
         df['k'], df['d'] = k, d
 
         support_cond = (k > d) & (k.shift(1) <= d.shift(1)) & (d < params['oversold'])
@@ -95,6 +99,11 @@ class KD(Indicator):
         
         return score * signal_count_penalty
 
+    def indicator_calculate(self, df: pd.DataFrame, params: Dict) -> Tuple[pd.Series]: # -> Tuple[k, d]
+        k_period = int(params['k_period'])
+        d_period = int(params['d_period'])
+        return self._stochastic(df['high'], df['low'], df['close'], k_period, d_period)
+
     def _stochastic(self, high, low, close, k_period, d_period):
         low_min = low.rolling(window=k_period).min()
         high_max = high.rolling(window=k_period).max()
@@ -127,10 +136,7 @@ class MACD(Indicator):
         df = df.copy()
 
         # 计算MACD
-        macd, signal = self._macd_atr(df['close'], df['high'], df['low'],
-                                            params['fast_period'], 
-                                            params['slow_period'], 
-                                            params['signal_period'])
+        macd, signal = self.indicator_calculate(df, params)
         df['macd'], df['signal'] = macd, signal
         
         # 信号检测
@@ -164,6 +170,10 @@ class MACD(Indicator):
         
         return score * signal_count_penalty
     
+
+    def indicator_calculate(self, df: pd.DataFrame, params: Dict) -> Tuple[pd.Series]: # -> Tuple[vmacd, signal]
+        return self._macd_atr(df['close'], df['high'], df['low'], int(params['fast_period']), int(params['slow_period']), int(params['signal_period']))
+    
     def _macd_atr(self, close, high, low, fast_period, slow_period, signal_period):
         ema_fast = close.ewm(span=fast_period,adjust=False).mean()
         ema_slow = close.ewm(span=slow_period,adjust=False).mean()
@@ -193,7 +203,8 @@ class RSI(Indicator):
         df = df.copy()
 
         # 计算RSI
-        df['rsi'] = self._rsi(df['close'], params['rsi_period'])
+        rsi = self.indicator_calculate(df, params)
+        df['rsi'] = rsi
 
         # 信号检测
         support_cond = (df['rsi'] < params['oversold']) & (df['rsi'] < df['rsi'].shift(1)) & (df['rsi'].shift(1) < params['oversold'])
@@ -232,6 +243,11 @@ class RSI(Indicator):
         
         return score * signal_count_penalty
 
+    
+    def indicator_calculate(self, df: pd.DataFrame, params: Dict) -> pd.Series: # -> rsi
+        period = int(params['rsi_period'])
+        return self._rsi(df['close'], period)
+    
     def _rsi(self, close, period):
         delta = close.diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()

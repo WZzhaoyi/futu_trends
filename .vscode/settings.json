@@ -1,6 +1,6 @@
 {
     "python.analysis.extraPaths": [
         "./signal_analysis",
-        "./fundamental_analysis"
+        "./gui"
     ]
 }

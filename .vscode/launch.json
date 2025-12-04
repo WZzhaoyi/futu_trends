@@ -60,5 +60,27 @@
             "console": "integratedTerminal",
             "args": ["--config","./env/trade.ini"]
         },
+        {
+            "name": "signal_window",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "./gui/signal_window.py",
+            "console": "integratedTerminal",
+            "args": ["--config","./env/signal_window.ini"],
+            "env": {
+                "MPLBACKEND": "Agg"
+            }
+        },
+        {
+            "name": "group_list",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "./gui/group_list.py",
+            "console": "integratedTerminal",
+            "args": ["--config","./env/signal_window.ini"],
+            "env": {
+                "MPLBACKEND": "Agg"
+            }
+        }
     ]
 }
