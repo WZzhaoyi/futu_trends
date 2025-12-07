@@ -39,15 +39,31 @@ def is_reverse(df: pd.DataFrame, code: str, config: configparser.ConfigParser) -
     
     # 从数据库读取参数
     db_path = config.get("CONFIG", "KD_PARAMS_DB", fallback=None)
-    if db_path is None:
-        return None
-    db = ParamsDB(db_path)
-    data = db.get_stock_params(code)
+    data = None
+    if db_path is not None:
+        db = ParamsDB(db_path)
+        data = db.get_stock_params(code)
+    
+    # 如果数据库中没有找到参数，使用默认参数
     if data is None:
-        return 'No KD parameters'
+        print(f"No KD parameters found for {code}, using default parameters")
+        data = {
+            'best_params': {
+                'k_period': 15,
+                'd_period': 5,
+                'overbought': 50,
+                'oversold': 50
+            },
+            'meta_info': {  
+                'target_multiplier': 0,
+                'atr_period': 0
+            },
+            'performance': {}
+        }
+    
     params = data['best_params']
     meta = data['meta_info']
-    performance = data['performance']
+    performance = data.get('performance', {})
             
     if not params:
         print(f"No KD parameters found for {code}")
@@ -65,8 +81,8 @@ def is_reverse(df: pd.DataFrame, code: str, config: configparser.ConfigParser) -
     msg = ''
     if reversal != 'none' and type(reversal) == str:
         msg += reversal.replace('reversal','kd')
-        target_low, target_high = get_target_price(df, target_multiplier=meta['target_multiplier'], atr_period=meta['atr_period'])
-        msg += f' [{target_low},{target_high}]'
+        target_low, target_high = get_target_price(df, target_multiplier=meta['target_multiplier'], atr_period=meta['atr_period']) if meta['target_multiplier'] > 0 and meta['atr_period'] > 0 else (0, 0)
+        msg += f' [{target_low},{target_high}]' if target_low > 0 and target_high > 0 else '[0,0]'
     if 'support' in reversal:
         msg += u'📈'
     elif 'resistance' in reversal:
@@ -78,15 +94,30 @@ def is_continue(df:pd.DataFrame, code:str, config:configparser.ConfigParser)->st
     
     # 从数据库读取参数
     db_path = config.get("CONFIG", "MACD_PARAMS_DB", fallback=None)
-    if db_path is None:
-        return None
-    db = ParamsDB(db_path)
-    data = db.get_stock_params(code)
+    data = None
+    if db_path is not None:
+        db = ParamsDB(db_path)
+        data = db.get_stock_params(code)
+    
+    # 如果数据库中没有找到参数，使用默认参数
     if data is None:
-        return 'No MACD parameters'
+        print(f"No MACD parameters found for {code}, using default parameters")
+        data = {
+            'best_params': {
+                'fast_period': 12,
+                'slow_period': 26,
+                'signal_period': 9
+            },
+            'meta_info': {  
+                'target_multiplier': 0,
+                'atr_period': 0
+            },
+            'performance': {}
+        }
+    
     params = data['best_params']
     meta = data['meta_info']
-    performance = data['performance']
+    performance = data.get('performance', {})
             
     if not params:
         print(f"No MACD parameters found for {code}")
@@ -104,8 +135,8 @@ def is_continue(df:pd.DataFrame, code:str, config:configparser.ConfigParser)->st
     msg = ''
     if reversal != 'none' and type(reversal) == str:
         msg += reversal.replace('reversal','macd')
-        target_low, target_high = get_target_price(df, target_multiplier=meta['target_multiplier'], atr_period=meta['atr_period'])
-        msg += f' [{target_low},{target_high}]'
+        target_low, target_high = get_target_price(df, target_multiplier=meta['target_multiplier'], atr_period=meta['atr_period']) if meta['target_multiplier'] > 0 and meta['atr_period'] > 0 else (0, 0)
+        msg += f' [{target_low},{target_high}]' if target_low > 0 and target_high > 0 else '[0,0]'
     if 'support' in reversal:
         msg += u'📈'
     elif 'resistance' in reversal:
@@ -145,15 +176,30 @@ def is_top_down(df:pd.DataFrame, code:str, config:configparser.ConfigParser) -> 
     assert len(df) >= 90
     # 从数据库读取参数
     db_path = config.get("CONFIG", "RSI_PARAMS_DB", fallback=None)
-    if db_path is None:
-        return None
-    db = ParamsDB(db_path)
-    data = db.get_stock_params(code)
+    data = None
+    if db_path is not None:
+        db = ParamsDB(db_path)
+        data = db.get_stock_params(code)
+    
+    # 如果数据库中没有找到参数，使用默认参数
     if data is None:
-        return 'No RSI parameters'
+        print(f"No RSI parameters found for {code}, using default parameters")
+        data = {
+            'best_params': {
+                'rsi_period': 7,
+                'oversold': 30,
+                'overbought': 70
+            },
+            'meta_info': {  
+                'target_multiplier': 0,
+                'atr_period': 0
+            },
+            'performance': {}
+        }
+    
     params = data['best_params']
     meta = data['meta_info']
-    performance = data['performance']
+    performance = data.get('performance', {})
             
     if not params:
         print(f"No RSI parameters found for {code}")
@@ -170,8 +216,8 @@ def is_top_down(df:pd.DataFrame, code:str, config:configparser.ConfigParser) -> 
     # 检查是否有反转信号
     if reversal != 'none' and type(reversal) == str:
         msg += reversal.replace('reversal','rsi')
-        target_low, target_high = get_target_price(df, target_multiplier=meta['target_multiplier'], atr_period=meta['atr_period'])
-        msg += f' [{target_low},{target_high}]'
+        target_low, target_high = get_target_price(df, target_multiplier=meta['target_multiplier'], atr_period=meta['atr_period']) if meta['target_multiplier'] > 0 and meta['atr_period'] > 0 else (0, 0)
+        msg += f' [{target_low},{target_high}]' if target_low > 0 and target_high > 0 else '[0,0]'
     if 'support' in reversal:
         msg += u'📈'
     elif 'resistance' in reversal:
