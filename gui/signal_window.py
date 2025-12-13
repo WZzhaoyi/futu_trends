@@ -87,6 +87,15 @@ class SignalWindow:
                 logger.info(f"use local data file: {data_file}")
                 df = pd.read_csv(data_file, index_col=0, parse_dates=True)
             
+            # 确保索引是 datetime 类型，并处理时区信息
+            if not isinstance(df.index, pd.DatetimeIndex):
+                # 使用 utc=True 来处理时区感知的 datetime 对象
+                df.index = pd.to_datetime(df.index, utc=True)
+            
+            # 如果是时区感知的 datetime，转换为 UTC 后移除时区信息
+            if df.index.tz is not None:
+                df.index = df.index.tz_convert('UTC').tz_localize(None)
+            
             df['time'] = df.index
             ema_period = self.config.getint("CONFIG", "EMA_PERIOD", fallback=240)
             df[f'EMA_{ema_period}'] = EMA(df['close'], ema_period)
@@ -264,8 +273,8 @@ class SignalWindow:
         # 异步并行添加子图（每个子图函数内部会读取对应的参数）
         tasks = [
             self._add_macd_subchart(df, code),
-            self._add_kd_subchart(df, code),
-            self._add_rsi_subchart(df, code)
+            # self._add_kd_subchart(df, code),
+            # self._add_rsi_subchart(df, code)
         ]
         
         await asyncio.gather(*tasks)
