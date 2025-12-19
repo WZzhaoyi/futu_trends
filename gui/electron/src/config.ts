@@ -8,14 +8,75 @@ export let API_BASE = `http://127.0.0.1:${API_PORT}`;
 export const API_TIMEOUT = 5000;
 export const MAX_KLINE_COUNT = 1000;
 
+// API 端口变化监听器
+type PortChangeListener = (port: number, apiBase: string) => void;
+const portChangeListeners: PortChangeListener[] = [];
+
+/**
+ * 获取当前 API 端口
+ * @returns 当前端口号
+ */
+export function getApiPort(): number {
+  return API_PORT;
+}
+
+/**
+ * 获取当前 API 基础地址（动态获取，确保总是最新值）
+ * @returns API 基础地址
+ */
+export function getApiBase(): string {
+  return `http://127.0.0.1:${API_PORT}`;
+}
+
+/**
+ * 构建完整的 API URL
+ * @param path - API 路径（以 / 开头）
+ * @returns 完整的 API URL
+ */
+export function getApiUrl(path: string): string {
+  const base = getApiBase();
+  const cleanPath = path.startsWith('/') ? path : `/${path}`;
+  return `${base}${cleanPath}`;
+}
+
+/**
+ * 添加端口变化监听器
+ * @param listener - 监听器函数
+ * @returns 取消监听的函数
+ */
+export function onApiPortChanged(listener: PortChangeListener): () => void {
+  portChangeListeners.push(listener);
+  return () => {
+    const index = portChangeListeners.indexOf(listener);
+    if (index > -1) {
+      portChangeListeners.splice(index, 1);
+    }
+  };
+}
+
 /**
  * 更新 API 端口
  * @param port - 新的端口号
  */
 export function updateApiPort(port: number): void {
+  if (port === API_PORT) {
+    return; // 端口未变化，无需更新
+  }
+  
+  const oldPort = API_PORT;
   API_PORT = port;
   API_BASE = `http://127.0.0.1:${port}`;
-  console.log(`[Config] API base updated to: ${API_BASE}`);
+  
+  console.log(`[Config] API port updated from ${oldPort} to ${port}, API base: ${API_BASE}`);
+  
+  // 通知所有监听器
+  portChangeListeners.forEach(listener => {
+    try {
+      listener(port, API_BASE);
+    } catch (error) {
+      console.error('[Config] Error in port change listener:', error);
+    }
+  });
 }
 
 /**
@@ -25,7 +86,7 @@ export async function initApiPort(): Promise<void> {
   if (typeof window !== 'undefined' && window.electronAPI) {
     try {
       const port = await window.electronAPI.getApiPort();
-      if (port) {
+      if (port && port !== API_PORT) {
         updateApiPort(port);
       }
     } catch (error) {
