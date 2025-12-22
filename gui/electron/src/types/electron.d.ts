@@ -3,6 +3,8 @@ export interface ElectronAPI {
   setWindowTitle: (title: string) => Promise<void>;
   getApiPort: () => Promise<number>;
   onApiPortChanged: (callback: (port: number) => void) => void;
+  selectConfigFile: () => Promise<string | null>;
+  restartBackend: (configPath?: string | null) => Promise<{ success: boolean; message: string }>;
 }
 
 declare global {

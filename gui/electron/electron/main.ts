@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain } from 'electron';
+import { app, BrowserWindow, ipcMain, dialog } from 'electron';
 import { spawn, ChildProcess } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -12,6 +12,7 @@ let pythonService: ChildProcess | null = null;
 let mainWindow: BrowserWindow | null = null;
 let actualApiPort: number = DEFAULT_API_PORT;
 let apiBase: string = `http://127.0.0.1:${DEFAULT_API_PORT}`;
+let currentConfigPath: string | null = null;
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
@@ -87,7 +88,7 @@ async function waitForPythonService(maxWaitTime: number = API_TIMEOUT): Promise<
   });
 }
 
-function startPythonService(): void {
+function startPythonService(configPath?: string | null): void {
   // 启动 Python FastAPI 服务
   const pythonPath = process.env.PYTHON_PATH || 'python';
   const apiPath = path.join(__dirname, '../../backend/api.py');
@@ -97,26 +98,46 @@ function startPythonService(): void {
   // 需要回到项目根目录: ../../../ = futu_trends/
   const projectRoot = path.resolve(__dirname, '../../../');
   
-  // 尝试多个可能的配置文件路径
-  const possibleConfigPaths = [
-    path.join(projectRoot, 'env', 'signal_window.ini')
-  ];
-  
   let configFullPath: string | null = null;
-  if (process.env.CONFIG_PATH) {
-    // 如果 CONFIG_PATH 是相对路径，相对于项目根目录
-    if (path.isAbsolute(process.env.CONFIG_PATH)) {
-      configFullPath = process.env.CONFIG_PATH;
+  
+  // 如果提供了配置文件路径，使用它
+  if (configPath) {
+    if (path.isAbsolute(configPath)) {
+      configFullPath = configPath;
     } else {
-      configFullPath = path.join(projectRoot, process.env.CONFIG_PATH);
+      configFullPath = path.join(projectRoot, configPath);
     }
+    // 保存当前配置文件路径
+    currentConfigPath = configFullPath;
+  } else if (currentConfigPath && fs.existsSync(currentConfigPath)) {
+    // 使用之前保存的配置文件路径
+    configFullPath = currentConfigPath;
   } else {
-    // 尝试找到存在的配置文件
-    for (const configPath of possibleConfigPaths) {
-      if (fs.existsSync(configPath)) {
-        configFullPath = configPath;
-        break;
+    // 尝试多个可能的配置文件路径
+    const possibleConfigPaths = [
+      path.join(projectRoot, 'env', 'signal_window.ini')
+    ];
+    
+    if (process.env.CONFIG_PATH) {
+      // 如果 CONFIG_PATH 是相对路径，相对于项目根目录
+      if (path.isAbsolute(process.env.CONFIG_PATH)) {
+        configFullPath = process.env.CONFIG_PATH;
+      } else {
+        configFullPath = path.join(projectRoot, process.env.CONFIG_PATH);
       }
+    } else {
+      // 尝试找到存在的配置文件
+      for (const possiblePath of possibleConfigPaths) {
+        if (fs.existsSync(possiblePath)) {
+          configFullPath = possiblePath;
+          break;
+        }
+      }
+    }
+    
+    // 保存找到的配置文件路径
+    if (configFullPath) {
+      currentConfigPath = configFullPath;
     }
   }
   
@@ -127,6 +148,7 @@ function startPythonService(): void {
   } else {
     console.warn('[Electron] Warning: Config file not found, using default configuration');
     console.log(`[Electron] Starting Python service: ${pythonPath} ${apiPath}`);
+    currentConfigPath = null;
   }
   
   pythonService = spawn(pythonPath, args, {
@@ -201,6 +223,77 @@ function startPythonService(): void {
   pythonService.on('error', (error) => {
     console.error(`[Electron] Failed to start Python service: ${error.message}`);
   });
+}
+
+// 停止 Python 服务
+function stopPythonService(): Promise<void> {
+  return new Promise((resolve) => {
+    if (!pythonService) {
+      resolve();
+      return;
+    }
+    
+    console.log('[Electron] Stopping Python service...');
+    
+    const service = pythonService;
+    let resolved = false;
+    
+    const cleanup = () => {
+      if (!resolved) {
+        resolved = true;
+        pythonService = null;
+        console.log('[Electron] Python service stopped');
+        resolve();
+      }
+    };
+    
+    // 监听进程退出
+    service.once('close', cleanup);
+    service.once('exit', cleanup);
+    
+    // 尝试优雅关闭（SIGTERM）
+    try {
+      if (process.platform === 'win32') {
+        // Windows: kill() 会发送终止信号
+        service.kill();
+      } else {
+        // Unix: 发送 SIGTERM 信号
+        service.kill('SIGTERM');
+      }
+    } catch (error) {
+      console.error('[Electron] Error killing Python service:', error);
+      cleanup();
+      return;
+    }
+    
+    // 如果 3 秒后还没关闭，强制杀死
+    setTimeout(() => {
+      if (service === pythonService && pythonService) {
+        console.log('[Electron] Force killing Python service');
+        try {
+          if (process.platform === 'win32') {
+            pythonService.kill();
+          } else {
+            pythonService.kill('SIGKILL');
+          }
+        } catch (error) {
+          console.error('[Electron] Error force killing Python service:', error);
+        }
+        cleanup();
+      }
+    }, 3000);
+  });
+}
+
+// 重启 Python 服务
+async function restartPythonService(configPath?: string | null): Promise<void> {
+  console.log('[Electron] Restarting Python service...');
+  await stopPythonService();
+  // 等待一小段时间确保端口释放
+  await new Promise(resolve => setTimeout(resolve, 1000));
+  startPythonService(configPath);
+  // 等待服务启动
+  await waitForPythonService(30000);
 }
 
 app.whenReady().then(async () => {
@@ -278,5 +371,40 @@ ipcMain.handle('set-window-title', (event, title: string) => {
 // IPC 处理：获取 API 端口
 ipcMain.handle('get-api-port', () => {
   return actualApiPort;
+});
+
+// IPC 处理：选择配置文件
+ipcMain.handle('select-config-file', async () => {
+  if (!mainWindow) {
+    console.error('[Electron] Main window not found');
+    return null;
+  }
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: '选择配置文件',
+    filters: [
+      { name: '配置文件', extensions: ['ini', 'conf', 'config'] },
+      { name: '所有文件', extensions: ['*'] }
+    ],
+    properties: ['openFile']
+  });
+  
+  if (result.canceled || result.filePaths.length === 0) {
+    return null;
+  }
+  
+  const selectedPath = result.filePaths[0];
+  console.log(`[Electron] Config file selected: ${selectedPath}`);
+  return selectedPath;
+});
+
+// IPC 处理：重启后端服务
+ipcMain.handle('restart-backend', async (event, configPath?: string | null) => {
+  try {
+    await restartPythonService(configPath);
+    return { success: true, message: '后端服务重启成功' };
+  } catch (error: any) {
+    console.error('[Electron] Failed to restart backend:', error);
+    return { success: false, message: `重启失败: ${error.message}` };
+  }
 });
 
