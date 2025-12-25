@@ -3,6 +3,9 @@
   "include": ["electron.vite.config.*", "src/main/**/*", "src/preload/**/*"],
   "compilerOptions": {
     "composite": true,
-    "types": ["electron-vite/node"]
+    "types": ["electron-vite/node"],
+    // 确保启用 ES 模块互操作性，正确处理 ES 模块的默认导出
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true
   }
 }

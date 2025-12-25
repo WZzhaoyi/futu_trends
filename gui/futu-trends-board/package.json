@@ -1,10 +1,10 @@
 {
   "name": "futu-trends-board",
   "version": "1.0.0",
-  "description": "An Electron application with Vue and TypeScript",
+  "description": "股票趋势分析工具 - 支持多数据源和自定义技术指标",
   "main": "./out/main/index.js",
-  "author": "example.com",
-  "homepage": "https://electron-vite.org",
+  "author": "Futu Trends Team",
+  "homepage": "https://github.com/yourusername/futu-trends-board",
   "scripts": {
     "format": "prettier --write .",
     "lint": "eslint --cache .",
@@ -14,7 +14,6 @@
     "start": "electron-vite preview",
     "dev": "electron-vite dev",
     "build": "npm run typecheck && electron-vite build",
-    "postinstall": "electron-builder install-app-deps",
     "build:unpack": "npm run build && electron-builder --dir",
     "build:win": "npm run build && electron-builder --win",
     "build:mac": "npm run build && electron-builder --mac",
@@ -23,12 +22,23 @@
   "dependencies": {
     "@electron-toolkit/preload": "^3.0.2",
     "@electron-toolkit/utils": "^4.0.0",
-    "electron-updater": "^6.3.9"
+    "@types/iconv-lite": "^0.0.1",
+    "electron-updater": "^6.3.9",
+    "futu-proto": "^9.4.5409",
+    "futu-sdk": "^0.2.6",
+    "iconv-lite": "^0.7.1",
+    "ini": "^6.0.0",
+    "lightweight-charts": "^5.1.0",
+    "mongodb": "^7.0.0",
+    "naive-ui": "^2.43.2",
+    "sql.js": "^1.13.0",
+    "yahoo-finance2": "^3.10.2"
   },
   "devDependencies": {
     "@electron-toolkit/eslint-config-prettier": "3.0.0",
     "@electron-toolkit/eslint-config-ts": "^3.1.0",
     "@electron-toolkit/tsconfig": "^2.0.0",
+    "@types/ini": "^4.1.1",
     "@types/node": "^22.19.1",
     "@vitejs/plugin-vue": "^6.0.2",
     "electron": "^39.2.6",
@@ -42,5 +52,38 @@
     "vue": "^3.5.25",
     "vue-eslint-parser": "^10.2.0",
     "vue-tsc": "^3.1.6"
+  },
+  "build": {
+    "appId": "com.fututrends.board",
+    "productName": "Futu Trends Board",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "out/**/*",
+      "resources/**/*"
+    ],
+    "npmRebuild": false,
+    "buildDependenciesFromSource": false,
+    "win": {
+      "target": ["nsis"],
+      "icon": "resources/icon.ico"
+    },
+    "mac": {
+      "target": ["dmg"],
+      "icon": "resources/icon.icns",
+      "category": "public.app-category.finance"
+    },
+    "linux": {
+      "target": ["AppImage", "deb"],
+      "icon": "resources/icon.png",
+      "category": "Finance"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
   }
 }
