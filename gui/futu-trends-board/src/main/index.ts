@@ -1,8 +1,59 @@
 import { app, shell, BrowserWindow, ipcMain, dialog, globalShortcut, Menu } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
-import { loadConfig, getConfig, getConfigPath } from './configManager'
+import { loadConfig, getConfig, getConfigPath, saveConfig } from './configManager'
 import { getFutuStockList, getChartData } from './dataService'
+import { initLogger, getLogger, interceptConsole, closeLogger } from './logger'
+
+// 初始化日志系统（尽早初始化）
+const logger = initLogger()
+
+// 拦截 console 输出到日志文件（打包环境）
+interceptConsole(logger)
+
+// 修复打包后的模块路径
+if (app.isPackaged) {
+  logger.info('检测到打包环境，修复模块路径...')
+  
+  // 获取 asar.unpacked 路径
+  const unpackedPath = join(process.resourcesPath, 'app.asar.unpacked', 'node_modules')
+  logger.info('Unpacked模块路径:', unpackedPath)
+  
+  // 检查关键模块是否存在
+  const fs = require('fs')
+  const criticalModules = ['futu-sdk', 'futu-proto', 'ws', 'mongodb']
+  const modulesStatus: any = {}
+  
+  criticalModules.forEach(moduleName => {
+    const modulePath = join(unpackedPath, moduleName)
+    const exists = fs.existsSync(modulePath)
+    modulesStatus[moduleName] = exists ? '✓' : '✗'
+    if (!exists) {
+      logger.warn(`模块 ${moduleName} 未在 unpacked 目录中找到: ${modulePath}`)
+    }
+  })
+  
+  logger.info('关键模块检查:', modulesStatus)
+  
+  // 添加到模块搜索路径
+  if (process.env.NODE_PATH) {
+    process.env.NODE_PATH = `${unpackedPath};${process.env.NODE_PATH}`
+  } else {
+    process.env.NODE_PATH = unpackedPath
+  }
+  
+  // 对于 Windows 系统，还需要添加到 PATH
+  if (process.platform === 'win32') {
+    const futuSdkPath = join(unpackedPath, 'futu-sdk')
+    const futuProtoPath = join(unpackedPath, 'futu-proto')
+    const wsPath = join(unpackedPath, 'ws')
+    process.env.PATH = `${futuSdkPath};${futuProtoPath};${wsPath};${process.env.PATH}`
+    logger.info('已添加 futu-sdk、futu-proto、ws 到 PATH')
+  }
+  
+  logger.info('模块路径修复完成')
+  logger.info('NODE_PATH:', process.env.NODE_PATH)
+}
 
 // 存储已打开的图表窗口
 const chartWindows = new Map<string, BrowserWindow>()
@@ -203,6 +254,26 @@ app.whenReady().then(() => {
     }
   })
 
+  // 保存配置
+  ipcMain.handle('save-config', async (_event, config) => {
+    try {
+      console.log('[Main] Saving config:', {
+        DATA_SOURCE: config.DATA_SOURCE,
+        FUTU_HOST: config.FUTU_HOST,
+        FUTU_GROUP: config.FUTU_GROUP || 'not set',
+        FUTU_CODE_LIST: config.FUTU_CODE_LIST ? `${config.FUTU_CODE_LIST.split(',').length} codes` : 'not set'
+      })
+      
+      const savedPath = saveConfig(config)
+      
+      console.log('[Main] Config saved successfully to:', savedPath)
+      return { success: true, path: savedPath }
+    } catch (error) {
+      console.error('[Main] Error saving config:', error)
+      throw error
+    }
+  })
+
   // 打开图表窗口
   ipcMain.handle('open-chart-window', async (_event, stockCode) => {
     return openChartWindow(stockCode)
@@ -238,6 +309,20 @@ app.whenReady().then(() => {
     }
   })
 
+  // 获取日志文件路径
+  ipcMain.handle('get-log-path', () => {
+    const logger = getLogger()
+    return logger.getLogPath()
+  })
+
+  // 打开日志目录
+  ipcMain.handle('open-log-dir', () => {
+    const logger = getLogger()
+    const logDir = logger.getLogDir()
+    shell.openPath(logDir)
+    return logDir
+  })
+
   createWindow()
 
   app.on('activate', function () {
@@ -256,9 +341,10 @@ app.on('window-all-closed', () => {
   }
 })
 
-// 在应用退出前清理全局快捷键
+// 在应用退出前清理全局快捷键和日志
 app.on('will-quit', () => {
   globalShortcut.unregisterAll()
+  closeLogger()
 })
 
 // 打开图表窗口

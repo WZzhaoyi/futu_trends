@@ -8,6 +8,8 @@ export default defineConfig({
     build: {
       // 将 yahoo-finance2 从外部依赖中排除，让它被打包进主进程代码
       // 这样可以确保 ES 模块的默认导出被 esbuild 正确处理
+      // futu-sdk、futu-proto、ws、mongodb 等保持外部化（不打包，从 node_modules 加载）
+      // electron-vite 默认会外部化所有依赖，这里只需要排除需要打包的模块
       externalizeDeps: {
         exclude: ['yahoo-finance2']
       },

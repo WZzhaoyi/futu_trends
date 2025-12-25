@@ -1,7 +1,8 @@
 // 配置管理器 - 读取和管理ini配置文件
 import * as fs from 'fs'
 import * as path from 'path'
-import { parse } from 'ini'
+import { parse, stringify } from 'ini'
+import { app } from 'electron'
 
 export interface AppConfig {
   // 数据源配置
@@ -167,4 +168,65 @@ export function getConfig(): AppConfig {
  */
 export function getConfigPath(): string | null {
   return currentConfigPath
+}
+
+/**
+ * 保存配置到文件
+ * @param config 配置对象
+ * @param filePath 可选的文件路径，不提供则保存到当前配置文件或默认位置
+ */
+export function saveConfig(config: AppConfig, filePath?: string): string {
+  try {
+    // 确定保存路径
+    let targetPath = filePath || currentConfigPath
+    
+    if (!targetPath) {
+      // 如果没有当前配置路径，使用用户数据目录
+      const userDataPath = app.getPath('userData')
+      targetPath = path.join(userDataPath, 'config.ini')
+      console.log('[ConfigManager] No current config path, using default:', targetPath)
+    }
+
+    // 确保目录存在
+    const dir = path.dirname(targetPath)
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true })
+    }
+
+    // 转换配置为 ini 格式
+    const iniData = {
+      CONFIG: {
+        DATA_SOURCE: config.DATA_SOURCE || 'yfinance',
+        FUTU_HOST: config.FUTU_HOST || '127.0.0.1',
+        FUTU_PORT: config.FUTU_PORT || 11111,
+        FUTU_WS_PORT: config.FUTU_WS_PORT || 33334,
+        FUTU_WS_KEY: config.FUTU_WS_KEY || '',
+        FUTU_GROUP: config.FUTU_GROUP || '',
+        FUTU_CODE_LIST: config.FUTU_CODE_LIST || '',
+        FUTU_PUSH_TYPE: config.FUTU_PUSH_TYPE || 'K_DAY',
+        EMA_PERIOD: config.EMA_PERIOD || 240,
+        KD_PARAMS_DB: config.KD_PARAMS_DB || '',
+        MACD_PARAMS_DB: config.MACD_PARAMS_DB || '',
+        RSI_PARAMS_DB: config.RSI_PARAMS_DB || '',
+        PROXY: config.PROXY || '',
+        DATA_DIR: config.DATA_DIR || './data/detect',
+        DARK_MODE: config.DARK_MODE ? 'True' : 'False'
+      }
+    }
+
+    // 写入文件
+    const iniContent = stringify(iniData)
+    fs.writeFileSync(targetPath, iniContent, 'utf-8')
+
+    console.log('[ConfigManager] Config saved to:', targetPath)
+
+    // 更新当前配置和路径
+    currentConfig = config
+    currentConfigPath = targetPath
+
+    return targetPath
+  } catch (error) {
+    console.error('[ConfigManager] Failed to save config:', error)
+    throw error
+  }
 }

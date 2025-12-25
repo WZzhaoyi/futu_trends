@@ -40,7 +40,21 @@
                 </template>
               </n-button>
             </template>
-            选择配置文件
+            配置管理
+          </n-tooltip>
+          <n-tooltip v-if="isElectron" trigger="hover">
+            <template #trigger>
+              <n-button
+                type="default"
+                @click="handleOpenLogDir"
+                class="action-button"
+              >
+                <template #icon>
+                  <span class="icon">📋</span>
+                </template>
+              </n-button>
+            </template>
+            打开日志目录
           </n-tooltip>
         </div>
       </div>
@@ -65,22 +79,31 @@
           :loading="loading"
           :bordered="false"
           :single-line="false"
+          :max-height="'100%'"
           class="stock-table"
           :row-props="rowProps"
         />
       </div>
     </div>
+
+    <!-- 配置对话框 -->
+    <ConfigDialog
+      v-model:show="showConfigDialog"
+      @save="handleSaveConfig"
+    />
   </n-config-provider>
 </template>
 
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue';
-import { NConfigProvider, NInput, NDataTable, NAlert, NButton, NTooltip, darkTheme, type DataTableColumns } from 'naive-ui';
+import { NConfigProvider, NInput, NDataTable, NAlert, NButton, NTooltip, darkTheme, useMessage, type DataTableColumns } from 'naive-ui';
 import { getStockList } from '../../../services/stockService';
 import type { Stock } from '../../../types/chart';
+import ConfigDialog from './ConfigDialog.vue';
 
 // 主题配置（深色模式）
 const theme = darkTheme;
+const message = useMessage();
 
 // 状态
 const stocks = ref<Stock[]>([]);
@@ -88,6 +111,7 @@ const searchTerm = ref('');
 const loading = ref(false);
 const errorMessage = ref<string | null>(null);
 const reloadingConfig = ref(false);
+const showConfigDialog = ref(false);
 const isElectron = typeof window !== 'undefined' && window.electronAPI !== undefined;
 
 /**
@@ -213,11 +237,21 @@ const handleDoubleClick = (row: Stock) => {
   }
 };
 
-// 选择配置文件
-const handleSelectConfig = async () => {
+// 打开配置对话框
+const handleSelectConfig = () => {
   if (!isElectron || !window.electronAPI) {
     console.warn('[GroupList] Electron API not available');
     errorMessage.value = 'Electron API不可用';
+    return;
+  }
+
+  showConfigDialog.value = true;
+};
+
+// 保存配置
+const handleSaveConfig = async (config: any) => {
+  if (!isElectron || !window.electronAPI) {
+    console.warn('[GroupList] Electron API not available');
     return;
   }
 
@@ -225,38 +259,72 @@ const handleSelectConfig = async () => {
   errorMessage.value = null;
 
   try {
-    console.log('[GroupList] Opening config file dialog...');
-    const result = await window.electronAPI.selectConfigFile();
-
-    if (!result) {
-      // 用户取消了选择
-      console.log('[GroupList] User cancelled config file selection');
-      return;
-    }
-
-    console.log('[GroupList] Config file selected and loaded:', result.path);
-    console.log('[GroupList] New config summary:', {
-      DATA_SOURCE: result.config.DATA_SOURCE,
-      FUTU_CODE_LIST: result.config.FUTU_CODE_LIST ? '已配置' : '未配置',
-      FUTU_GROUP: result.config.FUTU_GROUP || '未配置',
-      EMA_PERIOD: result.config.EMA_PERIOD || '使用默认值'
-    });
+    // 将响应式对象转换为纯 JavaScript 对象
+    const plainConfig = {
+      DATA_SOURCE: config.DATA_SOURCE,
+      FUTU_HOST: config.FUTU_HOST,
+      FUTU_PORT: config.FUTU_PORT,
+      FUTU_WS_PORT: config.FUTU_WS_PORT,
+      FUTU_WS_KEY: config.FUTU_WS_KEY,
+      FUTU_GROUP: config.FUTU_GROUP,
+      FUTU_CODE_LIST: config.FUTU_CODE_LIST,
+      FUTU_PUSH_TYPE: config.FUTU_PUSH_TYPE,
+      EMA_PERIOD: config.EMA_PERIOD,
+      KD_PARAMS_DB: config.KD_PARAMS_DB,
+      MACD_PARAMS_DB: config.MACD_PARAMS_DB,
+      RSI_PARAMS_DB: config.RSI_PARAMS_DB,
+      PROXY: config.PROXY,
+      DATA_DIR: config.DATA_DIR,
+      DARK_MODE: config.DARK_MODE
+    };
     
-    // 主进程已经在 select-config-file 中加载了新配置
-    // 重新加载股票列表（会从主进程获取最新配置）
-    console.log('[GroupList] Reloading stock list with new config...');
-    await loadStocks();
+    console.log('[GroupList] Saving config:', plainConfig);
     
-    if (stocks.value.length === 0) {
-      errorMessage.value = '配置已加载，但未获取到股票列表。请检查配置是否正确。';
+    // 保存配置到主进程
+    if (typeof window.electronAPI.saveConfig === 'function') {
+      await window.electronAPI.saveConfig(plainConfig);
+      message.success('配置已保存');
+      console.log('[GroupList] Config saved successfully');
+      
+      // 关闭对话框
+      showConfigDialog.value = false;
+      
+      // 重新加载股票列表
+      console.log('[GroupList] Reloading stock list with new config...');
+      await loadStocks();
+      
+      if (stocks.value.length === 0) {
+        errorMessage.value = '配置已保存，但未获取到股票列表。请检查配置是否正确。';
+      } else {
+        message.success(`成功加载 ${stocks.value.length} 只股票`);
+        console.log(`[GroupList] Successfully loaded ${stocks.value.length} stocks with new config`);
+      }
     } else {
-      console.log(`[GroupList] Successfully loaded ${stocks.value.length} stocks with new config`);
+      throw new Error('saveConfig API not available');
     }
   } catch (error) {
-    console.error('[GroupList] Error selecting config file:', error);
-    errorMessage.value = `选择配置文件失败: ${error instanceof Error ? error.message : '未知错误'}`;
+    console.error('[GroupList] Error saving config:', error);
+    errorMessage.value = `保存配置失败: ${error instanceof Error ? error.message : '未知错误'}`;
+    message.error('保存配置失败');
   } finally {
     reloadingConfig.value = false;
+  }
+};
+
+// 打开日志目录
+const handleOpenLogDir = async () => {
+  if (!isElectron || !window.electronAPI) {
+    console.warn('[GroupList] Electron API not available');
+    return;
+  }
+
+  try {
+    console.log('[GroupList] Opening log directory...');
+    const logDir = await window.electronAPI.openLogDir();
+    console.log('[GroupList] Log directory opened:', logDir);
+  } catch (error) {
+    console.error('[GroupList] Failed to open log directory:', error);
+    errorMessage.value = `打开日志目录失败: ${error instanceof Error ? error.message : '未知错误'}`;
   }
 };
 
@@ -270,19 +338,16 @@ onMounted(() => {
 <style scoped>
 .group-list-container {
   width: 100%;
-  height: 100%;
+  height: 100vh;
   display: flex;
   flex-direction: column;
   background-color: #191919;
   color: #ffffff;
-  overflow: hidden;
 }
 
 .search-box {
   padding: 10px;
   flex-shrink: 0;
-  background-color: #191919;
-  z-index: 10;
 }
 
 .button-group {
@@ -311,7 +376,7 @@ onMounted(() => {
   min-height: 0;
   /* 叠加滚动条 - Firefox */
   scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.4) transparent;
+  scrollbar-color: rgba(255, 255, 255, 0.4) rgba(255, 255, 255, 0.1);
 }
 
 .stock-table {
@@ -322,24 +387,30 @@ onMounted(() => {
   -ms-user-select: none;
 }
 
-/* Webkit 叠加滚动条 - hover时显示 */
+/* Webkit 滚动条 - 始终可见 */
 .stock-table-wrapper::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 10px;
+  height: 10px;
 }
 
 .stock-table-wrapper::-webkit-scrollbar-track {
-  background: transparent;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 5px;
 }
 
 .stock-table-wrapper::-webkit-scrollbar-thumb {
-  background-color: transparent;
-  border-radius: 4px;
-  transition: background-color 0.3s ease;
+  background-color: rgba(255, 255, 255, 0.3);
+  border-radius: 5px;
+  border: 2px solid rgba(25, 25, 25, 1);
+  transition: background-color 0.2s ease;
 }
 
-.stock-table-wrapper:hover::-webkit-scrollbar-thumb {
-  background-color: rgba(255, 255, 255, 0.4);
+.stock-table-wrapper::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(255, 255, 255, 0.5);
+}
+
+.stock-table-wrapper::-webkit-scrollbar-thumb:active {
+  background-color: rgba(255, 255, 255, 0.6);
 }
 
 .table-row-clickable:hover {

@@ -19,8 +19,12 @@ declare global {
       getConfig: () => Promise<AppConfig>
       selectConfigFile: () => Promise<ConfigFileResult | null>
       reloadConfig: (configPath?: string) => Promise<AppConfig>
+      saveConfig: (config: any) => Promise<void>
       getStockList: () => Promise<StockListResult>
       getChartData: (stockCode: string, maxCount?: number) => Promise<ChartData>
+      // 日志相关接口
+      getLogPath: () => Promise<string>
+      openLogDir: () => Promise<string>
     }
     api: unknown
   }

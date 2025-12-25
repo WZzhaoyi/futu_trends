@@ -1,13 +1,16 @@
 <template>
-  <div id="app">
-    <!-- 从 URL 参数获取 code，如果有则显示图表窗口，否则显示股票列表 -->
-    <SignalWindow v-if="code" :code="code" />
-    <GroupList v-else />
-  </div>
+  <n-message-provider>
+    <div id="app">
+      <!-- 从 URL 参数获取 code，如果有则显示图表窗口，否则显示股票列表 -->
+      <SignalWindow v-if="code" :code="code" />
+      <GroupList v-else />
+    </div>
+  </n-message-provider>
 </template>
 
 <script setup lang="ts">
 import { ref, onMounted, onBeforeMount } from 'vue';
+import { NMessageProvider } from 'naive-ui';
 import GroupList from './components/GroupList.vue';
 import SignalWindow from './components/SignalWindow.vue';
 

@@ -8,9 +8,13 @@ const api = {
   getConfig: () => ipcRenderer.invoke('get-config'),
   selectConfigFile: () => ipcRenderer.invoke('select-config-file'),
   reloadConfig: (configPath?: string) => ipcRenderer.invoke('reload-config', configPath),
+  saveConfig: (config: any) => ipcRenderer.invoke('save-config', config),
   getStockList: () => ipcRenderer.invoke('get-stock-list'),
   getChartData: (stockCode: string, maxCount?: number) => 
-    ipcRenderer.invoke('get-chart-data', stockCode, maxCount)
+    ipcRenderer.invoke('get-chart-data', stockCode, maxCount),
+  // 日志相关 API
+  getLogPath: () => ipcRenderer.invoke('get-log-path'),
+  openLogDir: () => ipcRenderer.invoke('open-log-dir')
 }
 
 // Use `contextBridge` APIs to expose Electron APIs to

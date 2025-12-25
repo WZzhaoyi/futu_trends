@@ -52,6 +52,7 @@ export async function getFutuStockList(): Promise<StockListResult> {
     FUTU_GROUP: config.FUTU_GROUP || 'not set',
     FUTU_HOST: config.FUTU_HOST || 'not set',
     FUTU_WS_PORT: config.FUTU_WS_PORT || 'not set',
+    FUTU_WS_KEY: config.FUTU_WS_KEY || 'not set',
     FUTU_CODE_LIST: config.FUTU_CODE_LIST ? `${config.FUTU_CODE_LIST.split(',').length} codes` : 'not set'
   })
 
@@ -60,15 +61,26 @@ export async function getFutuStockList(): Promise<StockListResult> {
   // 方法1: 从富途分组获取
   if (config?.FUTU_GROUP && config.FUTU_WS_KEY && config.FUTU_HOST && config.FUTU_WS_PORT) {
     console.log('[DataService] Attempting to load stocks from Futu group:', config.FUTU_GROUP)
+    console.log('[DataService] WebSocket connection details:', {
+      host: config.FUTU_HOST,
+      port: config.FUTU_WS_PORT,
+      hasKey: !!config.FUTU_WS_KEY,
+      keyLength: config.FUTU_WS_KEY?.length || 0
+    })
     
     try {
       const wsUrl = `ws://${config.FUTU_HOST}:${config.FUTU_WS_PORT}`
+      console.log('[DataService] Connecting to WebSocket:', wsUrl)
+      
       const { webRequest, webSocket } = getFutuApi(wsUrl, config.FUTU_WS_KEY)
+      console.log('[DataService] WebSocket connection established')
 
       try {
+        console.log('[DataService] Requesting GetUserSecurity for group:', config.FUTU_GROUP)
         const { staticInfoList } = await webRequest.GetUserSecurity({
           groupName: config.FUTU_GROUP
         })
+        console.log('[DataService] GetUserSecurity response received, items count:', staticInfoList?.length || 0)
 
         if (staticInfoList && staticInfoList.length > 0) {
           const getFutuMarketName = (market: Qot_Common.QotMarket): 'SH' | 'SZ' | 'HK' | 'US' | '' => {
@@ -98,10 +110,23 @@ export async function getFutuStockList(): Promise<StockListResult> {
           return { stocks, source: 'futu_group' }
         }
       } finally {
-        webSocket.close()
+        try {
+          webSocket.close()
+          console.log('[DataService] WebSocket closed')
+        } catch (closeError) {
+          console.warn('[DataService] Error closing WebSocket:', closeError)
+        }
       }
     } catch (error) {
-      console.error('[DataService] Failed to get stocks from Futu group:', error)
+      const errorDetails = {
+        message: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+        name: error instanceof Error ? error.name : undefined,
+        wsUrl: `ws://${config.FUTU_HOST}:${config.FUTU_WS_PORT}`,
+        isPackaged: process.env.NODE_ENV === 'production' || !process.env.ELECTRON_RENDERER_URL
+      }
+      console.error('[DataService] Failed to get stocks from Futu group:', errorDetails)
+      console.error('[DataService] Full error:', error)
     }
   }
 
@@ -315,10 +340,34 @@ export async function getFutuKlineData(stock: Stock, maxCount: number = 1200): P
     })
 
     const wsUrl = `ws://${config.FUTU_HOST}:${config.FUTU_WS_PORT}`
-    const { webRequest, webSocket } = getFutuApi(wsUrl, config.FUTU_WS_KEY)
+    console.log('[DataService] Connecting to WebSocket for kline data:', wsUrl)
+    
+    let webRequest: any
+    let webSocket: any
+    
+    try {
+      const apiResult = getFutuApi(wsUrl, config.FUTU_WS_KEY)
+      webRequest = apiResult.webRequest
+      webSocket = apiResult.webSocket
+      console.log('[DataService] WebSocket connection established for kline data')
+    } catch (connectionError) {
+      console.error('[DataService] Failed to establish WebSocket connection:', {
+        error: connectionError instanceof Error ? connectionError.message : String(connectionError),
+        wsUrl,
+        isPackaged: process.env.NODE_ENV === 'production' || !process.env.ELECTRON_RENDERER_URL
+      })
+      throw connectionError
+    }
 
     try {
       // 请求历史K线数据
+      console.log('[DataService] Requesting RequestHistoryKL:', {
+        security: { market: Qot_Common.QotMarket[market], code },
+        klType: ktype,
+        beginTime: startDate.toISOString().split('T')[0],
+        endTime: endDate.toISOString().split('T')[0],
+        maxAckKLNum: maxCount
+      })
       const result = await webRequest.RequestHistoryKL({
         security: {
           market:marketToFutuMarket(stock.market),
@@ -412,12 +461,28 @@ export async function getFutuKlineData(stock: Stock, maxCount: number = 1200): P
       console.log(`[DataService] Successfully fetched ${limitedKlines.length} klines from Futu for ${stock.code}`)
       return limitedKlines
     } finally {
-      webSocket.close()
+      try {
+        if (webSocket) {
+          webSocket.close()
+          console.log('[DataService] WebSocket closed for kline data')
+        }
+      } catch (closeError) {
+        console.warn('[DataService] Error closing WebSocket:', closeError)
+      }
     }
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error)
+    const errorDetails = {
+      message: errorMsg,
+      stack: error instanceof Error ? error.stack : undefined,
+      stock: stock.code,
+      wsUrl: `ws://${config.FUTU_HOST}:${config.FUTU_WS_PORT}`,
+      isPackaged: process.env.NODE_ENV === 'production' || !process.env.ELECTRON_RENDERER_URL,
+      configLoaded: !!config.FUTU_WS_KEY && !!config.FUTU_HOST && !!config.FUTU_WS_PORT
+    }
     logToConsole(`[DataService] 获取富途K线数据失败 ${stock.code}: ${errorMsg}`)
-    console.error(`[DataService] Failed to fetch kline data from Futu for ${stock.code}:`, error)
+    console.error(`[DataService] Failed to fetch kline data from Futu for ${stock.code}:`, errorDetails)
+    console.error(`[DataService] Full error:`, error)
     return []
   }
 }
