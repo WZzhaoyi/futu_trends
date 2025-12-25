@@ -269,6 +269,8 @@ const handleSaveConfig = async (config: any) => {
       FUTU_GROUP: config.FUTU_GROUP,
       FUTU_CODE_LIST: config.FUTU_CODE_LIST,
       FUTU_PUSH_TYPE: config.FUTU_PUSH_TYPE,
+      AKTOOLS_HOST: config.AKTOOLS_HOST,
+      AKTOOLS_PORT: config.AKTOOLS_PORT,
       EMA_PERIOD: config.EMA_PERIOD,
       KD_PARAMS_DB: config.KD_PARAMS_DB,
       MACD_PARAMS_DB: config.MACD_PARAMS_DB,

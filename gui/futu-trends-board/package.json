@@ -23,6 +23,7 @@
     "@electron-toolkit/preload": "^3.0.2",
     "@electron-toolkit/utils": "^4.0.0",
     "@types/iconv-lite": "^0.0.1",
+    "axios": "^1.13.2",
     "electron-updater": "^6.3.9",
     "futu-proto": "^9.4.5409",
     "futu-sdk": "^0.2.6",
@@ -77,16 +78,23 @@
       "**/node_modules/ws/**/*"
     ],
     "win": {
-      "target": ["nsis"],
+      "target": [
+        "nsis"
+      ],
       "icon": "resources/icon.ico"
     },
     "mac": {
-      "target": ["dmg"],
+      "target": [
+        "dmg"
+      ],
       "icon": "resources/icon.icns",
       "category": "public.app-category.finance"
     },
     "linux": {
-      "target": ["AppImage", "deb"],
+      "target": [
+        "AppImage",
+        "deb"
+      ],
       "icon": "resources/icon.png",
       "category": "Finance"
     },

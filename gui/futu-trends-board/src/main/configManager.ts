@@ -16,6 +16,10 @@ export interface AppConfig {
   FUTU_CODE_LIST?: string
   FUTU_PUSH_TYPE?: string
 
+  // AkTools 配置
+  AKTOOLS_HOST?: string
+  AKTOOLS_PORT?: number
+
   // 技术指标配置
   EMA_PERIOD?: number
   KD_PARAMS_DB?: string
@@ -84,6 +88,14 @@ export function parseConfigFile(filePath: string): AppConfig {
 
     if (configSection.FUTU_PUSH_TYPE) {
       appConfig.FUTU_PUSH_TYPE = configSection.FUTU_PUSH_TYPE
+    }
+
+    if (configSection.AKTOOLS_HOST) {
+      appConfig.AKTOOLS_HOST = configSection.AKTOOLS_HOST
+    }
+
+    if (configSection.AKTOOLS_PORT) {
+      appConfig.AKTOOLS_PORT = parseInt(configSection.AKTOOLS_PORT, 10)
     }
 
     if (configSection.EMA_PERIOD) {
@@ -204,6 +216,8 @@ export function saveConfig(config: AppConfig, filePath?: string): string {
         FUTU_GROUP: config.FUTU_GROUP || '',
         FUTU_CODE_LIST: config.FUTU_CODE_LIST || '',
         FUTU_PUSH_TYPE: config.FUTU_PUSH_TYPE || 'K_DAY',
+        AKTOOLS_HOST: config.AKTOOLS_HOST || '127.0.0.1',
+        AKTOOLS_PORT: config.AKTOOLS_PORT || 8080,
         EMA_PERIOD: config.EMA_PERIOD || 240,
         KD_PARAMS_DB: config.KD_PARAMS_DB || '',
         MACD_PARAMS_DB: config.MACD_PARAMS_DB || '',

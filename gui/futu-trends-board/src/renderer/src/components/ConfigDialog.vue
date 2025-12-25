@@ -108,6 +108,30 @@
           />
         </n-form-item>
 
+        <!-- AkShare 数据源配置 -->
+        <n-divider title-placement="left">AkShare 数据源配置（可选）</n-divider>
+
+        <n-form-item label="AkTools 主机地址" path="AKTOOLS_HOST">
+          <n-input
+            v-model:value="formData.AKTOOLS_HOST"
+            placeholder="127.0.0.1"
+          />
+        </n-form-item>
+
+        <n-form-item label="AkTools 端口" path="AKTOOLS_PORT">
+          <n-input-number
+            v-model:value="formData.AKTOOLS_PORT"
+            :show-button="false"
+            placeholder="8080"
+            style="width: 100%"
+          />
+        </n-form-item>
+
+        <n-alert type="info" style="margin-bottom: 16px;">
+          使用 AkShare 数据源前，请先启动 AkTools 服务：
+          <code style="display: block; margin-top: 8px;">python -m aktools --host 127.0.0.1 --port 8080</code>
+        </n-alert>
+
         <!-- 技术指标配置 -->
         <n-divider title-placement="left">技术指标配置（可选）</n-divider>
 
@@ -208,6 +232,8 @@ interface ConfigData {
   FUTU_GROUP: string
   FUTU_CODE_LIST: string
   FUTU_PUSH_TYPE: string
+  AKTOOLS_HOST: string
+  AKTOOLS_PORT: number | null
   EMA_PERIOD: number | null
   KD_PARAMS_DB: string
   MACD_PARAMS_DB: string
@@ -264,6 +290,8 @@ const formData = ref<ConfigData>({
   FUTU_GROUP: '',
   FUTU_CODE_LIST: 'SH.510300,SH.000985,SH.000902',
   FUTU_PUSH_TYPE: 'K_DAY',
+  AKTOOLS_HOST: '127.0.0.1',
+  AKTOOLS_PORT: 8080,
   EMA_PERIOD: 240,
   KD_PARAMS_DB: '',
   MACD_PARAMS_DB: '',
@@ -319,6 +347,8 @@ const loadCurrentConfig = async () => {
         FUTU_GROUP: config.FUTU_GROUP || '',
         FUTU_CODE_LIST: config.FUTU_CODE_LIST || 'SH.510300,SH.000985,SH.000902',
         FUTU_PUSH_TYPE: config.FUTU_PUSH_TYPE || 'K_DAY',
+        AKTOOLS_HOST: config.AKTOOLS_HOST || '127.0.0.1',
+        AKTOOLS_PORT: config.AKTOOLS_PORT ? Number(config.AKTOOLS_PORT) : 8080,
         EMA_PERIOD: config.EMA_PERIOD ? Number(config.EMA_PERIOD) : 240,
         KD_PARAMS_DB: config.KD_PARAMS_DB || '',
         MACD_PARAMS_DB: config.MACD_PARAMS_DB || '',
@@ -358,6 +388,8 @@ const handleImportConfig = async () => {
         FUTU_GROUP: result.config.FUTU_GROUP || formData.value.FUTU_GROUP,
         FUTU_CODE_LIST: result.config.FUTU_CODE_LIST || formData.value.FUTU_CODE_LIST,
         FUTU_PUSH_TYPE: result.config.FUTU_PUSH_TYPE || formData.value.FUTU_PUSH_TYPE,
+        AKTOOLS_HOST: result.config.AKTOOLS_HOST || formData.value.AKTOOLS_HOST,
+        AKTOOLS_PORT: result.config.AKTOOLS_PORT ? Number(result.config.AKTOOLS_PORT) : formData.value.AKTOOLS_PORT,
         EMA_PERIOD: result.config.EMA_PERIOD ? Number(result.config.EMA_PERIOD) : formData.value.EMA_PERIOD,
         KD_PARAMS_DB: result.config.KD_PARAMS_DB || formData.value.KD_PARAMS_DB,
         MACD_PARAMS_DB: result.config.MACD_PARAMS_DB || formData.value.MACD_PARAMS_DB,
@@ -389,6 +421,8 @@ const handleResetToDefault = () => {
     FUTU_GROUP: '',
     FUTU_CODE_LIST: 'SH.510300,SH.000985,SH.000902',
     FUTU_PUSH_TYPE: 'K_DAY',
+    AKTOOLS_HOST: '127.0.0.1',
+    AKTOOLS_PORT: 8080,
     EMA_PERIOD: 240,
     KD_PARAMS_DB: '',
     MACD_PARAMS_DB: '',
@@ -419,6 +453,8 @@ const handleSave = async () => {
       FUTU_GROUP: formData.value.FUTU_GROUP,
       FUTU_CODE_LIST: formData.value.FUTU_CODE_LIST,
       FUTU_PUSH_TYPE: formData.value.FUTU_PUSH_TYPE,
+      AKTOOLS_HOST: formData.value.AKTOOLS_HOST,
+      AKTOOLS_PORT: formData.value.AKTOOLS_PORT,
       EMA_PERIOD: formData.value.EMA_PERIOD,
       KD_PARAMS_DB: formData.value.KD_PARAMS_DB,
       MACD_PARAMS_DB: formData.value.MACD_PARAMS_DB,

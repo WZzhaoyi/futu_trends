@@ -6,6 +6,7 @@ import { getConfig } from './configManager'
 import { calculateIndicators } from './indicators'
 import type { Stock, KlineData, ChartData, IndicatorResult, StockListResult } from '../types'
 import iconv from 'iconv-lite'
+import axios from 'axios'
 
 // 创建 Yahoo Finance 实例（v3 API）
 // 可选配置：suppressNotices、validation 等
@@ -215,6 +216,132 @@ export async function getYahooKlineData(stock: Stock, maxCount: number = 1200): 
   } catch (error) {
     console.error(`[DataService] Failed to fetch kline data for ${stock.code} from Yahoo:`, error)
     throw error
+  }
+}
+
+/**
+ * 从 AkShare (通过 AkTools HTTP API) 获取K线数据
+ * @param stock 股票对象
+ * @param maxCount 最大K线数量
+ */
+export async function getAkShareKlineData(stock: Stock, maxCount: number = 1200): Promise<KlineData[]> {
+  const config = getConfig()
+  
+  if (!config.AKTOOLS_HOST || !config.AKTOOLS_PORT) {
+    console.warn('[DataService] AkTools connection parameters not configured')
+    return []
+  }
+
+  try {
+    // 解析股票代码
+    const parts = stock.code.split('.')
+    if (parts.length !== 2) {
+      throw new Error(`Invalid stock code format: ${stock.code}`)
+    }
+    
+    const [market, code] = parts
+    
+    // AkShare 只支持A股（SH和SZ市场）
+    if (market !== 'SH' && market !== 'SZ') {
+      console.warn(`[DataService] AkShare only supports A-share markets (SH/SZ), got: ${market}`)
+      return []
+    }
+
+    // 计算日期范围
+    const endDate = new Date()
+    const startDate = new Date()
+    // 多请求一些天数以确保获取足够的交易日数据
+    const daysNeeded = Math.ceil((maxCount * 7) / 5 * 1.5)
+    startDate.setDate(endDate.getDate() - daysNeeded)
+
+    // 格式化日期为 YYYYMMDD
+    const formatDate = (date: Date): string => {
+      const year = date.getFullYear()
+      const month = String(date.getMonth() + 1).padStart(2, '0')
+      const day = String(date.getDate()).padStart(2, '0')
+      return `${year}${month}${day}`
+    }
+
+    const startDateStr = formatDate(startDate)
+    const endDateStr = formatDate(endDate)
+
+    console.log('[DataService] Fetching AkShare kline:', {
+      stock: stock.code,
+      market,
+      code,
+      startDate: startDateStr,
+      endDate: endDateStr,
+      maxCount
+    })
+
+    // 构建 AkTools API URL
+    // 使用 stock_zh_a_hist 接口获取A股历史数据
+    const aktoolsUrl = `http://${config.AKTOOLS_HOST}:${config.AKTOOLS_PORT}/api/public/stock_zh_a_hist`
+    const params = {
+      symbol: code,  // 只传代码，不带市场前缀
+      period: 'daily',  // 日K线
+      start_date: startDateStr,
+      end_date: endDateStr,
+      adjust: 'qfq'  // 前复权
+    }
+
+    console.log('[DataService] Requesting AkTools API:', aktoolsUrl, params)
+
+    // 发送HTTP请求
+    const response = await axios.get(aktoolsUrl, {
+      params,
+      timeout: 30000  // 30秒超时
+    })
+
+    if (!response.data || !Array.isArray(response.data)) {
+      console.warn('[DataService] Invalid response from AkTools:', response.data)
+      return []
+    }
+
+    console.log('[DataService] Received data from AkTools:', {
+      totalRecords: response.data.length,
+      sample: response.data[0]
+    })
+
+    // 转换数据格式
+    // AkShare 返回的数据格式：
+    // { 日期: '2021-11-09', 开盘: 3014.70, 收盘: 3024.46, 最高: 3042.33, 最低: 2990.33, 成交量: 512595, 成交额: 895105984, ... }
+    const klines: KlineData[] = response.data
+      .filter((item: any) => {
+        // 过滤掉无效数据
+        return item && item['日期'] && item['收盘']
+      })
+      .map((item: any) => ({
+        time: item['日期'],  // 日期格式: YYYY-MM-DD
+        open: parseFloat(item['开盘'] || item['收盘']),
+        high: parseFloat(item['最高'] || item['收盘']),
+        low: parseFloat(item['最低'] || item['收盘']),
+        close: parseFloat(item['收盘']),
+        volume: parseInt(item['成交量'] || 0, 10)
+      }))
+
+    // 按时间排序并限制数量
+    const sortedKlines = klines.sort((a, b) => a.time.localeCompare(b.time))
+    const limitedKlines = sortedKlines.slice(-maxCount)
+
+    console.log(`[DataService] Successfully fetched ${limitedKlines.length} klines from AkShare for ${stock.code}`)
+    
+    if (limitedKlines.length > 0) {
+      console.log('[DataService] Sample kline data:', {
+        first: limitedKlines[0],
+        last: limitedKlines[limitedKlines.length - 1]
+      })
+    }
+
+    return limitedKlines
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error)
+    console.error(`[DataService] Failed to fetch kline data from AkShare for ${stock.code}:`, {
+      error: errorMsg,
+      stack: error instanceof Error ? error.stack : undefined,
+      aktoolsUrl: `http://${config.AKTOOLS_HOST}:${config.AKTOOLS_PORT}`
+    })
+    return []
   }
 }
 
@@ -514,6 +641,8 @@ export async function getChartData(stockCode: string, maxCount: number=1200): Pr
     klines = await getFutuKlineData(stock, klineCount)
   } else if (dataSource === 'yfinance') {
     klines = await getYahooKlineData(stock, klineCount)
+  } else if (dataSource === 'akshare') {
+    klines = await getAkShareKlineData(stock, klineCount)
   } else {
     throw new Error(`Unsupported data source: ${dataSource}`)
   }
