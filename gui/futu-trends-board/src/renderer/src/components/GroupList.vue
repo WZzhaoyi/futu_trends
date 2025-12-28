@@ -115,6 +115,17 @@ const showConfigDialog = ref(false);
 const isElectron = typeof window !== 'undefined' && window.electronAPI !== undefined;
 
 /**
+ * 更新窗口标题
+ */
+ const updateWindowTitle = (code: string | null) => {
+  if (code && window.electronAPI) {
+    window.electronAPI.setWindowTitle(code).catch((error: any) => {
+      console.error('[GroupList] Failed to update window title:', error);
+    });
+  }
+};
+
+/**
  * 加载股票列表
  */
 const loadStocks = async () => {
@@ -332,6 +343,7 @@ const handleOpenLogDir = async () => {
 
 // 加载数据
 onMounted(() => {
+  updateWindowTitle('Group List');
   // 直接加载股票列表（会自动从主进程获取配置）
   loadStocks();
 });

@@ -10,11 +10,26 @@ from configparser import ConfigParser
 import pandas as pd
 from data import get_kline_data
 from ft_config import get_config
+from params_db import ParamsDB
 import json
 from datetime import datetime
 from tools import code_in_futu_group, sanitize_path_component
 
+"""
+    运行分析
+    code_list: 股票代码列表
+    indicator_type: 指标类型
+    config: 配置文件
+    output_dir: 输出目录
+    data_dir: 数据目录
+    cache_expiry_days: 缓存过期时间
+    return: 结果字典, 结果文件路径
+"""
 def run_analysis(code_list:pd.DataFrame, indicator_type:str, config:ConfigParser, output_dir='./output', data_dir='./data/detect', cache_expiry_days=1):
+    if code_list.empty:
+        print(f'warning: {indicator_type} code_list is empty')
+        return {}
+    
     # 确保输出目录存在
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(data_dir, exist_ok=True)
@@ -78,7 +93,7 @@ def run_analysis(code_list:pd.DataFrame, indicator_type:str, config:ConfigParser
         json.dump(results, f, indent=4)
     
     print(f"\nAnalysis complete. Results saved to {output_dir}")
-    return results
+    return results, summary_file
 
 if __name__ == '__main__':
     config = get_config()
@@ -86,6 +101,11 @@ if __name__ == '__main__':
     host = config.get("CONFIG", "FUTU_HOST")
     port = int(config.get("CONFIG", "FUTU_PORT"))
     group = config.get("CONFIG", "FUTU_GROUP", fallback='')
+    # True->检查PARAMS_DB中是否存在参数 如果存在则不进行训练
+    params_check = config.getboolean("CONFIG", "PARAMS_CHECK", fallback=False)
+    # True->将训练结果更新到PARAMS_DB中
+    params_update = config.getboolean("CONFIG", "PARAMS_UPDATE", fallback=False)
+
     code_list = config.get("CONFIG", "FUTU_CODE_LIST", fallback='').split(',')
     code_list = [code for code in code_list if code.strip()]
 
@@ -112,13 +132,34 @@ if __name__ == '__main__':
     # 确保code_pd是DataFrame类型
     assert isinstance(code_pd, pd.DataFrame), "code_pd must be a DataFrame"
     for trend_type in trend_types:
+        pd_code_list = code_pd.copy()
         indicator_dict = {
             'reverse': 'KD',
             'continue': 'MACD',
             'topdown': 'RSI'
         }
+        params_db_dict = {
+            'reverse': config.get("CONFIG", "KD_PARAMS_DB", fallback=None),
+            'continue': config.get("CONFIG", "MACD_PARAMS_DB", fallback=None),
+            'topdown': config.get("CONFIG", "RSI_PARAMS_DB", fallback=None)
+        }
         if trend_type not in indicator_dict:
             raise ValueError(f"Invalid trend type: {trend_type}")
         indicator_type = indicator_dict[trend_type]
+        params_db = params_db_dict[trend_type]
+        
+        if params_db is not None and params_check is True:
+            db = ParamsDB(params_db)
+            # 逐个code查询是否存在参数 如果存在则剔除pd_code_list中的该行
+            for code in pd_code_list['code'].values:
+                data = db.get_stock_params(code)
+                if data is not None and data['best_params']:
+                    pd_code_list = pd_code_list[pd_code_list['code'] != code]
+                    print(f"code {code} already has parameters in {trend_type} database, skipping training")
+        
         output_dir = f'./output/detect_{timestamp}_{ktype}_{sanitize_path_component(group)}_{indicator_type}'
-        results = run_analysis(code_pd, indicator_type, config, output_dir=output_dir)
+        results, result_file = run_analysis(pd_code_list, indicator_type, config, output_dir=output_dir)
+
+        if params_db is not None and params_update is True:
+            db = ParamsDB(params_db, init_db=True)
+            db.import_params(result_file)

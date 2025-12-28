@@ -355,7 +355,7 @@ const loadCurrentConfig = async () => {
         RSI_PARAMS_DB: config.RSI_PARAMS_DB || '',
         PROXY: config.PROXY || '',
         DATA_DIR: config.DATA_DIR || './data/detect',
-        DARK_MODE: config.DARK_MODE === 'True' || config.DARK_MODE === true
+        DARK_MODE: config.DARK_MODE ?? true
       }
       
       console.log('[ConfigDialog] Current config loaded:', formData.value)
@@ -396,7 +396,7 @@ const handleImportConfig = async () => {
         RSI_PARAMS_DB: result.config.RSI_PARAMS_DB || formData.value.RSI_PARAMS_DB,
         PROXY: result.config.PROXY || formData.value.PROXY,
         DATA_DIR: result.config.DATA_DIR || formData.value.DATA_DIR,
-        DARK_MODE: result.config.DARK_MODE === 'True' || result.config.DARK_MODE === true
+        DARK_MODE: result.config.DARK_MODE ?? formData.value.DARK_MODE
       }
       
       message.success(`已从 ${result.path} 导入配置`)

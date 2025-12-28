@@ -630,7 +630,7 @@ export async function getChartData(stockCode: string, maxCount: number=1200): Pr
 
   // 2. 确定K线数量
   const config = getConfig()
-  const klineCount = maxCount || config.EMA_PERIOD || 200
+  const klineCount = maxCount || 1200
   const dataSource = config.DATA_SOURCE || 'futu'
 
   // 3. 获取K线数据（传递完整的 Stock 对象）

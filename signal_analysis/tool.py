@@ -15,6 +15,7 @@ from multiprocessing import Pool, cpu_count
 import matplotlib.collections as mcoll
 import matplotlib.dates as mdates
 import warnings
+import logging
 
 # 过滤 FutureWarning 警告
 warnings.filterwarnings('ignore', category=FutureWarning, message='.*DataFrame.swapaxes.*')
@@ -452,16 +453,25 @@ def run_bayes_optimization(args):
         
         return False, {}  # 返回元组 (stop, kwargs)
     
-    # 执行贝叶斯优化
-    best = fmin(
-        fn=objective,
-        space=space,
-        algo=tpe.suggest,
-        max_evals=max_evals,
-        trials=trials,
-        early_stop_fn=early_stop_fn,
-        verbose=False
-    )
+    # 关闭hyperopt的日志输出
+    hyperopt_logger = logging.getLogger('hyperopt')
+    original_level = hyperopt_logger.level
+    hyperopt_logger.setLevel(logging.WARNING)
+    
+    try:
+        # 执行贝叶斯优化
+        best = fmin(
+            fn=objective,
+            space=space,
+            algo=tpe.suggest,
+            max_evals=max_evals,
+            trials=trials,
+            early_stop_fn=early_stop_fn,
+            verbose=False
+        )
+    finally:
+        # 恢复原始日志级别
+        hyperopt_logger.setLevel(original_level)
     
     score = -trials.best_trial['result']['loss']
     return score, best
