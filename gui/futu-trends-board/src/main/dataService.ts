@@ -7,21 +7,133 @@ import { calculateIndicators } from './indicators'
 import type { Stock, KlineData, ChartData, IndicatorResult, StockListResult } from '../types'
 import iconv from 'iconv-lite'
 import axios from 'axios'
+import { ProxyAgent }  from 'undici'
+import * as fs from 'fs'
+import * as path from 'path'
 
 // 创建 Yahoo Finance 实例（v3 API）
 // 可选配置：suppressNotices、validation 等
 // 注意：通过 electron-vite 配置将 yahoo-finance2 打包，确保 ES 模块默认导出被正确处理
+// fetch 函数每次调用时都从 getConfig() 读取最新配置，支持配置动态更新
 const yahooFinance = new YahooFinance({
   // 禁用通知提示
   suppressNotices: ['yahooSurvey'],
   // 开启验证（推荐，默认已开启）
   validation: {
     logErrors: true
+  },
+  fetch: (url, options) => {
+    // 每次请求时都读取最新的代理配置，而不是在初始化时捕获
+    // 这样当配置更新时，下次请求会自动使用新的代理设置
+    const proxy = getConfig().PROXY
+    if (!proxy) {
+      return fetch(url, options)
+    }
+    const proxyAgent = new ProxyAgent(proxy)
+    return fetch(url, {
+      ...options,
+      dispatcher: proxyAgent
+    })
   }
 })
 
 // 重新导出类型供主进程使用
 export type { Stock, KlineData, ChartData, IndicatorResult, StockListResult }
+
+// 美股代码列表缓存
+let usStocksCache: Array<{ 代码: string; [key: string]: any }> | null = null
+const CACHE_EXPIRE_DAYS = 30
+
+/**
+ * 获取数据目录路径（从配置中读取，如果没有则使用默认值）
+ */
+function getDataDir(config: ReturnType<typeof getConfig>): string {
+  if (config.DATA_DIR) {
+    // 如果是相对路径，则基于 process.cwd() 解析
+    return path.isAbsolute(config.DATA_DIR) 
+      ? config.DATA_DIR 
+      : path.join(process.cwd(), config.DATA_DIR)
+  }
+  // 默认使用 './data'，与 Python 代码保持一致
+  return path.join(process.cwd(), 'data')
+}
+
+/**
+ * 获取美股代码列表，使用缓存避免重复调用
+ * 参考 Python 代码中的 get_us_stocks() 函数
+ */
+async function getUsStocks(config: ReturnType<typeof getConfig>): Promise<Array<{ 代码: string; [key: string]: any }>> {
+  // 如果内存缓存存在，直接返回
+  if (usStocksCache !== null) {
+    return usStocksCache
+  }
+
+  // 从配置中获取数据目录
+  const dataDir = getDataDir(config)
+  
+  // 准备缓存文件路径
+  const cacheFile = path.join(dataDir, 'us_stocks.json')
+  
+  // 确保数据目录存在
+  if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true })
+  }
+
+  // 检查缓存文件是否存在且未过期
+  if (fs.existsSync(cacheFile)) {
+    try {
+      const stats = fs.statSync(cacheFile)
+      const fileMtime = new Date(stats.mtime)
+      const now = new Date()
+      const daysDiff = (now.getTime() - fileMtime.getTime()) / (1000 * 60 * 60 * 24)
+      
+      if (daysDiff < CACHE_EXPIRE_DAYS) {
+        const cacheData = fs.readFileSync(cacheFile, 'utf-8')
+        usStocksCache = JSON.parse(cacheData)
+        console.log(`[DataService] Loaded ${usStocksCache?.length || 0} US stocks from cache`)
+        return usStocksCache || []
+      }
+    } catch (error) {
+      console.warn('[DataService] Failed to read US stocks cache:', error)
+    }
+  }
+
+  // 如果缓存不存在或已过期，重新获取数据
+  if (!config.AKTOOLS_HOST || !config.AKTOOLS_PORT) {
+    console.warn('[DataService] AkTools not configured, cannot fetch US stocks list')
+    return []
+  }
+
+  try {
+    const aktoolsUrl = `http://${config.AKTOOLS_HOST}:${config.AKTOOLS_PORT}/api/public/stock_us_spot_em`
+    console.log('[DataService] Fetching US stocks list from AkTools:', aktoolsUrl)
+    
+    const response = await axios.get(aktoolsUrl, {
+      timeout: 300000
+    })
+
+    if (!response.data || !Array.isArray(response.data)) {
+      console.warn('[DataService] Invalid US stocks response from AkTools:', response.data)
+      return []
+    }
+
+    usStocksCache = response.data
+
+    // 保存到缓存文件
+    try {
+      fs.writeFileSync(cacheFile, JSON.stringify(usStocksCache, null, 2), 'utf-8')
+      console.log(`[DataService] Cached ${usStocksCache.length} US stocks to file`)
+    } catch (error) {
+      console.warn('[DataService] Failed to write US stocks cache:', error)
+    }
+
+    return usStocksCache
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error)
+    console.error('[DataService] Failed to fetch US stocks list:', errorMsg)
+    return []
+  }
+}
 
 /**
  * 辅助函数：处理 PowerShell 中文输出
@@ -221,6 +333,7 @@ export async function getYahooKlineData(stock: Stock, maxCount: number = 1200): 
 
 /**
  * 从 AkShare (通过 AkTools HTTP API) 获取K线数据
+ * 支持A股（SH/SZ）、港股（HK）和美股（US）
  * @param stock 股票对象
  * @param maxCount 最大K线数量
  */
@@ -241,12 +354,6 @@ export async function getAkShareKlineData(stock: Stock, maxCount: number = 1200)
     
     const [market, code] = parts
     
-    // AkShare 只支持A股（SH和SZ市场）
-    if (market !== 'SH' && market !== 'SZ') {
-      console.warn(`[DataService] AkShare only supports A-share markets (SH/SZ), got: ${market}`)
-      return []
-    }
-
     // 计算日期范围
     const endDate = new Date()
     const startDate = new Date()
@@ -274,23 +381,79 @@ export async function getAkShareKlineData(stock: Stock, maxCount: number = 1200)
       maxCount
     })
 
-    // 构建 AkTools API URL
-    // 使用 stock_zh_a_hist 接口获取A股历史数据
-    const aktoolsUrl = `http://${config.AKTOOLS_HOST}:${config.AKTOOLS_PORT}/api/public/stock_zh_a_hist`
-    const params = {
-      symbol: code,  // 只传代码，不带市场前缀
-      period: 'daily',  // 日K线
-      start_date: startDateStr,
-      end_date: endDateStr,
-      adjust: 'qfq'  // 前复权
+    let aktoolsUrl: string
+    let params: Record<string, any>
+
+    // 根据市场类型选择不同的API
+    if (market === 'SH' || market === 'SZ') {
+      // A股数据
+      aktoolsUrl = `http://${config.AKTOOLS_HOST}:${config.AKTOOLS_PORT}/api/public/stock_zh_a_hist`
+      params = {
+        symbol: code,  // 只传代码，不带市场前缀
+        period: 'daily',  // 日K线
+        start_date: startDateStr,
+        end_date: endDateStr,
+        adjust: 'qfq'  // 前复权
+      }
+    } else if (market === 'US') {
+      // 美股数据
+      // 参考 Python 代码：需要先获取美股代码列表，然后匹配代码
+      const usStocks = await getUsStocks(config)
+      
+      // 查找匹配的股票代码
+      // Python 代码逻辑：us_stocks[us_stocks['代码'].str.split('.').str[1] == raw_code]
+      const matchedStock = usStocks.find((stockItem) => {
+        const stockCode = stockItem['代码']
+        if (!stockCode || typeof stockCode !== 'string') {
+          return false
+        }
+        // 提取代码的后半部分（去掉市场前缀）
+        const codeParts = stockCode.split('.')
+        if (codeParts.length === 2) {
+          return codeParts[1] === code
+        }
+        return false
+      })
+
+      if (!matchedStock || !matchedStock['代码']) {
+        console.warn(`[DataService] US stock code not found in stock list: ${stock.code}`)
+        return []
+      }
+
+      const fullSymbol = matchedStock['代码']
+      console.log(`[DataService] Matched US stock: ${code} -> ${fullSymbol}`)
+
+      aktoolsUrl = `http://${config.AKTOOLS_HOST}:${config.AKTOOLS_PORT}/api/public/stock_us_hist`
+      params = {
+        symbol: fullSymbol,  // 使用完整的东财代码
+        period: 'daily',  // 日K线
+        start_date: startDateStr,
+        end_date: endDateStr,
+        adjust: 'qfq'  // 前复权
+      }
+    } else if (market === 'HK') {
+      // 港股数据
+      // 参考 Python 代码：直接使用原始代码，不需要代码匹配
+      aktoolsUrl = `http://${config.AKTOOLS_HOST}:${config.AKTOOLS_PORT}/api/public/stock_hk_hist`
+      params = {
+        symbol: code,  // 只传代码，不带市场前缀
+        period: 'daily',  // 日K线
+        start_date: startDateStr,
+        end_date: endDateStr,
+        adjust: 'qfq'  // 前复权
+      }
+    } else {
+      console.warn(`[DataService] AkShare does not support market: ${market}`)
+      return []
     }
 
     console.log('[DataService] Requesting AkTools API:', aktoolsUrl, params)
 
     // 发送HTTP请求
+    // 首次读取历史数据可能需要较长时间（特别是美股数据），设置较长的超时时间
     const response = await axios.get(aktoolsUrl, {
       params,
-      timeout: 30000  // 30秒超时
+      timeout: 300000  // 300秒（5分钟）超时，确保首次读取有足够时间
     })
 
     if (!response.data || !Array.isArray(response.data)) {

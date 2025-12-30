@@ -1,6 +1,6 @@
 {
   "name": "futu-trends-board",
-  "version": "0.0.1",
+  "version": "0.0.3",
   "description": "股票趋势分析工具 - 支持多数据源和自定义技术指标",
   "main": "./out/main/index.js",
   "author": "Joey",
@@ -33,6 +33,7 @@
     "mongodb": "^7.0.0",
     "naive-ui": "^2.43.2",
     "sql.js": "^1.13.0",
+    "undici": "^7.16.0",
     "ws": "^8.18.0",
     "yahoo-finance2": "^3.10.2"
   },
