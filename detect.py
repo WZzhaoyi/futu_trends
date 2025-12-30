@@ -148,6 +148,12 @@ if __name__ == '__main__':
         indicator_type = indicator_dict[trend_type]
         params_db = params_db_dict[trend_type]
         
+        # 参数数据库 支持mongodb和sqlite 多个数据库用逗号分隔 PARAMS_CHECK以首个数据库为准 PARAMS_UPDATE为所有数据库更新 
+        db_list = []
+        if params_db is not None and len(params_db.split(',')) >= 1:
+            db_list = params_db.split(',')
+            params_db = db_list[0]
+        
         if params_db is not None and params_check is True:
             db = ParamsDB(params_db)
             # 逐个code查询是否存在参数 如果存在则剔除pd_code_list中的该行
@@ -160,6 +166,7 @@ if __name__ == '__main__':
         output_dir = f'./output/detect_{timestamp}_{ktype}_{sanitize_path_component(group)}_{indicator_type}'
         results, result_file = run_analysis(pd_code_list, indicator_type, config, output_dir=output_dir)
 
-        if params_db is not None and params_update is True:
-            db = ParamsDB(params_db, init_db=True)
-            db.import_params(result_file)
+        if params_db is not None and params_update is True and len(db_list) >= 1:
+            for db_path in db_list:
+                db = ParamsDB(db_path, init_db=True)
+                db.import_params(result_file)
