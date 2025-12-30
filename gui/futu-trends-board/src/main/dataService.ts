@@ -10,6 +10,8 @@ import axios from 'axios'
 import { ProxyAgent }  from 'undici'
 import * as fs from 'fs'
 import * as path from 'path'
+import { parse } from 'csv-parse/sync'
+import { stringify } from 'csv-stringify/sync'
 
 // 创建 Yahoo Finance 实例（v3 API）
 // 可选配置：suppressNotices、validation 等
@@ -54,8 +56,125 @@ function getDataDir(config: ReturnType<typeof getConfig>): string {
       ? config.DATA_DIR 
       : path.join(process.cwd(), config.DATA_DIR)
   }
-  // 默认使用 './data'，与 Python 代码保持一致
-  return path.join(process.cwd(), 'data')
+  // 默认使用 './data/detect'，与 Python 代码保持一致
+  return path.join(process.cwd(), 'data', 'detect')
+}
+
+/**
+ * 生成缓存文件名
+ * 参考 Python 代码：data_{code.replace(".", "_")}_{ktype}.csv
+ */
+function getCacheFileName(stockCode: string, ktype: string): string {
+  const sanitizedCode = stockCode.replace(/\./g, '_')
+  return `data_${sanitizedCode}_${ktype}.csv`
+}
+
+/**
+ * 从 CSV 文件读取 K线数据
+ */
+function readKlineDataFromCache(cacheFile: string): KlineData[] | null {
+  try {
+    if (!fs.existsSync(cacheFile)) {
+      return null
+    }
+
+    const csvContent = fs.readFileSync(cacheFile, 'utf-8')
+    const records = parse(csvContent, {
+      columns: true,
+      skip_empty_lines: true,
+      trim: true
+    })
+
+    if (!records || records.length === 0) {
+      return null
+    }
+
+    // 转换 CSV 记录为 KlineData 格式
+    // CSV 格式：time_key,code,name,open,close,high,low,...,volume,...
+    // 或者：time_key,open,high,low,close,volume（简化格式）
+    const klines: KlineData[] = records.map((record: any) => {
+      // 时间字段：优先使用 time_key，否则使用第一列
+      const time = record.time_key || record[Object.keys(record)[0]] || ''
+      
+      // 支持中英文列名
+      const open = parseFloat(record.open || record['开盘'] || '0')
+      const high = parseFloat(record.high || record['最高'] || '0')
+      const low = parseFloat(record.low || record['最低'] || '0')
+      const close = parseFloat(record.close || record['收盘'] || '0')
+      const volume = parseInt(record.volume || record['成交量'] || '0', 10)
+      
+      return {
+        time: time,
+        open: isNaN(open) ? 0 : open,
+        high: isNaN(high) ? 0 : high,
+        low: isNaN(low) ? 0 : low,
+        close: isNaN(close) ? 0 : close,
+        volume: isNaN(volume) ? 0 : volume
+      }
+    }).filter(kline => kline.time && kline.time !== '') // 过滤掉无效的时间数据
+
+    return klines
+  } catch (error) {
+    console.warn(`[DataService] Failed to read cache file ${cacheFile}:`, error)
+    return null
+  }
+}
+
+/**
+ * 将 K线数据保存到 CSV 文件
+ */
+function saveKlineDataToCache(cacheFile: string, klines: KlineData[]): void {
+  try {
+    // 确保目录存在
+    const cacheDir = path.dirname(cacheFile)
+    if (!fs.existsSync(cacheDir)) {
+      fs.mkdirSync(cacheDir, { recursive: true })
+    }
+
+    // 转换为 CSV 格式
+    // CSV 格式：time_key,open,high,low,close,volume
+    const records = klines.map(kline => ({
+      time_key: kline.time,
+      open: kline.open.toString(),
+      high: kline.high.toString(),
+      low: kline.low.toString(),
+      close: kline.close.toString(),
+      volume: kline.volume.toString()
+    }))
+
+    const csvContent = stringify(records, {
+      header: true,
+      columns: ['time_key', 'open', 'high', 'low', 'close', 'volume']
+    })
+
+    fs.writeFileSync(cacheFile, csvContent, 'utf-8')
+    console.log(`[DataService] Cached ${klines.length} klines to ${cacheFile}`)
+  } catch (error) {
+    console.warn(`[DataService] Failed to save cache file ${cacheFile}:`, error)
+  }
+}
+
+/**
+ * 检查缓存文件是否有效（未过期）
+ * @param cacheFile 缓存文件路径
+ * @param cacheExpiryDays 缓存过期天数，默认1天
+ */
+function isCacheValid(cacheFile: string, cacheExpiryDays: number = 1): boolean {
+  if (!fs.existsSync(cacheFile)) {
+    return false
+  }
+
+  try {
+    const stats = fs.statSync(cacheFile)
+    const fileMtime = new Date(stats.mtime)
+    const now = new Date()
+    const daysDiff = (now.getTime() - fileMtime.getTime()) / (1000 * 60 * 60 * 24)
+    
+    return daysDiff <= cacheExpiryDays
+  } catch (error) {
+    console.warn(`[DataService] Failed to check cache validity for ${cacheFile}:`, error)
+    return false
+  }
 }
 
 /**
@@ -779,8 +898,12 @@ export async function getFutuKlineData(stock: Stock, maxCount: number = 1200): P
 
 /**
  * 获取完整的图表数据（K线 + 指标）
+ * 包含缓存机制，对所有数据源透明，参考 Python 代码的缓存逻辑
+ * @param stockCode 股票代码
+ * @param maxCount 最大K线数量
+ * @param cacheExpiryDays 缓存过期天数，默认1天
  */
-export async function getChartData(stockCode: string, maxCount: number=1200): Promise<ChartData> {
+export async function getChartData(stockCode: string, maxCount: number=1300, cacheExpiryDays: number = 1): Promise<ChartData> {
   console.log('[DataService] Getting chart data for:', stockCode)
 
   // 1. 获取股票信息
@@ -791,36 +914,64 @@ export async function getChartData(stockCode: string, maxCount: number=1200): Pr
     throw new Error(`Stock not found: ${stockCode}`)
   }
 
-  // 2. 确定K线数量
+  // 2. 确定K线数量和类型
   const config = getConfig()
-  const klineCount = maxCount || 1200
+  const klineCount = maxCount || 1300
   const dataSource = config.DATA_SOURCE || 'futu'
+  const ktype = config.FUTU_PUSH_TYPE || 'K_DAY'
 
-  // 3. 获取K线数据（传递完整的 Stock 对象）
+  // 3. 检查缓存文件（对所有数据源统一处理）
+  const dataDir = getDataDir(config)
+  const cacheFileName = getCacheFileName(stockCode, ktype)
+  const cacheFile = path.join(dataDir, cacheFileName)
+  
   let klines: KlineData[] = []
 
-  // 根据数据源区分
-  if (dataSource === 'futu') {
-    klines = await getFutuKlineData(stock, klineCount)
-  } else if (dataSource === 'yfinance') {
-    klines = await getYahooKlineData(stock, klineCount)
-  } else if (dataSource === 'akshare') {
-    klines = await getAkShareKlineData(stock, klineCount)
-  } else {
-    throw new Error(`Unsupported data source: ${dataSource}`)
+  // 如果缓存文件存在且未过期，直接读取缓存
+  if (isCacheValid(cacheFile, cacheExpiryDays)) {
+    console.log(`[DataService] Using cached data file: ${cacheFile}`)
+    const cachedKlines = readKlineDataFromCache(cacheFile)
+    if (cachedKlines && cachedKlines.length > 0) {
+      // 限制返回数量
+      klines = cachedKlines.slice(-klineCount)
+      console.log(`[DataService] Loaded ${klines.length} klines from cache for ${stockCode}`)
+    }
   }
 
+  // 4. 如果缓存无效或不存在，从数据源获取K线数据
   if (klines.length === 0) {
-    throw new Error(`No kline data available for ${stockCode}`)
+    console.log(`[DataService] Downloading new data: ${cacheFile}`)
+    
+    // 根据数据源区分
+    if (dataSource === 'futu') {
+      klines = await getFutuKlineData(stock, klineCount)
+    } else if (dataSource === 'yfinance') {
+      klines = await getYahooKlineData(stock, klineCount)
+    } else if (dataSource === 'akshare') {
+      klines = await getAkShareKlineData(stock, klineCount)
+    } else {
+      throw new Error(`Unsupported data source: ${dataSource}`)
+    }
+
+    if (klines.length === 0) {
+      throw new Error(`No kline data available for ${stockCode}`)
+    }
+
+    // 保存到缓存文件
+    if (klines.length > 0) {
+      saveKlineDataToCache(cacheFile, klines)
+    }
   }
 
-  // 4. 计算指标（传递股票代码以从数据库读取参数）
+  // 5. 计算指标（传递股票代码以从数据库读取参数）
   console.log('[DataService] Calculating indicators with params from database...')
   const indicators = await calculateIndicators(klines, stock.code)
 
   console.log('[DataService] Chart data ready:', {
     stock: stock.code,
     klineCount: klines.length,
+    dataSource,
+    cached: isCacheValid(cacheFile, cacheExpiryDays),
     hasIndicators: {
       ema: !!indicators.ema,
       macd: !!indicators.macd,
