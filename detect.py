@@ -14,6 +14,7 @@ from params_db import ParamsDB
 import json
 from datetime import datetime
 from tools import code_in_futu_group, sanitize_path_component
+from notification_engine import NotificationEngine
 
 """
     运行分析
@@ -170,3 +171,8 @@ if __name__ == '__main__':
             for db_path in db_list:
                 db = ParamsDB(db_path, init_db=True)
                 db.import_params(result_file)
+            msg = f"Parameters updated for {','.join(pd_code_list['code'].to_list())} in {len(db_list)} databases\n{result_file}"
+            notification = NotificationEngine(config)
+            notification.send_telegram_message(msg)
+            notification.send_email(msg, msg)
+            print(msg)
