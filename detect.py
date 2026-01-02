@@ -26,10 +26,10 @@ from notification_engine import NotificationEngine
     cache_expiry_days: 缓存过期时间
     return: 结果字典, 结果文件路径
 """
-def run_analysis(code_list:pd.DataFrame, indicator_type:str, config:ConfigParser, output_dir='./output', data_dir='./data/detect', cache_expiry_days=1):
+def run_analysis(code_list:pd.DataFrame, indicator_type:str, config:ConfigParser, output_dir='./output', data_dir='./data/detect', cache_expiry_days=1)->tuple[dict,str]:
     if code_list.empty:
         print(f'warning: {indicator_type} code_list is empty')
-        return {}
+        return {},''
     
     # 确保输出目录存在
     os.makedirs(output_dir, exist_ok=True)
@@ -164,10 +164,14 @@ if __name__ == '__main__':
                     pd_code_list = pd_code_list[pd_code_list['code'] != code]
                     print(f"code {code} already has parameters in {trend_type} database, skipping training")
         
+        if pd_code_list.empty:
+            print(f"no code to train {trend_type}")
+            continue
+        
         output_dir = f'./output/detect_{timestamp}_{ktype}_{sanitize_path_component(group)}_{indicator_type}'
         results, result_file = run_analysis(pd_code_list, indicator_type, config, output_dir=output_dir)
 
-        if params_db is not None and params_update is True and len(db_list) >= 1:
+        if params_db is not None and params_update is True and len(db_list) >= 1 and result_file:
             for db_path in db_list:
                 db = ParamsDB(db_path, init_db=True)
                 db.import_params(result_file)
