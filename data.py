@@ -12,7 +12,7 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
-#  Written by Joey <wzzhaoyi@outlook.com>, 2024
+#  Written by Joey <wzzhaoyi@outlook.com>, 2026
 #  Copyright (c)  Joey - All Rights Reserved
 
 import configparser
@@ -29,6 +29,7 @@ import threading
 import os
 import json
 import re
+import requests
 
 # 美股代码列表缓存
 _us_stocks_cache = None
@@ -41,6 +42,82 @@ _CACHE_EXPIRE_DAYS = 30
 _futu_lock = threading.Lock()
 _yfinance_lock = threading.Lock()
 _akshare_lock = threading.Lock()
+
+# 全局代理配置
+_proxy_configured = False
+_proxy_url = None
+_global_session = None
+
+def setup_global_proxy(proxy_url: str = None):
+    """
+    设置全局代理，使所有 HTTP 请求（包括 yfinance）都走代理
+    类似 Windows 系统中的自动设置系统代理
+    
+    Args:
+        proxy_url: 代理地址，格式如 'http://127.0.0.1:7890'
+                   如果为 None，则从环境变量读取
+    """
+    global _proxy_configured, _proxy_url, _global_session
+    
+    if proxy_url:
+        _proxy_url = proxy_url
+    else:
+        # 从环境变量读取
+        _proxy_url = os.environ.get('HTTP_PROXY') or os.environ.get('HTTPS_PROXY')
+    
+    if not _proxy_url:
+        return
+    
+    # 方法1: 设置环境变量（requests 库会自动读取）
+    os.environ['HTTP_PROXY'] = _proxy_url
+    os.environ['HTTPS_PROXY'] = _proxy_url
+    os.environ['http_proxy'] = _proxy_url
+    os.environ['https_proxy'] = _proxy_url
+    
+    # 方法2: Monkey patch requests 的默认 session
+    # 创建一个带代理的 session 并替换 requests 的默认方法
+    class ProxiedSession(requests.Session):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.proxies = {
+                'http': _proxy_url,
+                'https': _proxy_url
+            }
+            # 不配置重试策略：一旦陷入流控或代理失效，重试毫无意义
+    
+    # 保存原始的 requests 方法
+    if not hasattr(requests, '_original_get'):
+        requests._original_get = requests.get
+        requests._original_post = requests.post
+        requests._original_request = requests.request
+        requests._original_session = requests.Session
+    
+    # 创建全局 session 实例
+    _global_session = ProxiedSession()
+    
+    # 替换 requests 的全局方法
+    def proxied_get(url, **kwargs):
+        if 'proxies' not in kwargs:
+            kwargs['proxies'] = {'http': _proxy_url, 'https': _proxy_url}
+        return _global_session.get(url, **kwargs)
+    
+    def proxied_post(url, **kwargs):
+        if 'proxies' not in kwargs:
+            kwargs['proxies'] = {'http': _proxy_url, 'https': _proxy_url}
+        return _global_session.post(url, **kwargs)
+    
+    def proxied_request(method, url, **kwargs):
+        if 'proxies' not in kwargs:
+            kwargs['proxies'] = {'http': _proxy_url, 'https': _proxy_url}
+        return _global_session.request(method, url, **kwargs)
+    
+    requests.get = proxied_get
+    requests.post = proxied_post
+    requests.request = proxied_request
+    requests.Session = ProxiedSession
+    
+    _proxy_configured = True
+
 
 def get_us_stocks():
     """获取美股代码列表，使用缓存避免重复调用"""
@@ -219,11 +296,16 @@ def get_yfinance_params(ktype: str, max_count: int) -> dict:
 
 def fetch_yfinance_data(code: str, ktype: str, max_count: int, config: configparser.ConfigParser) -> pd.DataFrame:
     """获取YFinance最近数据"""
+    global _proxy_configured
+    
     with _yfinance_lock:
-        # 设置代理
-        proxy = config.get("CONFIG", "PROXY", fallback=None)
-        if proxy:
-            yf.set_config(proxy=proxy)
+        # 设置全局代理（如果尚未配置）
+        if not _proxy_configured:
+            proxy = config.get("CONFIG", "PROXY", fallback=None)
+            if proxy:
+                setup_global_proxy(proxy)
+        
+        sleep(1)
             
         yf_code = futu_code_to_yfinance_code(code)
         params = get_yfinance_params(ktype, max_count)
@@ -234,8 +316,6 @@ def fetch_yfinance_data(code: str, ktype: str, max_count: int, config: configpar
         if history.empty:
             return None
         df = history[['Open', 'Close', 'Volume', 'High', 'Low']].copy()
-        
-        sleep(1)
         
         return df.rename(columns={
             'Open': 'open', 'High': 'high',
