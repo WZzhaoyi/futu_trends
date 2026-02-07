@@ -42,7 +42,10 @@
             "request": "launch",
             "program": "./trends.py",
             "console": "integratedTerminal",
-            "args": ["--config","./env/signal_cn.ini"]
+            "args": ["--config","./env/signal_cn.ini"],
+            "env": {
+                "MPLBACKEND": "Agg"
+            }
         },
         {
             "name": "rs_rating",
@@ -61,18 +64,7 @@
             "args": ["--config","./env/trade.ini"]
         },
         {
-            "name": "signal_window",
-            "type": "debugpy",
-            "request": "launch",
-            "program": "./gui/signal_window.py",
-            "console": "integratedTerminal",
-            "args": ["--config","./env/signal_window.ini"],
-            "env": {
-                "MPLBACKEND": "Agg"
-            }
-        },
-        {
-            "name": "group_list",
+            "name": "group_list_python",
             "type": "debugpy",
             "request": "launch",
             "program": "./gui/group_list.py",
@@ -81,6 +73,21 @@
             "env": {
                 "MPLBACKEND": "Agg"
             }
+        },
+        {
+            "name": "position_sync",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "./position_sync.py",
+            "console": "integratedTerminal",
+            "args": ["--config","./env/trade.ini"]
+        },
+        {
+            "name": "futu-trends-board dev",
+            "type": "node-terminal",
+            "request": "launch",
+            "command": "npm run dev",
+            "cwd": "${workspaceFolder}/gui/futu-trends-board"
         }
     ]
 }

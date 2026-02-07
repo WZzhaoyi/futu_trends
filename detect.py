@@ -53,7 +53,8 @@ def run_analysis(code_list:pd.DataFrame, indicator_type:str, config:ConfigParser
             # 文件不存在，下载数据
             print(f"下载新数据: {data_file}")
             df = get_kline_data(code, config, max_count=1300)
-            df.to_csv(data_file)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                df.to_csv(data_file)
         else:
             print(f"使用本地数据文件: {data_file}")
             df = pd.read_csv(data_file, index_col=0, parse_dates=True)

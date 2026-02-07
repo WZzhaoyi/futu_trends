@@ -80,7 +80,7 @@ def is_reverse(df: pd.DataFrame, code: str, config: configparser.ConfigParser) -
     # 检查是否有反转信号
     msg = ''
     if reversal != 'none' and type(reversal) == str:
-        msg += reversal.replace('reversal','kd')
+        msg += 'kd'
         target_low, target_high = get_target_price(df, target_multiplier=meta['target_multiplier'], atr_period=meta['atr_period']) if meta['target_multiplier'] > 0 and meta['atr_period'] > 0 else (0, 0)
         msg += f' [{target_low},{target_high}]' if target_low > 0 and target_high > 0 else '[0,0]'
     if 'support' in reversal:
@@ -134,7 +134,7 @@ def is_continue(df:pd.DataFrame, code:str, config:configparser.ConfigParser)->st
     # 检查是否有反转信号
     msg = ''
     if reversal != 'none' and type(reversal) == str:
-        msg += reversal.replace('reversal','macd')
+        msg += 'macd'
         target_low, target_high = get_target_price(df, target_multiplier=meta['target_multiplier'], atr_period=meta['atr_period']) if meta['target_multiplier'] > 0 and meta['atr_period'] > 0 else (0, 0)
         msg += f' [{target_low},{target_high}]' if target_low > 0 and target_high > 0 else '[0,0]'
     if 'support' in reversal:
@@ -143,8 +143,8 @@ def is_continue(df:pd.DataFrame, code:str, config:configparser.ConfigParser)->st
         msg += u'📉'
     return None if msg == '' else msg
 
-def is_breakout(data:pd.DataFrame, code:str, config:configparser.ConfigParser)->str|None:# K线突破/跌破均线
-    assert len(data) >= 90
+def is_breakout(df:pd.DataFrame, code:str, config:configparser.ConfigParser)->str|None:# K线突破/跌破均线
+    assert len(df) >= 90
     N = 240
     # 从数据库读取参数 默认N=240
     db_path = config.get("CONFIG", "EMA_PARAMS_DB", fallback=None)
@@ -154,7 +154,7 @@ def is_breakout(data:pd.DataFrame, code:str, config:configparser.ConfigParser)->
         if data is not None:
             N = data['best_params']['ema_period']
 
-    close = data['close']
+    close = df['close']
     close_ema = EMA(close, N)
     last_close = round_decimal(close.iloc[-1])
     last_ema = round_decimal(close_ema[-1])
@@ -215,7 +215,7 @@ def is_top_down(df:pd.DataFrame, code:str, config:configparser.ConfigParser) -> 
     
     # 检查是否有反转信号
     if reversal != 'none' and type(reversal) == str:
-        msg += reversal.replace('reversal','rsi')
+        msg += 'rsi'
         target_low, target_high = get_target_price(df, target_multiplier=meta['target_multiplier'], atr_period=meta['atr_period']) if meta['target_multiplier'] > 0 and meta['atr_period'] > 0 else (0, 0)
         msg += f' [{target_low},{target_high}]' if target_low > 0 and target_high > 0 else '[0,0]'
     if 'support' in reversal:

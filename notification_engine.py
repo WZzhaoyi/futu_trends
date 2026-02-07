@@ -26,7 +26,7 @@ import time
 import os
 import json
 from requests_html import HTMLSession
-from futu import *
+from futu import OpenQuoteContext, RET_OK, SetPriceReminderOp, PriceReminderType, PriceReminderFreq, ModifyUserSecurityOp
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 import httplib2
@@ -42,7 +42,7 @@ class NotificationEngine:
             Notification Engine Constructor
         """
         # Email configuration
-        self.mail_port = config.get("CONFIG", "EMAIL_PORT")
+        self.mail_port = config.getint("CONFIG", "EMAIL_PORT")
         self.mail_host = config.get("CONFIG", "EMAIL_SERVER")
         self.sender = config.get("CONFIG", "EMAIL_SENDER")
         self.mail_pass = config.get("CONFIG", "EMAIL_PASWD")
@@ -136,7 +136,7 @@ class NotificationEngine:
         message = MIMEText(html_content, 'html', 'utf-8')
         message["From"] = self.sender
         message['To'] = ','.join(self.receivers)
-        message['Subject'] = Header(f"Trends - {datetime.today().strftime('%Y-%m-%d')} - {subject}", 'utf-8')
+        message['Subject'] = f"Trends - {datetime.today().strftime('%Y-%m-%d')} - {subject}"
 
         try:
             smtpObj = smtplib.SMTP_SSL(self.mail_host, self.mail_port) #建立smtp连接，ssl 465端口
