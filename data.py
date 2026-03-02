@@ -422,8 +422,13 @@ def get_kline_data(code: str, config: configparser.ConfigParser, max_count: int 
     Returns:
         pd.DataFrame: K线数据，包含 open, high, low, close, volume
     """
-    source_type = config.get("CONFIG", "DATA_SOURCE").lower()
     ktype = config.get("CONFIG", "FUTU_PUSH_TYPE")
+    market = code.split('.')[0].upper()
+    market_key = f"DATA_SOURCE_{market}"
+    if config.has_option("CONFIG", market_key):
+        source_type = config.get("CONFIG", market_key).lower()
+    else:
+        source_type = config.get("CONFIG", "DATA_SOURCE").lower()
     
     # 获取原始数据
     if source_type == 'futu':
