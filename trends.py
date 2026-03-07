@@ -419,12 +419,12 @@ if __name__ == "__main__":
 
     # futu分组/到价提醒
     if len(filter_df) > 0:
-        target_prices = filter_df['msg'].str.extract(r'\[(\d+\.\d+),(\d+\.\d+)\]')
+        target_prices = filter_df['msg'].str.extract(r'\[(\d+\.?\d*),(\d+\.?\d*)\]')
         notification.send_futu_message([str(code) for code in filter_df.index.tolist()],filter_df['msg'].tolist(),target_prices[1].tolist(),target_prices[0].tolist())
 
     # 原始消息（telegram/email 去除到价区间 [low,high]）
     import re as _re
-    raw_msg_clean = _re.sub(r' \[\d+\.\d+,\d+\.\d+\]', '', raw_msg)
+    raw_msg_clean = _re.sub(r' \[\d+\.?\d*,\d+\.?\d*\]', '', raw_msg)
     notification.send_telegram_message(raw_msg_clean,'https://www.futunn.com/')
     notification.send_email(f'{group} {push_type}',raw_msg_clean)
 

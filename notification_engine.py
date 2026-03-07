@@ -83,6 +83,8 @@ class NotificationEngine:
         for keyword in self.futu_keyword:
             for code, msg, recent_high, recent_low in zip(codes, messages, highs, lows): 
                 if keyword in msg:
+                    if recent_high == recent_low or recent_high == 0 or recent_low == 0:
+                        continue
                     ret_del, data_del = quote_ctx.set_price_reminder(code=code, op=SetPriceReminderOp.DEL_ALL)
                     ret_up, data_up = quote_ctx.set_price_reminder(code=code, op=SetPriceReminderOp.ADD, reminder_type=PriceReminderType.PRICE_UP,reminder_freq=PriceReminderFreq.ONCE,value=float(recent_high))
                     ret_down, data_down = quote_ctx.set_price_reminder(code=code, op=SetPriceReminderOp.ADD, reminder_type=PriceReminderType.PRICE_DOWN,reminder_freq=PriceReminderFreq.ONCE,value=float(recent_low))

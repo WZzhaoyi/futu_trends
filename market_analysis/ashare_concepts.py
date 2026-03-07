@@ -17,7 +17,7 @@ BLACKLIST_FILE = "./env/concept_blacklist.txt"
 TOP_N = 30           # 分析竞价金额前多少名
 MIN_SLEEP = 0.5     # 最小随机延时(秒)
 MAX_SLEEP = 3       # 最大随机延时(秒)
-OUTPUT_JSON_DIR = "./output"  # 输出JSON文件路径
+OUTPUT_JSON_DIR = "./output/concepts"  # 输出JSON文件路径
 
 # ================= 核心功能函数 =================
 
