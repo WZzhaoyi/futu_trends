@@ -453,6 +453,15 @@ def calc_momentum(close: pd.Series, N=21, method='linear')->pd.Series:
     
     return result
 
+
+
+def calc_returns_score(close: pd.Series):
+    """计算20d/60d收益率和得分。返回 (ret_20d, ret_60d, score)。"""
+    ret_20d = float((close.iloc[-1] / close.iloc[-21] - 1) * 100) if len(close) >= 21 else None
+    ret_60d = float((close.iloc[-1] / close.iloc[-61] - 1) * 100) if len(close) >= 61 else None
+    score = round((ret_20d + ret_60d) / 2, 2) if ret_20d is not None and ret_60d is not None else None
+    return ret_20d, ret_60d, score
+
 # 在文件开头添加路径清理函数
 def sanitize_path_component(path_component: str) -> str:
     """

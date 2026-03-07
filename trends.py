@@ -4,7 +4,7 @@ from ft_config import get_config
 from data import get_kline_data
 from params_db import ParamsDB
 from signal_analysis import get_target_price, MACD, KD, RSI
-from tools import MA, EMA, calc_momentum, code_in_futu_group
+from tools import MA, EMA, calc_momentum, calc_returns_score, code_in_futu_group
 import datetime
 import configparser
 from notification_engine import NotificationEngine
@@ -290,25 +290,25 @@ def check_trends(code_in_group: pd.DataFrame, config: configparser.ConfigParser)
                 print(f"Warning: No data for {futu_code}")
                 continue
 
-            msg = f'{futu_code} {name}'
+            msg = f'{name}'
             for i in trend_type:
-                if i.lower() == 'breakout':
+                if i.lower() == 'ema':
                     bo = is_breakout(df,futu_code,config) # 突破/跌破EMA均线
                     if bo is not None:
                         msg += f' | {bo}'
-                elif i.lower() == 'reverse':
+                elif i.lower() == 'kd':
                     rev = is_reverse(df,futu_code,config) # 趋势反转
                     if rev is not None:
                         msg += f' | {rev}'
-                elif i.lower() == 'continue':
+                elif i.lower() == 'macd':
                     co = is_continue(df,futu_code,config) # 趋势延续
                     if co is not None:
                         msg += f' | {co}'
-                elif i.lower() == 'topdown':
+                elif i.lower() == 'rsi':
                     td = is_top_down(df,futu_code,config) # 顶底结构
                     if td is not None:
                         msg += f' | {td}'
-                elif i.lower() == 'balance':
+                elif i.lower() == 'vol':
                     bal = is_balance(df) # 量价关系平衡
                     if bal is not None:
                         msg += f' | {bal}'
@@ -331,6 +331,14 @@ def check_trends(code_in_group: pd.DataFrame, config: configparser.ConfigParser)
 
             recent_high = df['high'].iloc[-3:].max()
             recent_low = df['low'].iloc[-3:].min()
+            ret_20d, ret_60d, score = calc_returns_score(close)
+            kline_date = pd.to_datetime(df['time_key'].iloc[-1]).strftime('%Y%m%d') if 'time_key' in df.columns else ""
+            if ret_20d is not None:
+                msg += f' | {ret_20d:+.1f}%'
+            if ret_60d is not None:
+                msg += f' | {ret_60d:+.1f}%'
+            if score is not None:
+                msg += f' | {score:+.2f}'
 
             results.append({
                 'futu_code': futu_code,
@@ -338,7 +346,11 @@ def check_trends(code_in_group: pd.DataFrame, config: configparser.ConfigParser)
                 'msg': msg,
                 'momentum': last_momentum,
                 'high': recent_high,
-                'low': recent_low
+                'low': recent_low,
+                'ret_20d': ret_20d,
+                'ret_60d': ret_60d,
+                'score': score,
+                'kline_date': kline_date,
             })
         except Exception as e:
             print(f"Error processing {futu_code}: {str(e)}")
@@ -353,7 +365,11 @@ def check_trends(code_in_group: pd.DataFrame, config: configparser.ConfigParser)
             'msg': f'━━━{momentum_period}动量0轴━━━',
             'momentum': 0.000,
             'high': 0.000,
-            'low': 0.000
+            'low': 0.000,
+            'ret_20d': None,
+            'ret_60d': None,
+            'score': None,
+            'kline_date': '',
         })
         
         result_df = pd.DataFrame(results)
@@ -391,6 +407,11 @@ if __name__ == "__main__":
     if trends_df.empty:
         print('warning: no trends data')
         exit()
+    # 保存当期快照
+    from rank_rotation import save_snapshot, SNAPSHOT_DIR
+    _snapshot_dir = config.get('CONFIG', 'SNAPSHOT_DIR', fallback=SNAPSHOT_DIR)
+    save_snapshot(trends_df, group or 'default', push_type, _snapshot_dir)
+
     raw_msg = '{} {} {}:\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group if group else '', push_type, '\n'.join(trends_df['msg']))
     filter_df = trends_df[trends_df['msg'].str.count('\\|') >= 2]
 
@@ -401,9 +422,11 @@ if __name__ == "__main__":
         target_prices = filter_df['msg'].str.extract(r'\[(\d+\.\d+),(\d+\.\d+)\]')
         notification.send_futu_message([str(code) for code in filter_df.index.tolist()],filter_df['msg'].tolist(),target_prices[1].tolist(),target_prices[0].tolist())
 
-    # 原始消息
-    notification.send_telegram_message(raw_msg,'https://www.futunn.com/')
-    notification.send_email(f'{group} {push_type}',raw_msg)
+    # 原始消息（telegram/email 去除到价区间 [low,high]）
+    import re as _re
+    raw_msg_clean = _re.sub(r' \[\d+\.\d+,\d+\.\d+\]', '', raw_msg)
+    notification.send_telegram_message(raw_msg_clean,'https://www.futunn.com/')
+    notification.send_email(f'{group} {push_type}',raw_msg_clean)
 
     # google sheet
     notification.send_google_sheet_message('{} {} {}:\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group if group else '', push_type, '\n'.join(filter_df['msg'])))

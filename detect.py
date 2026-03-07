@@ -136,14 +136,14 @@ if __name__ == '__main__':
     for trend_type in trend_types:
         pd_code_list = code_pd.copy()
         indicator_dict = {
-            'reverse': 'KD',
-            'continue': 'MACD',
-            'topdown': 'RSI'
+            'kd': 'KD',
+            'macd': 'MACD',
+            'rsi': 'RSI'
         }
         params_db_dict = {
-            'reverse': config.get("CONFIG", "KD_PARAMS_DB", fallback=None),
-            'continue': config.get("CONFIG", "MACD_PARAMS_DB", fallback=None),
-            'topdown': config.get("CONFIG", "RSI_PARAMS_DB", fallback=None)
+            'kd': config.get("CONFIG", "KD_PARAMS_DB", fallback=None),
+            'macd': config.get("CONFIG", "MACD_PARAMS_DB", fallback=None),
+            'rsi': config.get("CONFIG", "RSI_PARAMS_DB", fallback=None)
         }
         if trend_type not in indicator_dict:
             raise ValueError(f"Invalid trend type: {trend_type}")
