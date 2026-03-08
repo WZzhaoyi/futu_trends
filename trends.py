@@ -424,7 +424,7 @@ if __name__ == "__main__":
 
     # 原始消息（telegram/email 去除到价区间 [low,high]）
     import re as _re
-    raw_msg_clean = _re.sub(r' \[\d+\.?\d*,\d+\.?\d*\]', '', raw_msg)
+    raw_msg_clean = _re.sub(r'\[\d+\.?\d*,\d+\.?\d*\]', '', raw_msg)
     notification.send_telegram_message(raw_msg_clean,'https://www.futunn.com/')
     notification.send_email(f'{group} {push_type}',raw_msg_clean)
 
