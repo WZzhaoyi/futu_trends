@@ -211,3 +211,5 @@ if __name__ == "__main__":
     notification_engine = NotificationEngine(config)
     notification_engine.send_email("【金额排名详情】{}".format(now), msg)
     notification_engine.send_telegram_message(msg)
+    notification_engine.send_openclaw_qq(msg)
+    notification_engine.send_openclaw_telegram(msg)

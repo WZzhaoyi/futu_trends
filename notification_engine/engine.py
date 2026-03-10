@@ -32,6 +32,8 @@ from googleapiclient.discovery import build
 import httplib2
 from google_auth_httplib2 import AuthorizedHttp
 
+from .openclaw import OpenClawNotifier, HookResult
+
 
 class NotificationEngine:
     def plog(self,content):
@@ -70,6 +72,9 @@ class NotificationEngine:
         self.google_api_json = config.get("CONFIG", "GOOGLE_API_JSON", fallback="")
         self.google_sheet_cell_origin = config.get("CONFIG", "GOOGLE_SHEET_CELL_ORIGIN", fallback="B2")
 
+        # OpenClaw configuration
+        self._openclaw = OpenClawNotifier(config)
+
     def send_futu_message(self, codes:list[str], messages:list[str], highs:list[float], lows:list[float]):
         """
         根据关键词存入futu group
@@ -79,9 +84,9 @@ class NotificationEngine:
             return
 
         quote_ctx = OpenQuoteContext(host=self.host, port=self.port)
-        
+
         for keyword in self.futu_keyword:
-            for code, msg, recent_high, recent_low in zip(codes, messages, highs, lows): 
+            for code, msg, recent_high, recent_low in zip(codes, messages, highs, lows):
                 if keyword in msg:
                     if recent_high == recent_low or recent_high == 0 or recent_low == 0:
                         continue
@@ -92,14 +97,14 @@ class NotificationEngine:
                         self.plog(f'{code} 价格提醒 [{recent_low},{recent_high}]')
                     else:
                         self.plog(f'{code} 价格提醒失败 {data_del} {data_up} {data_down}')
-                    
+
                     ret, data = quote_ctx.modify_user_security(keyword, ModifyUserSecurityOp.ADD, [code])
                     if ret == RET_OK:
                         self.plog(f'{code} 存入{keyword}')
                     else:
                         self.plog(f'存入{keyword}失败 {data}')
                     time.sleep(3)
-        
+
         quote_ctx.close()
 
 
@@ -111,7 +116,7 @@ class NotificationEngine:
         if not all([self.mail_port, self.mail_host, self.sender, self.mail_pass]):
             self.plog('邮件配置不完整，跳过发送')
             return
-            
+
         # 检查是否有订阅者
         if not self.receivers:
             self.plog('没有邮件订阅者，跳过发送')
@@ -119,7 +124,7 @@ class NotificationEngine:
 
         # 将消息转换为HTML格式
         message_html = message_html.replace('\n', '<br>')
-        
+
         # 添加基本的HTML样式
         html_content = f"""
         <html>
@@ -173,7 +178,7 @@ class NotificationEngine:
             self.plog(f'Telegram Sent: {self.TELEGRAM_CHAT_ID}')
         except:
             self.plog(f'网络代理错误，请检查确认后关闭本程序重试')
-    
+
     def send_telegram_photo(self, img_url):
         """
         给电报发送图片
@@ -210,7 +215,7 @@ class NotificationEngine:
         if result.status_code != 200: # 如果分组发送失败 则单独发送图片
             for pic in pic_urls:
                 self.send_telegram_photo(pic)
-    
+
     def _safe_execute(self, execute_func, *args, **kwargs):
         """安全的执行函数，带重试机制"""
         for attempt in range(3):
@@ -232,7 +237,7 @@ class NotificationEngine:
             # 获取Google Sheet服务
             SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
             creds = Credentials.from_service_account_file(self.google_api_json, scopes=SCOPES)
-            
+
             # 配置HTTP客户端
             if self.PROXIES.get('http'):
                 proxy_url = self.PROXIES['http'].split('://', 1)[1]
@@ -248,7 +253,7 @@ class NotificationEngine:
                 )
             else:
                 http_client = httplib2.Http(timeout=30)
-            
+
             http = AuthorizedHttp(creds, http_client)
             service = build('sheets', 'v4', http=http)
 
@@ -256,12 +261,12 @@ class NotificationEngine:
             match = re.match(r'([A-Z]+)(\d+)', self.google_sheet_cell_origin)
             if not match:
                 raise ValueError("Invalid grid_origin format, expected like 'B2'")
-            
+
             start_col_letter, start_row = match.groups()
             start_row = int(start_row)
             today = date.today()
             cell_sheet_name = today.strftime('%y-%m')
-            
+
             # 计算目标单元格位置
             start_col = ord(start_col_letter[0]) - ord('A')
             first_day_of_month = datetime(today.year, today.month, 1)
@@ -282,7 +287,7 @@ class NotificationEngine:
                     spreadsheetId=self.google_sheet_id,
                     body={'requests': [{'addSheet': {'properties': {'title': cell_sheet_name}}}]}
                 )
-                
+
                 # 设置表头
                 header_range = f'{cell_sheet_name}!{start_col_letter}{start_row}:{chr(ord(start_col_letter)+6)}{start_row}'
                 self._safe_execute(
@@ -301,7 +306,7 @@ class NotificationEngine:
                 range=target_cell
             )
             existing_content += existing_result.get('values', [[]])[0][0] if existing_result.get('values') else ""
-            
+
             # 更新单元格
             updated_content = f"{existing_content}\n\n{message}" if existing_content else message
             self._safe_execute(
@@ -312,15 +317,24 @@ class NotificationEngine:
                 body={'values': [[updated_content]]}
             )
             self.plog(f'Google Sheet Updated: {self.google_sheet_id} at {target_cell}')
-            
+
         except Exception as e:
             self.plog(f'Google Sheet操作失败: {str(e)}')
+
+    def send_openclaw_qq(self, content: str, to: str | None = None, mode: str = "relay") -> HookResult:
+        """通过 OpenClaw 发送到 QQBot"""
+        return self._openclaw.send_to_qq(content, to=to, mode=mode)
+
+    def send_openclaw_telegram(self, content: str, to: str | None = None, mode: str = "relay") -> HookResult:
+        """通过 OpenClaw 发送到 Telegram"""
+        return self._openclaw.send_to_telegram(content, to=to, mode=mode)
+
 
 if __name__ == "__main__":
     BASE_DIR = os.path.split(os.path.realpath(__file__))[0]
     config = configparser.ConfigParser()
-    config.read(os.path.join(BASE_DIR, 'config.ini'), encoding='utf-8')
+    config.read(os.path.join(BASE_DIR, '..', 'config.ini'), encoding='utf-8')
     notification = NotificationEngine(config)
     notification.send_futu_message(['HK.00001','HK.00002'],['HK.00001 顶背离','HK.00002 底背离'],[100,200],[90,190])
     notification.send_telegram_message('{} test'.format(time.strftime("%Y-%m-%d %H:%M:%S",time.localtime(time.time()))))
-    notification.send_email('group','{} test'.format(time.strftime("%Y-%m-%d %H:%M:%S",time.localtime(time.time())))) 
+    notification.send_email('group','{} test'.format(time.strftime("%Y-%m-%d %H:%M:%S",time.localtime(time.time()))))

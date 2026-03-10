@@ -412,8 +412,14 @@ if __name__ == "__main__":
     _snapshot_dir = config.get('CONFIG', 'SNAPSHOT_DIR', fallback=SNAPSHOT_DIR)
     save_snapshot(trends_df, group or 'default', push_type, _snapshot_dir)
 
-    raw_msg = '{} {} {}:\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group if group else '', push_type, '\n'.join(trends_df['msg']))
-    filter_df = trends_df[trends_df['msg'].str.count('\\|') >= 2]
+    header = '名称 | 信号 | 动量 | 20D% | 60D% | 评分'
+    raw_msg = '{} {} {}:\n{}\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group if group else '', push_type, header, '\n'.join(trends_df['msg']))
+    _futu_kw_str = config.get('CONFIG', 'FUTU_KEYWORD', fallback='')
+    _futu_keywords = [k.strip() for k in _futu_kw_str.split(',') if k.strip()]
+    if _futu_keywords:
+        filter_df = trends_df[trends_df['msg'].apply(lambda msg: any(kw in msg for kw in _futu_keywords))]
+    else:
+        filter_df = trends_df.iloc[0:0]
 
     notification = NotificationEngine(config)
 
@@ -427,6 +433,9 @@ if __name__ == "__main__":
     raw_msg_clean = _re.sub(r'\[\d+\.?\d*,\d+\.?\d*\]', '', raw_msg)
     notification.send_telegram_message(raw_msg_clean,'https://www.futunn.com/')
     notification.send_email(f'{group} {push_type}',raw_msg_clean)
+    notification.send_openclaw_qq(raw_msg_clean)
+    notification.send_openclaw_telegram(raw_msg_clean)
 
     # google sheet
-    notification.send_google_sheet_message('{} {} {}:\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group if group else '', push_type, '\n'.join(filter_df['msg'])))
+    if len(filter_df) > 0:
+        notification.send_google_sheet_message('{} {} {}:\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group if group else '', push_type, '\n'.join(filter_df['msg'])))
