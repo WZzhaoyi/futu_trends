@@ -1,4 +1,11 @@
-# Created by .ignore support plugin (hsz.mobi)
+# Operating System 
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+Thumbs.db
+Desktop.ini
+*.log
 ### Python template
 # Byte-compiled / optimized / DLL files
 __pycache__/
