@@ -322,8 +322,8 @@ class NotificationEngine:
         except Exception as e:
             logger.error('Google Sheet操作失败: %s', e)
 
-    def send_webhook(self, content: str) -> list[HookResult]:
-        """通过 Webhook 发送到所有已配置的接收方"""
+    def send_webhook(self, content: str) -> HookResult:
+        """通过 Webhook 发送"""
         return self._webhook.send(content)
 
 

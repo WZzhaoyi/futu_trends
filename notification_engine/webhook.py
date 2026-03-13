@@ -31,14 +31,14 @@ config.ini 配置示例（以 OpenClaw 为例）:
     ; CF-Access-Client-Secret = your-cf-access-client-secret
 
     [WEBHOOK_PAYLOAD]
-    ; 静态 payload 基础字段，新增字段无需修改代码
+    ; 所有 payload 字段，新增字段无需修改代码；用户内容由代码按 WEBHOOK_CONTENT_FIELD 附加
+    channel        = qqbot
+    to             = c2c:YOUR_OPENID
+    name           = Notify
     wakeMode       = now
     deliver        = true
     thinking       = low
     timeoutSeconds = 30
-    ; 接收方地址：以 to_ 为前缀，send() 时自动遍历所有 to_* 字段逐一发送
-    to_qq          = c2c:YOUR_OPENID
-    to_telegram    = 123456789
 """
 
 import configparser
@@ -57,7 +57,6 @@ _ID_FIELD = "runId"
 @dataclass
 class HookResult:
     ok: bool
-    dest: str = ""
     run_id: Optional[str] = None
     error: Optional[str] = None
     raw: Optional[dict] = field(default_factory=dict)
@@ -68,30 +67,22 @@ class WebhookNotifier:
 
     def __init__(self, config: configparser.ConfigParser):
         self._url = config.get("CONFIG", "WEBHOOK_URL", fallback="")
+        self._content_field = config.get("CONFIG", "WEBHOOK_CONTENT_FIELD", fallback="message")
         self._headers = {"Content-Type": "application/json"}
         if config.has_section("WEBHOOK_HEADERS"):
             self._headers.update(config.items("WEBHOOK_HEADERS"))
         self._payload = dict(config.items("WEBHOOK_PAYLOAD")) if config.has_section("WEBHOOK_PAYLOAD") else {}
 
-    def send(self, content: str, name: str = "Notify") -> list[HookResult]:
-        """遍历 [WEBHOOK_PAYLOAD] 中所有 to_* 接收方并逐一发送"""
+    def send(self, content: str) -> HookResult:
+        """将 content 附加到 [WEBHOOK_PAYLOAD] 并发送"""
         if not self._url:
             logger.warning("WEBHOOK_URL 未配置，跳过发送")
-            return [HookResult(ok=False, error="WEBHOOK_URL 未配置")]
+            return HookResult(ok=False, error="WEBHOOK_URL 未配置")
 
-        destinations = {k[3:]: v for k, v in self._payload.items() if k.startswith("to_")}
-        if not destinations:
-            logger.warning("[WEBHOOK_PAYLOAD] 中无 to_* 接收方配置，跳过发送")
-            return [HookResult(ok=False, error="无接收方配置")]
+        payload = {**self._payload, self._content_field: content}
+        timeout = int(self._payload.get("timeoutseconds", 30)) + 10
 
-        static = {k: v for k, v in self._payload.items() if not k.startswith("to_")}
-        timeout = int(static.get("timeoutseconds", 30)) + 10
-
-        return [self._post(dest, to, static, content, name, timeout) for dest, to in destinations.items()]
-
-    def _post(self, dest: str, to: str, static: dict, content: str, name: str, timeout: int) -> HookResult:
-        payload = {**static, "to": to, "message": content, "name": name}
-        logger.info("发送通知 → dest=%s | to=%s | 内容长度=%d", dest, to, len(content))
+        logger.info("发送通知 → url=%s | 内容长度=%d", self._url, len(content))
         try:
             resp = requests.post(self._url, headers=self._headers, json=payload, timeout=timeout)
             logger.debug("响应状态: %d", resp.status_code)
@@ -100,24 +91,24 @@ class WebhookNotifier:
             if not content_type.startswith("application/json"):
                 body = resp.text[:500]
                 logger.error("非 JSON 响应 | status=%d | body=%s", resp.status_code, body)
-                return HookResult(ok=False, dest=dest, error=f"HTTP {resp.status_code}: {body}")
+                return HookResult(ok=False, error=f"HTTP {resp.status_code}: {body}")
 
             if not resp.text.strip():
                 logger.error("空响应 | status=%d", resp.status_code)
-                return HookResult(ok=False, dest=dest, error=f"HTTP {resp.status_code}: empty response")
+                return HookResult(ok=False, error=f"HTTP {resp.status_code}: empty response")
 
             data = resp.json()
             if resp.ok and data.get(_OK_FIELD):
-                logger.info("发送成功: dest=%s | id=%s", dest, data.get(_ID_FIELD))
-                return HookResult(ok=True, dest=dest, run_id=data.get(_ID_FIELD), raw=data)
+                logger.info("发送成功: id=%s", data.get(_ID_FIELD))
+                return HookResult(ok=True, run_id=data.get(_ID_FIELD), raw=data)
 
             err = data.get("error", f"HTTP {resp.status_code}")
-            logger.error("发送失败: dest=%s | %s | raw=%s", dest, err, data)
-            return HookResult(ok=False, dest=dest, error=err, raw=data)
+            logger.error("发送失败: %s | raw=%s", err, data)
+            return HookResult(ok=False, error=err, raw=data)
 
         except requests.Timeout:
-            logger.error("请求超时: dest=%s", dest)
-            return HookResult(ok=False, dest=dest, error="request timeout")
+            logger.error("请求超时")
+            return HookResult(ok=False, error="request timeout")
         except requests.RequestException as e:
-            logger.error("请求异常: dest=%s | %s", dest, e)
-            return HookResult(ok=False, dest=dest, error=str(e))
+            logger.error("请求异常: %s", e)
+            return HookResult(ok=False, error=str(e))
