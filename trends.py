@@ -1,6 +1,9 @@
 import json
+import logging
 import os
 from ft_config import get_config
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 from data import get_kline_data
 from params_db import ParamsDB
 from signal_analysis import get_target_price, MACD, KD, RSI
@@ -433,8 +436,7 @@ if __name__ == "__main__":
     raw_msg_clean = _re.sub(r'\[\d+\.?\d*,\d+\.?\d*\]', '', raw_msg)
     notification.send_telegram_message(raw_msg_clean,'https://www.futunn.com/')
     notification.send_email(f'{group} {push_type}',raw_msg_clean)
-    notification.send_openclaw_qq(raw_msg_clean)
-    notification.send_openclaw_telegram(raw_msg_clean)
+    notification.send_webhook(raw_msg_clean)
 
     # google sheet
     if len(filter_df) > 0:

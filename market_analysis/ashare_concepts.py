@@ -1,3 +1,4 @@
+import logging
 import pandas as pd
 import requests
 import json
@@ -11,6 +12,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import configparser
 from notification_engine import NotificationEngine
 from ft_config import get_config
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ================= 配置区域 =================
 BLACKLIST_FILE = "./env/concept_blacklist.txt"
@@ -211,5 +214,4 @@ if __name__ == "__main__":
     notification_engine = NotificationEngine(config)
     notification_engine.send_email("【金额排名详情】{}".format(now), msg)
     notification_engine.send_telegram_message(msg)
-    notification_engine.send_openclaw_qq(msg)
-    notification_engine.send_openclaw_telegram(msg)
+    notification_engine.send_webhook(msg)

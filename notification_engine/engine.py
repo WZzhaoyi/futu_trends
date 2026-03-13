@@ -17,6 +17,7 @@
 
 import configparser
 from datetime import datetime,date
+import logging
 import re
 import smtplib
 from email.mime.text import MIMEText
@@ -32,12 +33,12 @@ from googleapiclient.discovery import build
 import httplib2
 from google_auth_httplib2 import AuthorizedHttp
 
-from .openclaw import OpenClawNotifier, HookResult
+from .webhook import WebhookNotifier, HookResult
+
+logger = logging.getLogger(__name__)
 
 
 class NotificationEngine:
-    def plog(self,content):
-        print('{} {}'.format(time.strftime("%Y-%m-%d %H:%M:%S",time.localtime(time.time())), content))
 
     def __init__(self, config:configparser.ConfigParser):
         """
@@ -72,15 +73,15 @@ class NotificationEngine:
         self.google_api_json = config.get("CONFIG", "GOOGLE_API_JSON", fallback="")
         self.google_sheet_cell_origin = config.get("CONFIG", "GOOGLE_SHEET_CELL_ORIGIN", fallback="B2")
 
-        # OpenClaw configuration
-        self._openclaw = OpenClawNotifier(config)
+        # Webhook configuration
+        self._webhook = WebhookNotifier(config)
 
     def send_futu_message(self, codes:list[str], messages:list[str], highs:list[float], lows:list[float]):
         """
         根据关键词存入futu group
         """
         if not self.futu_keyword:
-            self.plog('没有futu关键词，跳过存入futu group')
+            logger.warning('没有futu关键词，跳过存入futu group')
             return
 
         quote_ctx = OpenQuoteContext(host=self.host, port=self.port)
@@ -94,15 +95,15 @@ class NotificationEngine:
                     ret_up, data_up = quote_ctx.set_price_reminder(code=code, op=SetPriceReminderOp.ADD, reminder_type=PriceReminderType.PRICE_UP,reminder_freq=PriceReminderFreq.ONCE,value=float(recent_high))
                     ret_down, data_down = quote_ctx.set_price_reminder(code=code, op=SetPriceReminderOp.ADD, reminder_type=PriceReminderType.PRICE_DOWN,reminder_freq=PriceReminderFreq.ONCE,value=float(recent_low))
                     if ret_del == RET_OK and ret_up == RET_OK and ret_down == RET_OK:
-                        self.plog(f'{code} 价格提醒 [{recent_low},{recent_high}]')
+                        logger.info('%s 价格提醒 [%s,%s]', code, recent_low, recent_high)
                     else:
-                        self.plog(f'{code} 价格提醒失败 {data_del} {data_up} {data_down}')
+                        logger.error('%s 价格提醒失败 %s %s %s', code, data_del, data_up, data_down)
 
                     ret, data = quote_ctx.modify_user_security(keyword, ModifyUserSecurityOp.ADD, [code])
                     if ret == RET_OK:
-                        self.plog(f'{code} 存入{keyword}')
+                        logger.info('%s 存入%s', code, keyword)
                     else:
-                        self.plog(f'存入{keyword}失败 {data}')
+                        logger.error('存入%s失败 %s', keyword, data)
                     time.sleep(3)
 
         quote_ctx.close()
@@ -114,12 +115,12 @@ class NotificationEngine:
         """
         # 检查邮件配置是否完整
         if not all([self.mail_port, self.mail_host, self.sender, self.mail_pass]):
-            self.plog('邮件配置不完整，跳过发送')
+            logger.warning('邮件配置不完整，跳过发送')
             return
 
         # 检查是否有订阅者
         if not self.receivers:
-            self.plog('没有邮件订阅者，跳过发送')
+            logger.warning('没有邮件订阅者，跳过发送')
             return
 
         # 将消息转换为HTML格式
@@ -150,13 +151,13 @@ class NotificationEngine:
             smtpObj.login(self.sender, self.mail_pass)  #登陆
             smtpObj.sendmail(self.sender, self.receivers, message.as_string())  #发送
             smtpObj.quit()
-            self.plog(f'Email Sent: {self.receivers}')
+            logger.info('Email Sent: %s', self.receivers)
         except (gaierror, ConnectionRefusedError):
-            self.plog('Failed to connect to the server. Bad connection settings?')
+            logger.error('Failed to connect to the server. Bad connection settings?')
         except smtplib.SMTPServerDisconnected:
-            self.plog('Failed to connect to the server. Wrong user/password?')
+            logger.error('Failed to connect to the server. Wrong user/password?')
         except smtplib.SMTPException as e:
-            self.plog('SMTP error occurred: ' + str(e))
+            logger.error('SMTP error occurred: %s', e)
 
     def send_telegram_message(self, text, link='www.google.com'):
         """
@@ -164,7 +165,7 @@ class NotificationEngine:
         """
         # 检查Telegram配置是否完整
         if not all([self.TELEGRAM_BOT_TOKEN, self.TELEGRAM_CHAT_ID]):
-            self.plog('Telegram配置不完整，跳过发送')
+            logger.warning('Telegram配置不完整，跳过发送')
             return
 
         headers = {
@@ -175,9 +176,9 @@ class NotificationEngine:
         url = f'https://api.telegram.org/bot{self.TELEGRAM_BOT_TOKEN}/sendMessage'
         try:
             self.SESSION.post(url, headers=headers, data=data.encode('utf-8'), proxies=self.PROXIES)
-            self.plog(f'Telegram Sent: {self.TELEGRAM_CHAT_ID}')
+            logger.info('Telegram Sent: %s', self.TELEGRAM_CHAT_ID)
         except:
-            self.plog(f'网络代理错误，请检查确认后关闭本程序重试')
+            logger.error('网络代理错误，请检查确认后关闭本程序重试')
 
     def send_telegram_photo(self, img_url):
         """
@@ -185,7 +186,7 @@ class NotificationEngine:
         """
         # 检查Telegram配置是否完整
         if not all([self.TELEGRAM_BOT_TOKEN, self.TELEGRAM_CHAT_ID]):
-            self.plog('Telegram配置不完整，跳过发送')
+            logger.warning('Telegram配置不完整，跳过发送')
             return
 
         url = f'https://api.telegram.org/bot{self.TELEGRAM_BOT_TOKEN}/sendPhoto'
@@ -200,7 +201,7 @@ class NotificationEngine:
         """
         # 检查Telegram配置是否完整
         if not all([self.TELEGRAM_BOT_TOKEN, self.TELEGRAM_CHAT_ID]):
-            self.plog('Telegram配置不完整，跳过发送')
+            logger.warning('Telegram配置不完整，跳过发送')
             return
 
         url = f'https://api.telegram.org/bot{self.TELEGRAM_BOT_TOKEN}/sendMediaGroup'
@@ -230,7 +231,7 @@ class NotificationEngine:
     def send_google_sheet_message(self, message):
         """更新Google Sheet"""
         if not all([self.google_sheet_id, os.path.exists(self.google_api_json), self.google_sheet_cell_origin]):
-            self.plog('Google Sheet配置不完整，跳过发送')
+            logger.warning('Google Sheet配置不完整，跳过发送')
             return
 
         try:
@@ -316,18 +317,14 @@ class NotificationEngine:
                 valueInputOption='RAW',
                 body={'values': [[updated_content]]}
             )
-            self.plog(f'Google Sheet Updated: {self.google_sheet_id} at {target_cell}')
+            logger.info('Google Sheet Updated: %s at %s', self.google_sheet_id, target_cell)
 
         except Exception as e:
-            self.plog(f'Google Sheet操作失败: {str(e)}')
+            logger.error('Google Sheet操作失败: %s', e)
 
-    def send_openclaw_qq(self, content: str, to: str | None = None, mode: str = "relay") -> HookResult:
-        """通过 OpenClaw 发送到 QQBot"""
-        return self._openclaw.send_to_qq(content, to=to, mode=mode)
-
-    def send_openclaw_telegram(self, content: str, to: str | None = None, mode: str = "relay") -> HookResult:
-        """通过 OpenClaw 发送到 Telegram"""
-        return self._openclaw.send_to_telegram(content, to=to, mode=mode)
+    def send_webhook(self, content: str) -> list[HookResult]:
+        """通过 Webhook 发送到所有已配置的接收方"""
+        return self._webhook.send(content)
 
 
 if __name__ == "__main__":
