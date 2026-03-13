@@ -1,6 +1,9 @@
 import json
+import logging
 import os
 from ft_config import get_config
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 from data import get_kline_data
 from params_db import ParamsDB
 from signal_analysis import get_target_price, MACD, KD, RSI

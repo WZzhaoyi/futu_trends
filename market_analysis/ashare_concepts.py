@@ -1,3 +1,4 @@
+import logging
 import pandas as pd
 import requests
 import json
@@ -11,6 +12,8 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import configparser
 from notification_engine import NotificationEngine
 from ft_config import get_config
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ================= 配置区域 =================
 BLACKLIST_FILE = "./env/concept_blacklist.txt"
