@@ -433,8 +433,7 @@ if __name__ == "__main__":
     raw_msg_clean = _re.sub(r'\[\d+\.?\d*,\d+\.?\d*\]', '', raw_msg)
     notification.send_telegram_message(raw_msg_clean,'https://www.futunn.com/')
     notification.send_email(f'{group} {push_type}',raw_msg_clean)
-    notification.send_openclaw_qq(raw_msg_clean)
-    notification.send_openclaw_telegram(raw_msg_clean)
+    notification.send_webhook(raw_msg_clean)
 
     # google sheet
     if len(filter_df) > 0:

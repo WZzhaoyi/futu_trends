@@ -16,4 +16,4 @@
 #  Copyright (c)  Joey - All Rights Reserved
 
 from .engine import NotificationEngine
-from .openclaw import OpenClawNotifier, OpenClawConfig, HookResult, Channel, SendMode
+from .webhook import WebhookNotifier, HookResult

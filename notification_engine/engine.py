@@ -32,7 +32,7 @@ from googleapiclient.discovery import build
 import httplib2
 from google_auth_httplib2 import AuthorizedHttp
 
-from .openclaw import OpenClawNotifier, HookResult
+from .webhook import WebhookNotifier, HookResult
 
 
 class NotificationEngine:
@@ -72,8 +72,8 @@ class NotificationEngine:
         self.google_api_json = config.get("CONFIG", "GOOGLE_API_JSON", fallback="")
         self.google_sheet_cell_origin = config.get("CONFIG", "GOOGLE_SHEET_CELL_ORIGIN", fallback="B2")
 
-        # OpenClaw configuration
-        self._openclaw = OpenClawNotifier(config)
+        # Webhook configuration
+        self._webhook = WebhookNotifier(config)
 
     def send_futu_message(self, codes:list[str], messages:list[str], highs:list[float], lows:list[float]):
         """
@@ -321,13 +321,9 @@ class NotificationEngine:
         except Exception as e:
             self.plog(f'Google Sheet操作失败: {str(e)}')
 
-    def send_openclaw_qq(self, content: str, to: str | None = None, mode: str = "relay") -> HookResult:
-        """通过 OpenClaw 发送到 QQBot"""
-        return self._openclaw.send_to_qq(content, to=to, mode=mode)
-
-    def send_openclaw_telegram(self, content: str, to: str | None = None, mode: str = "relay") -> HookResult:
-        """通过 OpenClaw 发送到 Telegram"""
-        return self._openclaw.send_to_telegram(content, to=to, mode=mode)
+    def send_webhook(self, content: str) -> list[HookResult]:
+        """通过 Webhook 发送到所有已配置的接收方"""
+        return self._webhook.send(content)
 
 
 if __name__ == "__main__":
