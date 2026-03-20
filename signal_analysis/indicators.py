@@ -161,7 +161,7 @@ class MACD(Indicator):
         df['macd'], df['signal'] = macd, signal
 
         # 信号检测：histogram 拐点
-        extreme = params['macd_extreme']
+        extreme = params.get('macd_extreme', 150)
         hist = macd - signal
         # histogram 止跌回升 + 回调期间 hist 曾为负 + 处于上升趋势
         support_cond = (hist > hist.shift(1)) & (hist.shift(1) <= hist.shift(2)) & (hist.shift(1) < 0) & (macd > 0) & (macd < extreme)
