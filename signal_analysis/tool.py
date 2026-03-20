@@ -213,18 +213,22 @@ def get_target_price(df, target_multiplier=1.1, atr_period=20)->tuple[float, flo
     target_low = close - atr * target_multiplier
     return round(target_low, 3), round(target_high, 3)
 
-def calculate_win_rate(df, look_ahead=10, target_multiplier=1.1, atr_period=20, check_high_low=True):
-    df = df.copy()
+def precompute_win_rate_columns(df, look_ahead, target_multiplier, atr_period):
+    """预计算胜率所需的价格派生列（与信号无关，幂等）"""
+    if 'atr' in df.columns:
+        return df
     df['atr'] = ATR(df['high'], df['low'], df['close'], period=atr_period)
-    
     df['support_target'] = df['close'] + df['atr'] * target_multiplier
     df['resistance_target'] = df['close'] - df['atr'] * target_multiplier
-    
     df['future_high'] = get_future_range_numba(df['high'].values, look_ahead, is_high=True)
     df['future_low'] = get_future_range_numba(df['low'].values, look_ahead, is_high=False)
-    
     df['recent_high'] = df['high'].rolling(window=3, min_periods=1).max()
     df['recent_low'] = df['low'].rolling(window=3, min_periods=1).min()
+    return df
+
+def calculate_win_rate(df, look_ahead=10, target_multiplier=1.1, atr_period=20, check_high_low=True):
+    df = df.copy()
+    precompute_win_rate_columns(df, look_ahead, target_multiplier, atr_period)
     
     if check_high_low:
         df['support_win'] = np.where(

@@ -14,8 +14,9 @@ class Indicator(ABC):
         return self.__class__.__name__
     
     @abstractmethod
-    def calculate(self, df: pd.DataFrame, params: Dict, mode='train') -> pd.DataFrame:
-        """计算指标并返回带信号的DataFrame"""
+    def calculate(self, df: pd.DataFrame, params: Dict, mode='train', atr_period=None, target_multiplier=None) -> pd.DataFrame:
+        """计算指标并返回带信号的DataFrame
+        mode='check' 时需提供 atr_period 和 target_multiplier 用于消耗过滤"""
         pass
     
     @abstractmethod
@@ -38,9 +39,25 @@ class Indicator(ABC):
         pass
     
     @abstractmethod
-    def _future_confirmation(self, df, is_support):
+    def _future_confirmation(self, df, is_support) -> pd.Series:
         """未来确认 - 不能直接用作胜率计算"""
-        pass
+        ...
+
+    def _check_confirmation(self, df, is_support, signal_cond, atr_period, target_multiplier, consume_ratio=0.5):
+        """形态确认 + 目标空间消耗过滤"""
+        pattern = self._future_confirmation(df, is_support)
+        confirm_move = (df['close'].shift(-1) - df['close']).abs()
+        atr = ATR(df['high'], df['low'], df['close'], period=atr_period)
+        target_distance = atr * target_multiplier
+        not_consumed = confirm_move < consume_ratio * target_distance
+        result = signal_cond & pattern & not_consumed
+        # 只在信号 bar 上统计过滤比率
+        signal_confirmed = (signal_cond & pattern).sum()
+        signal_filtered = signal_confirmed - result.sum()
+        side = 'support' if is_support else 'resistance'
+        if signal_confirmed > 0:
+            print(f"  {self.name} {side}: {signal_cond.sum()} signals, {signal_confirmed} confirmed, {signal_filtered} consumed ({signal_filtered/signal_confirmed:.0%})")
+        return result
 
     @abstractmethod
     def indicator_calculate(self, df: pd.DataFrame, params: Dict) -> pd.Series | Tuple[pd.Series]:
@@ -54,32 +71,32 @@ class KD(Indicator):
         return {
             'k_period': hp.quniform('k_period', 9, 21, 1),
             'd_period': hp.quniform('d_period', 3, 7, 1),
-            'overbought': hp.quniform('overbought', 55, 90, 1),
-            'oversold': hp.quniform('oversold', 10, 45, 1),
+            'overbought': hp.quniform('overbought', 50, 90, 1),
+            'oversold': hp.quniform('oversold', 10, 50, 1),
         }
     
-    def calculate(self, df: pd.DataFrame, params: Dict, mode='train') -> pd.DataFrame:
+    def calculate(self, df: pd.DataFrame, params: Dict, mode='train', atr_period=None, target_multiplier=None) -> pd.DataFrame:
         params = self.get_params(params)
         df = df.copy()
-        
+
         # 计算KD
         k, d = self.indicator_calculate(df, params)
         df['k'], df['d'] = k, d
 
         support_cond = (k > d) & (k.shift(1) <= d.shift(1)) & (d < params['oversold'])
         resistance_cond = (k < d) & (k.shift(1) >= d.shift(1)) & (d > params['overbought'])
-        
+
         # 未来确认
         if mode == 'check':
-            support_cond &= self._future_confirmation(df, True)
-            resistance_cond &= self._future_confirmation(df, False)
-        
+            support_cond = self._check_confirmation(df, True, support_cond, atr_period, target_multiplier)
+            resistance_cond = self._check_confirmation(df, False, resistance_cond, atr_period, target_multiplier)
+
         # 生成信号
-        df['reversal'] = np.select([support_cond, resistance_cond], 
+        df['reversal'] = np.select([support_cond, resistance_cond],
                                   ['support reversal', 'resistance reversal'], 'none')
         df['is_strong'] = ((df['reversal'] != 'none')).astype(int)
         return df
-    
+
     def calculate_score(self, result: Dict, signal_count_target: float) -> float:
         support_f1 = 2 * (result['strong_support_win_rate'] * result['support_recall']) / \
                     (result['strong_support_win_rate'] + result['support_recall']) if \
@@ -129,42 +146,47 @@ class MACD(Indicator):
             'fast_period': hp.quniform('fast_period', 10, 12, 1),
             'slow_period': hp.quniform('slow_period', 20, 26, 1),
             'signal_period': hp.quniform('signal_period', 7, 9, 1),
+            'macd_extreme': hp.quniform('macd_extreme', 100, 200, 10),
         }
-    
-    def calculate(self, df: pd.DataFrame, params: Dict, mode='train') -> pd.DataFrame:
+
+    def calculate(self, df: pd.DataFrame, params: Dict, mode='train', atr_period=None, target_multiplier=None) -> pd.DataFrame:
         params = self.get_params(params)
         df = df.copy()
 
         # 计算MACD
         macd, signal = self.indicator_calculate(df, params)
         df['macd'], df['signal'] = macd, signal
-        
-        # 信号检测
-        support_cond = (macd > signal) & (macd.shift(1) <= signal.shift(1)) & (macd > 0) & (macd < 150)
-        resistance_cond = (macd < signal) & (macd.shift(1) >= signal.shift(1)) & (macd < 0) & (macd > -150)
+
+        # 信号检测：histogram 拐点
+        extreme = params['macd_extreme']
+        hist = macd - signal
+        # histogram 止跌回升 + 回调期间 hist 曾为负 + 处于上升趋势
+        support_cond = (hist > hist.shift(1)) & (hist.shift(1) <= hist.shift(2)) & (hist.shift(1) < 0) & (macd > 0) & (macd < extreme)
+        # histogram 止涨回落 + 反弹期间 hist 曾为正 + 处于下降趋势
+        resistance_cond = (hist < hist.shift(1)) & (hist.shift(1) >= hist.shift(2)) & (hist.shift(1) > 0) & (macd < 0) & (macd > -extreme)
         # 未来确认
         if mode == 'check':
-            support_cond &= self._future_confirmation(df, True)
-            resistance_cond &= self._future_confirmation(df, False)
-        
+            support_cond = self._check_confirmation(df, True, support_cond, atr_period, target_multiplier)
+            resistance_cond = self._check_confirmation(df, False, resistance_cond, atr_period, target_multiplier)
+
         # 生成信号
-        df['reversal'] = np.select([support_cond, resistance_cond], 
+        df['reversal'] = np.select([support_cond, resistance_cond],
                                   ['support reversal', 'resistance reversal'], 'none')
         df['is_strong'] = ((df['reversal'] != 'none')).astype(int)
-        
+
         return df
-    
+
     def calculate_score(self, result: Dict, signal_count_target: float) -> float:
         signal_count_target = signal_count_target / 3
 
         support_f1 = result['strong_support_win_rate']
         resistance_f1 = result['strong_resistance_win_rate']
-        
+
         if support_f1 > 0 and resistance_f1 > 0:
             score = 2 / (1/support_f1 + 1/resistance_f1)
         else:
             score = 0
-        
+
         # 信号数量惩罚
         signal_count_penalty = min(1.0, (max(result['strong_support_signals_count'], result['strong_resistance_signals_count']))/signal_count_target)
         
@@ -198,7 +220,7 @@ class RSI(Indicator):
             'overbought': hp.quniform('overbought', 70, 90, 1),
         }
     
-    def calculate(self, df: pd.DataFrame, params: Dict, mode='train') -> pd.DataFrame:
+    def calculate(self, df: pd.DataFrame, params: Dict, mode='train', atr_period=None, target_multiplier=None) -> pd.DataFrame:
         params = self.get_params(params)
         df = df.copy()
 
@@ -212,11 +234,11 @@ class RSI(Indicator):
 
         # 未来确认
         if mode == 'check':
-            support_cond &= self._future_confirmation(df, True)
-            resistance_cond &= self._future_confirmation(df, False)
+            support_cond = self._check_confirmation(df, True, support_cond, atr_period, target_multiplier)
+            resistance_cond = self._check_confirmation(df, False, resistance_cond, atr_period, target_multiplier)
 
         # 生成信号
-        df['reversal'] = np.select([support_cond, resistance_cond], 
+        df['reversal'] = np.select([support_cond, resistance_cond],
                                   ['support reversal', 'resistance reversal'], 'none')
         df['is_strong'] = ((df['reversal'] != 'none')).astype(int)
 

@@ -58,8 +58,8 @@ def is_reverse(df: pd.DataFrame, code: str, config: configparser.ConfigParser) -
                 'oversold': 50
             },
             'meta_info': {  
-                'target_multiplier': 0,
-                'atr_period': 0
+                'target_multiplier': 1.5,
+                'atr_period': 60
             },
             'performance': {}
         }
@@ -73,7 +73,7 @@ def is_reverse(df: pd.DataFrame, code: str, config: configparser.ConfigParser) -
         return 'No KD parameters'
     
     # 信号检测
-    result = KD().calculate(df, params)
+    result = KD().calculate(df, params, atr_period=meta['atr_period'], target_multiplier=meta['target_multiplier'])
     
     # 获取最后一行的信号
     last_row = result.iloc[-1]
@@ -109,11 +109,12 @@ def is_continue(df:pd.DataFrame, code:str, config:configparser.ConfigParser)->st
             'best_params': {
                 'fast_period': 12,
                 'slow_period': 26,
-                'signal_period': 9
+                'signal_period': 9,
+                'macd_extreme': 150
             },
             'meta_info': {  
-                'target_multiplier': 0,
-                'atr_period': 0
+                'target_multiplier': 1.5,
+                'atr_period': 60
             },
             'performance': {}
         }
@@ -127,7 +128,7 @@ def is_continue(df:pd.DataFrame, code:str, config:configparser.ConfigParser)->st
         return 'No MACD parameters'
             
     # 信号检测
-    result = MACD().calculate(df, params)
+    result = MACD().calculate(df, params, atr_period=meta['atr_period'], target_multiplier=meta['target_multiplier'])
     
     # 获取最后一行的信号
     last_row = result.iloc[-1]
@@ -194,8 +195,8 @@ def is_top_down(df:pd.DataFrame, code:str, config:configparser.ConfigParser) -> 
                 'overbought': 70
             },
             'meta_info': {  
-                'target_multiplier': 0,
-                'atr_period': 0
+                'target_multiplier': 1.5,
+                'atr_period': 60
             },
             'performance': {}
         }
@@ -209,7 +210,7 @@ def is_top_down(df:pd.DataFrame, code:str, config:configparser.ConfigParser) -> 
         return 'No RSI parameters'
             
     # 信号检测
-    result = RSI().calculate(df, params)
+    result = RSI().calculate(df, params, atr_period=meta['atr_period'], target_multiplier=meta['target_multiplier'])
     last_row = result.iloc[-1]
     reversal =  last_row['reversal']
     is_strong =  last_row['is_strong']
