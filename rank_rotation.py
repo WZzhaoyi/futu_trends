@@ -409,6 +409,7 @@ def compare(config: configparser.ConfigParser) -> None:
     title = f"{curr_snap['date']} {group} {push_type} 轮动对比"
     notification.send_telegram_message(report, 'https://www.futunn.com/')
     notification.send_email(title, report)
+    notification.send_webhook(f'{title}\n{report}')
 
 
 # ── CLI 入口 ─────────────────────────────────────────────────────────────────

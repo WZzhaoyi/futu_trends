@@ -83,13 +83,32 @@ def technical_analysis(df, name, indicator_type='KD', evals=500, look_ahead=0):
     df_visual = result['detailed_df']
     original_plot = display_signals(df_visual, title, best_params, result)
 
+    # 确认信号（无消耗过滤）
     print(f"\n--------Checked signals for {name} with best params--------")
-    df_checked = indicator.calculate(df, best_params, mode='check', atr_period=atr_period, target_multiplier=target_multiplier)
-    result_checked = indicator.calculate_win_rate(df_checked, look_ahead=look_ahead,
-                                       target_multiplier=target_multiplier, atr_period=atr_period)
+    check_kwargs = dict(mode='check', atr_period=atr_period, target_multiplier=target_multiplier)
+    wr_kwargs = dict(look_ahead=look_ahead, target_multiplier=target_multiplier, atr_period=atr_period)
+
+    df_checked = indicator.calculate(df, best_params, **check_kwargs)
+    result_checked = indicator.calculate_win_rate(df_checked, **wr_kwargs)
     checked_plot = display_signals(result_checked['detailed_df'], f'Checked {title}', best_params, result_checked)
 
+    # 多阈值消耗过滤
+    consume_thresholds = [0.3, 0.5, 0.7]
+    filtered_results = {}
+    for ratio in consume_thresholds:
+        df_f = indicator.calculate(df, best_params, **check_kwargs, consume_ratio=ratio)
+        r = indicator.calculate_win_rate(df_f, **wr_kwargs)
+        del r['detailed_df']
+        filtered_results[f'checked_{ratio}'] = r
+
     del result["detailed_df"]
+    del result_checked["detailed_df"]
+
+    # 组装 performance：原始 + 确认 + 多阈值过滤
+    def _round_floats(d, decimals=3):
+        return {k: (round(v, decimals) if isinstance(v, float) else _round_floats(v, decimals) if isinstance(v, dict) else v) for k, v in d.items()}
+
+    performance = _round_floats({**result, 'checked': result_checked, **filtered_results})
 
     meta_info = {
         'strategy': indicator.name,
@@ -102,7 +121,7 @@ def technical_analysis(df, name, indicator_type='KD', evals=500, look_ahead=0):
     }
 
     return {
-        'performance': result,
+        'performance': performance,
         'best_params': best_params,
         'signal': df_visual,
         'plot': original_plot,

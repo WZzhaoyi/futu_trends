@@ -14,9 +14,10 @@ class Indicator(ABC):
         return self.__class__.__name__
     
     @abstractmethod
-    def calculate(self, df: pd.DataFrame, params: Dict, mode='train', atr_period=None, target_multiplier=None) -> pd.DataFrame:
+    def calculate(self, df: pd.DataFrame, params: Dict, mode='train', atr_period=None, target_multiplier=None, consume_ratio=None) -> pd.DataFrame:
         """计算指标并返回带信号的DataFrame
-        mode='check' 时需提供 atr_period 和 target_multiplier 用于消耗过滤"""
+        mode='check' 时需提供 atr_period 和 target_multiplier 用于确认
+        consume_ratio: 消耗过滤阈值，None 表示不过滤"""
         pass
     
     @abstractmethod
@@ -43,20 +44,22 @@ class Indicator(ABC):
         """未来确认 - 不能直接用作胜率计算"""
         ...
 
-    def _check_confirmation(self, df, is_support, signal_cond, atr_period, target_multiplier, consume_ratio=0.5):
-        """形态确认 + 目标空间消耗过滤"""
+    def _check_confirmation(self, df, is_support, signal_cond, atr_period, target_multiplier, consume_ratio=None):
+        """形态确认 + 目标空间消耗过滤
+        consume_ratio: None 表示仅确认不过滤，float 表示消耗比例阈值"""
         pattern = self._future_confirmation(df, is_support)
-        confirm_move = (df['close'].shift(-1) - df['close']).abs()
-        atr = ATR(df['high'], df['low'], df['close'], period=atr_period)
-        target_distance = atr * target_multiplier
-        not_consumed = confirm_move < consume_ratio * target_distance
-        result = signal_cond & pattern & not_consumed
-        # 只在信号 bar 上统计过滤比率
-        signal_confirmed = (signal_cond & pattern).sum()
-        signal_filtered = signal_confirmed - result.sum()
-        side = 'support' if is_support else 'resistance'
-        if signal_confirmed > 0:
-            print(f"  {self.name} {side}: {signal_cond.sum()} signals, {signal_confirmed} confirmed, {signal_filtered} consumed ({signal_filtered/signal_confirmed:.0%})")
+        result = signal_cond & pattern
+        if consume_ratio is not None:
+            confirm_move = (df['close'].shift(-1) - df['close']).abs()
+            atr = ATR(df['high'], df['low'], df['close'], period=atr_period)
+            target_distance = atr * target_multiplier
+            not_consumed = confirm_move < consume_ratio * target_distance
+            filtered_result = result & not_consumed
+            consumed = result.sum() - filtered_result.sum()
+            side = 'support' if is_support else 'resistance'
+            if result.sum() > 0:
+                print(f"  {self.name} {side}: {signal_cond.sum()} raw, {result.sum()} confirmed, {consumed} consumed@{consume_ratio} ({consumed/result.sum():.0%})")
+            result = filtered_result
         return result
 
     @abstractmethod
@@ -75,7 +78,7 @@ class KD(Indicator):
             'oversold': hp.quniform('oversold', 10, 50, 1),
         }
     
-    def calculate(self, df: pd.DataFrame, params: Dict, mode='train', atr_period=None, target_multiplier=None) -> pd.DataFrame:
+    def calculate(self, df: pd.DataFrame, params: Dict, mode='train', atr_period=None, target_multiplier=None, consume_ratio=None) -> pd.DataFrame:
         params = self.get_params(params)
         df = df.copy()
 
@@ -88,8 +91,8 @@ class KD(Indicator):
 
         # 未来确认
         if mode == 'check':
-            support_cond = self._check_confirmation(df, True, support_cond, atr_period, target_multiplier)
-            resistance_cond = self._check_confirmation(df, False, resistance_cond, atr_period, target_multiplier)
+            support_cond = self._check_confirmation(df, True, support_cond, atr_period, target_multiplier, consume_ratio)
+            resistance_cond = self._check_confirmation(df, False, resistance_cond, atr_period, target_multiplier, consume_ratio)
 
         # 生成信号
         df['reversal'] = np.select([support_cond, resistance_cond],
@@ -149,7 +152,7 @@ class MACD(Indicator):
             'macd_extreme': hp.quniform('macd_extreme', 100, 200, 10),
         }
 
-    def calculate(self, df: pd.DataFrame, params: Dict, mode='train', atr_period=None, target_multiplier=None) -> pd.DataFrame:
+    def calculate(self, df: pd.DataFrame, params: Dict, mode='train', atr_period=None, target_multiplier=None, consume_ratio=None) -> pd.DataFrame:
         params = self.get_params(params)
         df = df.copy()
 
@@ -166,8 +169,8 @@ class MACD(Indicator):
         resistance_cond = (hist < hist.shift(1)) & (hist.shift(1) >= hist.shift(2)) & (hist.shift(1) > 0) & (macd < 0) & (macd > -extreme)
         # 未来确认
         if mode == 'check':
-            support_cond = self._check_confirmation(df, True, support_cond, atr_period, target_multiplier)
-            resistance_cond = self._check_confirmation(df, False, resistance_cond, atr_period, target_multiplier)
+            support_cond = self._check_confirmation(df, True, support_cond, atr_period, target_multiplier, consume_ratio)
+            resistance_cond = self._check_confirmation(df, False, resistance_cond, atr_period, target_multiplier, consume_ratio)
 
         # 生成信号
         df['reversal'] = np.select([support_cond, resistance_cond],
@@ -220,7 +223,7 @@ class RSI(Indicator):
             'overbought': hp.quniform('overbought', 70, 90, 1),
         }
     
-    def calculate(self, df: pd.DataFrame, params: Dict, mode='train', atr_period=None, target_multiplier=None) -> pd.DataFrame:
+    def calculate(self, df: pd.DataFrame, params: Dict, mode='train', atr_period=None, target_multiplier=None, consume_ratio=None) -> pd.DataFrame:
         params = self.get_params(params)
         df = df.copy()
 
@@ -234,8 +237,8 @@ class RSI(Indicator):
 
         # 未来确认
         if mode == 'check':
-            support_cond = self._check_confirmation(df, True, support_cond, atr_period, target_multiplier)
-            resistance_cond = self._check_confirmation(df, False, resistance_cond, atr_period, target_multiplier)
+            support_cond = self._check_confirmation(df, True, support_cond, atr_period, target_multiplier, consume_ratio)
+            resistance_cond = self._check_confirmation(df, False, resistance_cond, atr_period, target_multiplier, consume_ratio)
 
         # 生成信号
         df['reversal'] = np.select([support_cond, resistance_cond],
