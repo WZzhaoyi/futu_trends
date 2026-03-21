@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Stock List</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; overflow: hidden; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace; background: #1a1a2e; color: #e0e0e0; display: flex; flex-direction: column; }
+.toolbar { display: flex; gap: 10px; padding: 10px 16px; align-items: center; flex-shrink: 0; }
+.toolbar input { background: #16213e; border: 1px solid #0f3460; color: #e0e0e0; padding: 6px 12px; border-radius: 6px; font-size: 13px; width: 240px; }
+#status { color: #888; font-size: 12px; }
+.table-wrap { flex: 1; min-height: 0; overflow-y: auto; padding: 0 16px 10px; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+thead { position: sticky; top: 0; background: #1a1a2e; z-index: 1; }
+th { text-align: left; padding: 6px 10px; border-bottom: 1px solid #0f3460; color: #888; font-weight: normal; }
+td { padding: 6px 10px; border-bottom: 1px solid #0f3460; }
+tr.row { cursor: pointer; }
+tr.row:hover { background: #16213e; }
+.market { color: #53c7f0; font-size: 12px; min-width: 40px; }
+</style>
+</head>
+<body>
+<div class="toolbar">
+  <input id="search" type="text" placeholder="Search code or name..." autofocus>
+  <span id="status">Loading...</span>
+</div>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th style="width:60px">Market</th><th style="width:140px">Code</th><th>Name</th></tr></thead>
+    <tbody id="tbody"></tbody>
+  </table>
+</div>
+
+<script>
+const marketNames = { SH: '沪市', SZ: '深市', HK: '港股', US: '美股' };
+let allStocks = [];
+
+function getMarket(code) {
+  const prefix = code.split('.')[0];
+  return marketNames[prefix] || prefix;
+}
+
+function renderRows(stocks) {
+  const tbody = document.getElementById('tbody');
+  tbody.innerHTML = stocks.map(s => `<tr class="row" data-code="${s.code}">
+    <td class="market">${getMarket(s.code)}</td>
+    <td>${s.code}</td>
+    <td>${s.name}</td>
+  </tr>`).join('');
+}
+
+document.getElementById('search').addEventListener('input', e => {
+  const kw = e.target.value.trim().toLowerCase();
+  if (!kw) { renderRows(allStocks); return; }
+  renderRows(allStocks.filter(s => s.code.toLowerCase().includes(kw) || s.name.toLowerCase().includes(kw)));
+});
+
+document.getElementById('tbody').addEventListener('click', e => {
+  const row = e.target.closest('tr.row');
+  if (row) window.location.href = `/detect/${row.dataset.code}`;
+});
+
+fetch('/api/stocks/list')
+  .then(r => r.json())
+  .then(data => {
+    allStocks = data.stocks || [];
+    document.getElementById('status').textContent = `${allStocks.length} stocks`;
+    renderRows(allStocks);
+  })
+  .catch(e => { document.getElementById('status').textContent = e.message; });
+</script>
+</body>
+</html>

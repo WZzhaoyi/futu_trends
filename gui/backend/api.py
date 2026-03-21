@@ -5,7 +5,7 @@ Futu Trends API 后端服务
 """
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 import sys
 import logging
 from pathlib import Path
@@ -62,19 +62,27 @@ async def get_stock_list():
     try:
         stocks = []
         
-        # 从富途分组获取
-        group = config.get("CONFIG", "FUTU_GROUP", fallback='')
+        # 从富途分组获取（支持多个 group，逗号分隔）
+        groups_str = config.get("CONFIG", "FUTU_GROUP", fallback='')
         host = config.get("CONFIG", "FUTU_HOST", fallback='127.0.0.1')
         port = config.getint("CONFIG", "FUTU_PORT", fallback=11111)
-        
-        if group and host and port:
-            try:
-                df = code_in_futu_group(group, host, port)
-                if isinstance(df, pd.DataFrame) and not df.empty:
-                    stocks.extend(df[['code', 'name']].to_dict('records'))
-                    logger.info(f"Retrieved {len(stocks)} stocks from Futu group")
-            except Exception as e:
-                logger.warning(f"Failed to get stock list from Futu group: {e}")
+
+        if groups_str and host and port:
+            seen_codes = set()
+            for group in groups_str.split(','):
+                group = group.strip()
+                if not group:
+                    continue
+                try:
+                    df = code_in_futu_group(group, host, port)
+                    if isinstance(df, pd.DataFrame) and not df.empty:
+                        for rec in df[['code', 'name']].to_dict('records'):
+                            if rec['code'] not in seen_codes:
+                                seen_codes.add(rec['code'])
+                                stocks.append(rec)
+                        logger.info(f"Retrieved stocks from Futu group '{group}', total unique: {len(stocks)}")
+                except Exception as e:
+                    logger.warning(f"Failed to get stock list from Futu group '{group}': {e}")
         
         # 从配置获取
         code_list = config.get("CONFIG", "FUTU_CODE_LIST", fallback='').split(',')
@@ -246,6 +254,53 @@ async def get_indicators(code: str):
     except Exception as e:
         logger.error(f"Error getting indicators: {code}, {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/detect/{code}")
+async def get_detect_result(code: str):
+    """获取标的的 detect 结果（聚合 KD/MACD/RSI 三个指标的 performance）"""
+    db_paths = {
+        'KD': config.get("CONFIG", "KD_PARAMS_DB", fallback=None),
+        'MACD': config.get("CONFIG", "MACD_PARAMS_DB", fallback=None),
+        'RSI': config.get("CONFIG", "RSI_PARAMS_DB", fallback=None),
+    }
+
+    result = {}
+    for indicator, db_path in db_paths.items():
+        if not db_path:
+            continue
+        try:
+            db = ParamsDB(db_path.split(',')[0])
+            data = db.get_stock_params(code)
+            if data:
+                result[indicator] = {
+                    'best_params': data['best_params'],
+                    'meta_info': data['meta_info'],
+                    'performance': data['performance'],
+                }
+        except Exception as e:
+            logger.warning(f"Failed to get {indicator} params for {code}: {e}")
+
+    if not result:
+        raise HTTPException(status_code=404, detail=f"No detect results found for {code}")
+
+    return JSONResponse(content={'code': code, 'indicators': result})
+
+@app.get("/detect/{code:path}")
+@app.get("/detect")
+async def detect_page(code: str = ""):
+    """Detect 结果可视化页面，支持 /detect/SZ.159949 直接访问"""
+    html_path = Path(__file__).parent / "detect.html"
+    if not html_path.exists():
+        raise HTTPException(status_code=404, detail="detect.html not found")
+    return HTMLResponse(content=html_path.read_text(encoding='utf-8'))
+
+@app.get("/stocks")
+async def stocks_page():
+    """股票列表页面"""
+    html_path = Path(__file__).parent / "stocks.html"
+    if not html_path.exists():
+        raise HTTPException(status_code=404, detail="stocks.html not found")
+    return HTMLResponse(content=html_path.read_text(encoding='utf-8'))
 
 @app.get("/")
 async def root():

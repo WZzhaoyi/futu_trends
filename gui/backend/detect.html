@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Detect Results</title>
+<script src="https://unpkg.com/lightweight-charts@5.1.0/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { height: 100%; overflow: hidden; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace; background: #1a1a2e; color: #e0e0e0; display: flex; flex-direction: column; }
+.search { display: flex; gap: 10px; padding: 10px 16px; align-items: center; flex-shrink: 0; }
+.search input { background: #16213e; border: 1px solid #0f3460; color: #e0e0e0; padding: 6px 12px; border-radius: 6px; font-size: 13px; width: 200px; }
+.search button { background: #0f3460; color: #e0e0e0; border: none; padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+.search button:hover { background: #1a5276; }
+#status { color: #888; font-size: 12px; }
+.indicators { display: flex; flex-wrap: wrap; gap: 10px; padding: 0 16px 10px; flex-shrink: 0; }
+.indicator-card { background: #16213e; border: 1px solid #0f3460; border-radius: 6px; padding: 10px 12px; flex: 1; min-width: 300px; }
+.indicator-card h3 { color: #53c7f0; margin-bottom: 6px; font-size: 14px; }
+.params { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; }
+.param-tag { background: #0f3460; padding: 2px 6px; border-radius: 3px; font-size: 11px; }
+.meta-row { font-size: 11px; color: #888; margin-bottom: 6px; }
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+th { text-align: left; padding: 3px 6px; border-bottom: 1px solid #0f3460; color: #888; font-weight: normal; }
+td { padding: 3px 6px; border-bottom: 1px solid #0f3460; }
+.wr-high { color: #4ecdc4; }
+.wr-mid { color: #f0c953; }
+.wr-low { color: #e07070; }
+#chart-container { flex: 1; min-height: 0; margin: 0 16px 10px; border: 1px solid #0f3460; border-radius: 6px; overflow: hidden; }
+</style>
+</head>
+<body>
+<div class="search">
+  <input id="code" type="text" placeholder="US.QQQ" autofocus>
+  <button onclick="fetchData()">Query</button>
+  <span id="status"></span>
+</div>
+<div id="result" class="indicators"></div>
+<div id="chart-container"></div>
+
+<script>
+const { createChart, ColorType, LineStyle } = LightweightCharts;
+const input = document.getElementById('code');
+input.addEventListener('keydown', e => { if (e.key === 'Enter') fetchData(); });
+
+let currentChart = null;
+
+// URL 路径中的 code 自动填入并查询
+const pathCode = window.location.pathname.replace(/^\/detect\/?/, '');
+if (pathCode) {
+  input.value = pathCode;
+  window.addEventListener('DOMContentLoaded', () => fetchData());
+}
+
+function parseTime(t) {
+  if (typeof t === 'string' && t.length === 10) {
+    const [y, m, d] = t.split('-').map(Number);
+    return { year: y, month: m, day: d };
+  }
+  if (typeof t === 'string' && t.length > 10) {
+    return Math.floor(new Date(t).getTime() / 1000);
+  }
+  return t;
+}
+
+const C = {
+  bg: '#1a1a2e', text: '#888', grid: '#0f3460',
+  up: '#ff5252', down: '#00a843',
+  macdLine: '#2196f3', signal: '#ff9800',
+  histUp: 'rgba(255,82,82,0.8)', histUpWeak: 'rgba(255,205,210,0.6)',
+  histDn: 'rgba(38,166,154,0.8)', histDnWeak: 'rgba(178,223,219,0.6)',
+  kLine: '#2196f3', dLine: '#ff9800',
+  rsiLine: '#ab47bc',
+  refLine: 'rgba(255,255,255,0.15)',
+};
+
+function addRefLines(pane, times, overbought, oversold, priceScaleId) {
+  for (const val of [overbought, oversold]) {
+    const s = pane.addSeries(LightweightCharts.LineSeries, {
+      color: C.refLine, lineWidth: 1, lineStyle: LineStyle.Dashed,
+      priceScaleId, lastValueVisible: false, priceLineVisible: false,
+    });
+    s.setData(times.map(t => ({ time: t, value: val })));
+  }
+}
+
+function macdHistColor(cur, prev) {
+  if (cur >= 0) return cur >= prev ? C.histUp : C.histUpWeak;
+  return cur <= prev ? C.histDn : C.histDnWeak;
+}
+
+function renderChart(kline, indicators) {
+  const container = document.getElementById('chart-container');
+  container.innerHTML = '';
+  if (currentChart) { currentChart.remove(); currentChart = null; }
+
+  const chart = createChart(container, {
+    width: container.clientWidth, height: container.clientHeight,
+    layout: { background: { type: ColorType.Solid, color: C.bg }, textColor: C.text },
+    grid: { vertLines: { color: C.grid }, horzLines: { color: C.grid } },
+    timeScale: { timeVisible: true, secondsVisible: false },
+    rightPriceScale: { scaleMargins: { top: 0.1, bottom: 0.1 } },
+    crosshair: { mode: 0 },
+  });
+  currentChart = chart;
+
+  const times = indicators.time.map(parseTime);
+
+  // --- Main pane: Candlestick ---
+  const candle = chart.addSeries(LightweightCharts.CandlestickSeries, {
+    upColor: C.up, downColor: C.down, borderVisible: false,
+    wickUpColor: C.up, wickDownColor: C.down,
+  });
+  candle.setData(kline.data.map(d => ({
+    time: parseTime(d.time), open: d.open, high: d.high, low: d.low, close: d.close,
+  })));
+
+  // --- Volume ---
+  const vol = chart.addSeries(LightweightCharts.HistogramSeries, {
+    priceScaleId: 'vol', priceFormat: { type: 'volume' },
+    lastValueVisible: false, priceLineVisible: false,
+  });
+  vol.priceScale().applyOptions({ scaleMargins: { top: 0.8, bottom: 0.05 } });
+  vol.setData(kline.data.map(d => ({
+    time: parseTime(d.time), value: d.volume,
+    color: d.close >= d.open ? 'rgba(255,82,82,0.3)' : 'rgba(0,168,67,0.3)',
+  })));
+
+  // --- MACD pane ---
+  if (indicators.macd) {
+    const macdPane = chart.addPane();
+    macdPane.setStretchFactor(0.5);
+    const m = indicators.macd;
+
+    const hist = macdPane.addSeries(LightweightCharts.HistogramSeries, {
+      priceScaleId: 'macd', priceLineVisible: false, lastValueVisible: false,
+    });
+    hist.setData(times.map((t, i) => ({
+      time: t, value: m.hist[i],
+      color: macdHistColor(m.hist[i], i > 0 ? m.hist[i - 1] : 0),
+    })));
+
+    const macdLine = macdPane.addSeries(LightweightCharts.LineSeries, {
+      color: C.macdLine, lineWidth: 1, priceScaleId: 'macd',
+      lastValueVisible: false, priceLineVisible: false,
+    });
+    macdLine.setData(times.map((t, i) => ({ time: t, value: m.vmacd[i] })));
+
+    const sigLine = macdPane.addSeries(LightweightCharts.LineSeries, {
+      color: C.signal, lineWidth: 1, priceScaleId: 'macd',
+      lastValueVisible: false, priceLineVisible: false,
+    });
+    sigLine.setData(times.map((t, i) => ({ time: t, value: m.signal[i] })));
+
+    const zeroLine = macdPane.addSeries(LightweightCharts.LineSeries, {
+      color: C.refLine, lineWidth: 1, lineStyle: LineStyle.Dashed,
+      priceScaleId: 'macd', lastValueVisible: false, priceLineVisible: false,
+    });
+    zeroLine.setData(times.map(t => ({ time: t, value: 0 })));
+  }
+
+  // --- KD pane ---
+  if (indicators.kd) {
+    const kdPane = chart.addPane();
+    kdPane.setStretchFactor(0.5);
+    const kd = indicators.kd;
+
+    const kSeries = kdPane.addSeries(LightweightCharts.LineSeries, {
+      color: C.kLine, lineWidth: 1, priceScaleId: 'kd',
+      lastValueVisible: false, priceLineVisible: false,
+    });
+    kSeries.setData(times.map((t, i) => ({ time: t, value: kd.k[i] })));
+
+    const dSeries = kdPane.addSeries(LightweightCharts.LineSeries, {
+      color: C.dLine, lineWidth: 1, priceScaleId: 'kd',
+      lastValueVisible: false, priceLineVisible: false,
+    });
+    dSeries.setData(times.map((t, i) => ({ time: t, value: kd.d[i] })));
+
+    addRefLines(kdPane, times, kd.overbought || 80, kd.oversold || 20, 'kd');
+  }
+
+  // --- RSI pane ---
+  if (indicators.rsi) {
+    const rsiPane = chart.addPane();
+    rsiPane.setStretchFactor(0.5);
+    const rsi = indicators.rsi;
+
+    const rsiSeries = rsiPane.addSeries(LightweightCharts.LineSeries, {
+      color: C.rsiLine, lineWidth: 1, priceScaleId: 'rsi',
+      lastValueVisible: false, priceLineVisible: false,
+    });
+    rsiSeries.setData(times.map((t, i) => ({ time: t, value: rsi.values[i] })));
+
+    addRefLines(rsiPane, times, rsi.overbought || 70, rsi.oversold || 30, 'rsi');
+  }
+
+  chart.timeScale().fitContent();
+
+  const ro = new ResizeObserver(() => {
+    chart.applyOptions({ width: container.clientWidth, height: container.clientHeight });
+  });
+  ro.observe(container);
+}
+
+async function fetchData() {
+  const code = input.value.trim();
+  if (!code) return;
+  const status = document.getElementById('status');
+  const resultDiv = document.getElementById('result');
+  status.textContent = 'Loading...';
+  resultDiv.innerHTML = '';
+
+  try {
+    const [detectResp, klineResp, indResp] = await Promise.all([
+      fetch(`/api/detect/${encodeURIComponent(code)}`),
+      fetch(`/api/kline/${encodeURIComponent(code)}`),
+      fetch(`/api/indicators/${encodeURIComponent(code)}`),
+    ]);
+
+    if (!detectResp.ok) throw new Error(`Detect: ${(await detectResp.json()).detail}`);
+    const detectData = await detectResp.json();
+
+    status.textContent = `${code} - ${Object.keys(detectData.indicators).length} indicators`;
+    renderIndicators(detectData.indicators);
+
+    if (klineResp.ok && indResp.ok) {
+      const kline = await klineResp.json();
+      const indicators = await indResp.json();
+      renderChart(kline, indicators);
+    } else {
+      document.getElementById('chart-container').innerHTML =
+        '<div style="padding:20px;color:#888">Chart data unavailable</div>';
+    }
+  } catch (e) {
+    status.textContent = e.message;
+  }
+}
+
+function wrClass(v) {
+  if (v >= 0.6) return 'wr-high';
+  if (v >= 0.45) return 'wr-mid';
+  return 'wr-low';
+}
+function fmtPct(v) { return v != null ? (v * 100).toFixed(1) + '%' : '-'; }
+function fmtNum(v) { return v != null ? v : '-'; }
+
+function renderPerf(perf, label) {
+  return `<tr>
+    <td style="font-weight:500;color:#aaa;font-size:11px">${label}</td>
+    <td class="${wrClass(perf.support_win_rate)}">${fmtPct(perf.support_win_rate)}</td>
+    <td>${fmtNum(perf.support_signals_count)}</td>
+    <td>${fmtNum(perf.support_z_score)}</td>
+    <td class="${wrClass(perf.resistance_win_rate)}">${fmtPct(perf.resistance_win_rate)}</td>
+    <td>${fmtNum(perf.resistance_signals_count)}</td>
+    <td>${fmtNum(perf.resistance_z_score)}</td>
+  </tr>`;
+}
+
+function renderIndicators(indicators) {
+  const container = document.getElementById('result');
+  for (const [name, data] of Object.entries(indicators)) {
+    const card = document.createElement('div');
+    card.className = 'indicator-card';
+
+    const params = Object.entries(data.best_params)
+      .map(([k, v]) => `<span class="param-tag">${k}: ${v}</span>`).join('');
+
+    const meta = data.meta_info;
+    const metaStr = `look_ahead=${meta.look_ahead} | target_mult=${parseFloat(meta.target_multiplier).toFixed(2)} | atr_period=${meta.atr_period} | vol=${parseFloat(meta.volatility).toFixed(4)}`;
+
+    const perf = data.performance;
+    let rows = renderPerf(perf, 'Raw');
+    if (perf.checked) rows += renderPerf(perf.checked, 'Checked');
+    for (const key of Object.keys(perf).filter(k => k.startsWith('checked_'))) {
+      rows += renderPerf(perf[key], key.replace('checked_', 'Filter@'));
+    }
+
+    card.innerHTML = `
+      <h3>${name}</h3>
+      <div class="params">${params}</div>
+      <div class="meta-row">${metaStr}</div>
+      <table>
+        <thead><tr>
+          <th></th>
+          <th>Sup WR</th><th>Sup #</th><th>Sup Z</th>
+          <th>Res WR</th><th>Res #</th><th>Res Z</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+    container.appendChild(card);
+  }
+}
+</script>
+</body>
+</html>
