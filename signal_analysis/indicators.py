@@ -128,7 +128,7 @@ class KD(Indicator):
         low_min = low.rolling(window=k_period).min()
         high_max = high.rolling(window=k_period).max()
         k = 100 * (close - low_min) / (high_max - low_min)
-        d = k.rolling(window=d_period).mean()
+        d = k.ewm(span=d_period, adjust=False).mean()
         return k, d
 
     def _future_confirmation(self, df, is_support):
@@ -180,8 +180,6 @@ class MACD(Indicator):
         return df
 
     def calculate_score(self, result: Dict, signal_count_target: float) -> float:
-        signal_count_target = signal_count_target / 3
-
         support_f1 = result['strong_support_win_rate']
         resistance_f1 = result['strong_resistance_win_rate']
 
@@ -191,10 +189,10 @@ class MACD(Indicator):
             score = 0
 
         # 信号数量惩罚
-        signal_count_penalty = min(1.0, (max(result['strong_support_signals_count'], result['strong_resistance_signals_count']))/signal_count_target)
-        
+        signal_count_penalty = min(1.0, min(result['strong_support_signals_count'],
+                                           result['strong_resistance_signals_count']) / signal_count_target)
+
         return score * signal_count_penalty
-    
 
     def indicator_calculate(self, df: pd.DataFrame, params: Dict) -> Tuple[pd.Series]: # -> Tuple[vmacd, signal]
         return self._macd_atr(df['close'], df['high'], df['low'], int(params['fast_period']), int(params['slow_period']), int(params['signal_period']))
