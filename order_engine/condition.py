@@ -1,28 +1,16 @@
 import configparser
 import os
 import re
-import sys
-from pathlib import Path
-import time
 from typing import Callable
 import yaml
 from datetime import datetime
-from notification_engine import NotificationEngine
-from ft_config import get_config
 
-# 将项目根目录添加到Python路径，确保可以导入gateway
-sys.path.append(str(Path(__file__).resolve().parent))
-
-from vnpy.event import Event, EventEngine
-from vnpy.trader.engine import LogData, MainEngine
-from vnpy.trader.ui import MainWindow, create_qapp
-from vnpy.trader.object import TickData, OrderRequest, SubscribeRequest
-from vnpy.trader.constant import Direction, Offset, OrderType, Exchange
-from vnpy.trader.event import EVENT_LOG, EVENT_TICK
-from vnpy.trader.app import BaseApp
-from vnpy.trader.engine import BaseEngine
-
-from gateway import FutuGateway, QmtGateway
+from order_engine.event_engine import Event, EVENT_LOG, EVENT_TICK
+from order_engine.core import MainEngine, BaseEngine
+from order_engine.models import (
+    TickData, OrderRequest, SubscribeRequest, LogData,
+    Exchange, Direction, Offset, OrderType,
+)
 
 EXCHANGE_MAP = {
     "SH": Exchange.SSE,
@@ -41,22 +29,20 @@ ORDER_TYPE_MAP = {
     "market": OrderType.MARKET,
 }
 
+
 class ConditionOrderEngine(BaseEngine):
     """条件单引擎"""
-    
-    def __init__(self, main_engine: MainEngine, event_engine: EventEngine, engine_name='ConditionOrder'):
+
+    def __init__(self, main_engine: MainEngine, event_engine, engine_name='ConditionOrder'):
         super().__init__(main_engine, event_engine, engine_name)
         self.active_orders = {}
 
     def write_log(self, msg: str, source: str = "") -> None:
-        """
-        Put log event with specific message.
-        """
         log = LogData(msg=msg, gateway_name=source)
         event = Event(EVENT_LOG, log)
         self.event_engine.put(event)
 
-    def load(self, config: configparser.ConfigParser, notify_calc:Callable[[str], None]=None):
+    def load(self, config: configparser.ConfigParser, notify_calc: Callable[[str], None] = None):
         """加载配置"""
         self.yaml_config_path = config.get("CONFIG", "ORDER_CONFIG", fallback=None)
         if os.path.exists(self.yaml_config_path):
@@ -66,7 +52,7 @@ class ConditionOrderEngine(BaseEngine):
             for order_config in yaml_config.get('orders', []):
                 if order_config.get('enabled', False):
                     self.active_orders[order_config['id']] = order_config
-            
+
             self.event_engine.register(EVENT_TICK, self.process_tick)
             if isinstance(notify_calc, Callable):
                 # 注册LOG事件回调
@@ -74,17 +60,17 @@ class ConditionOrderEngine(BaseEngine):
                     log: LogData = event.data
                     notify_calc(log.msg)
                 self.event_engine.register(EVENT_LOG, process_log)
-            
+
             # 订阅行情 暂定futu
             symbols_to_subscribe = set()
             for order in self.active_orders.values():
                 req = SubscribeRequest(symbol=order['symbol'], exchange=EXCHANGE_MAP[order['exchange']])
                 symbols_to_subscribe.add((req.symbol, req.exchange))
-            
+
             for symbol, exchange in symbols_to_subscribe:
                 req = SubscribeRequest(symbol=symbol, exchange=exchange)
                 self.main_engine.subscribe(req, "FUTU")
-            
+
         else:
             self.write_log(f"yaml配置不存在: {self.yaml_config_path}")
             raise Exception(f"yaml配置不存在: {self.yaml_config_path}")
@@ -105,18 +91,18 @@ class ConditionOrderEngine(BaseEngine):
     def _check_condition(self, order: dict, tick: TickData):
         items = order['conditions']['items']
         op = order['conditions'].get('logical_operator', 'AND').upper()
-        
+
         results = []
         for cond in items:
             result = False
 
-            if 'variable' not in cond: 
+            if 'variable' not in cond:
                 results.append(False)
                 self.write_log(f"条件单 {order['id']} {cond['variable']} 变量不存在")
                 continue
-            
+
             var_value = getattr(tick, cond['variable'], None)
-            if var_value is None: 
+            if var_value is None:
                 results.append(False)
                 self.write_log(f"条件单 {order['id']} {cond['variable']} 变量值为空")
                 continue
@@ -136,8 +122,7 @@ class ConditionOrderEngine(BaseEngine):
                     results.append(False)
                     self.write_log(f"条件单 {order['id']} {cond['variable']} 时间格式异常: {target_value}")
                     continue
-                
-            
+
             try:
                 if operator == '>':   result = var_value > target_value
                 elif operator == '<':   result = var_value < target_value
@@ -147,9 +132,9 @@ class ConditionOrderEngine(BaseEngine):
             except Exception as e:
                 self.write_log(f"条件单 {order['id']} {cond['variable']} 比较异常: {e}")
                 result = False
-            
+
             results.append(result)
-            
+
         if not results: return False
         return all(results) if op == 'AND' else any(results)
 
@@ -168,43 +153,3 @@ class ConditionOrderEngine(BaseEngine):
                     offset=Offset.OPEN
                 )
                 self.main_engine.send_order(req, "QMT")
-
-def main():
-    config = get_config()
-    
-    qapp = create_qapp()
-    event_engine = EventEngine()
-    main_engine = MainEngine(event_engine)
-    
-    futu_setting = {
-        "host": config.get("CONFIG", "FUTU_HOST"),
-        "port": int(config.get("CONFIG", "FUTU_PORT")),
-    }
-    main_engine.add_gateway(FutuGateway, "FUTU")
-    main_engine.connect(futu_setting, "FUTU")
-
-    qmt_setting = {
-        "path": config.get("CONFIG", "QMT_PATH"),
-        "session_id": int(time.time()),
-        "account_id": config.get("CONFIG", "QMT_ACCOUNT_ID"),
-    }
-    main_engine.add_gateway(QmtGateway, "QMT")
-    main_engine.connect(qmt_setting, "QMT")
-
-    # 远程通知
-    notification_engine = NotificationEngine(config)
-    def notify_calc(msg:str):
-        print(f'{datetime.now().strftime("%Y-%m-%d %H:%M:%S")} {msg}')
-        notification_engine.send_telegram_message(msg)
-        notification_engine.send_email(msg,msg)
-    
-    # 添加条件单配置
-    condition_engine: ConditionOrderEngine = main_engine.add_engine(ConditionOrderEngine)
-    condition_engine.load(config, notify_calc)
-    # main_window = MainWindow(main_engine, event_engine)
-    # main_window.showMaximized()
-    
-    qapp.exec()
-
-if __name__ == "__main__":
-    main()

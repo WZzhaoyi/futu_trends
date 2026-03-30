@@ -5,29 +5,28 @@ import datetime
 from datetime import datetime
 from copy import copy
 from typing import Dict, Set
+from zoneinfo import ZoneInfo
 
-from vnpy.trader.gateway import BaseGateway
-from vnpy.trader.object import (
-    TickData, OrderRequest, OrderData, TradeData, PositionData, AccountData, 
-    SubscribeRequest, ContractData, CancelRequest
+from order_engine.core import BaseGateway
+from order_engine.event_engine import EVENT_TICK, EVENT_ORDER, EVENT_TRADE, EVENT_ACCOUNT, EVENT_POSITION, EVENT_TIMER
+from order_engine.models import (
+    TickData, OrderRequest, OrderData, TradeData, PositionData, AccountData,
+    SubscribeRequest, ContractData, CancelRequest,
+    Exchange, Direction, Offset, Status, OrderType, Product,
 )
-from vnpy.trader.constant import Exchange, Direction, Offset, Status, OrderType, Product
-from vnpy.trader.event import EVENT_TICK, EVENT_ORDER, EVENT_TRADE, EVENT_ACCOUNT, EVENT_POSITION, EVENT_TIMER
-from vnpy.trader.utility import ZoneInfo
 
 from xtquant import xtconstant
 from xtquant.xttrader import XtQuantTrader, XtQuantTraderCallback
 from xtquant.xttype import StockAccount, XtTrade, XtAsset, XtOrder, XtOrderError, XtOrderResponse, XtPosition, XtCancelError, XtCancelOrderResponse
 import xtquant.xtdata
 
-# 富途交易所映射
-EXCHANGE_VT2FUTU = {
-    Exchange.SMART: "US",
-    Exchange.SEHK: "HK", 
-    Exchange.SSE: "SH",
-    Exchange.SZSE: "SZ",
+# 富途交易所映射（Exchange.value 即为 Futu 交易所代码）
+EXCHANGE_FUTU2VT = {
+    "US": Exchange.SMART,
+    "HK": Exchange.SEHK,
+    "SH": Exchange.SSE,
+    "SZ": Exchange.SZSE,
 }
-EXCHANGE_FUTU2VT = {v: k for k, v in EXCHANGE_VT2FUTU.items()}
 
 # QMT交易所映射 不支持US
 QMT_EXCHANGE_MAP = {
@@ -76,12 +75,11 @@ QMT_PRODUCT_MAP = {
 CHINA_TZ = ZoneInfo("Asia/Shanghai")
 
 def convert_symbol_vt2futu(symbol: str, exchange: Exchange) -> str:
-    """将vnpy合约名称转换为富途格式"""
-    futu_exchange = EXCHANGE_VT2FUTU.get(exchange, exchange.value)
-    return f"{futu_exchange}.{symbol}"
+    """将合约名称转换为富途格式"""
+    return f"{exchange.value}.{symbol}"
 
 def convert_symbol_futu2vt(code: str) -> tuple:
-    """将富途合约名称转换为vnpy格式"""
+    """将富途合约名称转换为内部格式"""
     code_list = code.split(".")
     futu_exchange = code_list[0]
     futu_symbol = ".".join(code_list[1:])
@@ -89,7 +87,7 @@ def convert_symbol_futu2vt(code: str) -> tuple:
     return futu_symbol, exchange
 
 def convert_symbol_vt2qmt(symbol: str, exchange: Exchange, market: str) -> str:
-    """将vnpy合约名称转换为QMT格式"""
+    """将合约名称转换为QMT格式"""
     qmt_exchange = QMT_EXCHANGE_MAP.get(exchange)
     # qmt为国内券商提供服务，需要将港股映射为沪港通或深港通
     if market == 'HUGANGTONG' and (exchange == Exchange.SEHK or exchange == Exchange.SHHK):
@@ -101,9 +99,9 @@ def convert_symbol_vt2qmt(symbol: str, exchange: Exchange, market: str) -> str:
     return f"{symbol}.{qmt_exchange}"
 
 def convert_symbol_qmt2vt(code: str, market: str = None) -> tuple:
-    """将QMT合约名称转换为vnpy格式"""
+    """将QMT合约名称转换为内部格式"""
     symbol, suffix = code.rsplit('.')
-    
+
     # 如果market参数未提供，从代码后缀自动推断
     if market is None:
         if suffix in ['SH', 'SZ']:
@@ -112,14 +110,14 @@ def convert_symbol_qmt2vt(code: str, market: str = None) -> tuple:
             market = 'HUGANGTONG'
         else:
             market = 'STOCK'  # 默认
-    
+
     # 根据market参数调整交易所映射
     if market == 'HUGANGTONG' and suffix == 'HK':
         # 港股通交易，HK后缀映射到SHHK
         exchange = Exchange.SHHK
     else:
         exchange = QMT_TO_VN_EXCHANGE.get(suffix)
-    
+
     if not exchange:
         raise ValueError(f"不支持的QMT交易所: {suffix}")
     return symbol, exchange
@@ -130,7 +128,7 @@ def timestamp_to_datetime(timestamp: int) -> datetime:
 
 class FutuGateway(BaseGateway):
     """富途行情Gateway - 专注于行情推送"""
-    
+
     default_name = "FUTU"
     default_setting = {
         "host": "127.0.0.1",
@@ -147,11 +145,11 @@ class FutuGateway(BaseGateway):
         """连接行情接口"""
         try:
             self.quote_ctx = ft.OpenQuoteContext(host=setting["host"], port=setting["port"])
-            
+
             # 设置行情推送处理器
             class QuoteHandler(ft.StockQuoteHandlerBase):
                 gateway = self
-                
+
                 def on_recv_rsp(self, rsp_str):
                     ret_code, content = super(QuoteHandler, self).on_recv_rsp(rsp_str)
                     if ret_code != ft.RET_OK:
@@ -161,9 +159,9 @@ class FutuGateway(BaseGateway):
 
             self.quote_ctx.set_handler(QuoteHandler())
             self.quote_ctx.start()
-            
+
             self.write_log("富途行情Gateway连接成功")
-            
+
         except Exception as e:
             self.write_log(f"富途行情Gateway连接失败: {e}")
 
@@ -173,9 +171,9 @@ class FutuGateway(BaseGateway):
         if req.exchange not in self.exchanges:
             self.write_log(f"futu不支持订阅行情: {req.symbol} {req.exchange}")
             return
-        
+
         futu_symbol = convert_symbol_vt2futu(req.symbol, req.exchange)
-        
+
         code, data = self.quote_ctx.subscribe(futu_symbol, "QUOTE", True)
         if code:
             self.write_log(f"订阅行情失败：{data}")
@@ -186,7 +184,7 @@ class FutuGateway(BaseGateway):
         """获取或创建Tick数据"""
         tick = self.ticks.get(code, None)
         symbol, exchange = convert_symbol_futu2vt(code)
-        
+
         if not tick:
             tick = TickData(
                 symbol=symbol,
@@ -195,14 +193,14 @@ class FutuGateway(BaseGateway):
                 gateway_name=self.gateway_name,
             )
             self.ticks[code] = tick
-        
+
         return tick
 
     def process_quote(self, data):
         """处理行情推送"""
         for _, row in data.iterrows():
             symbol = row["code"]
-            
+
             # 解析时间
             date = row["data_date"].replace("-", "")
             time_str = row["data_time"]
@@ -210,7 +208,7 @@ class FutuGateway(BaseGateway):
                 time_str = time_str.split('.')[0]
             dt = datetime.strptime(f"{date} {time_str}", "%Y%m%d %H:%M:%S")
             dt = dt.replace(tzinfo=CHINA_TZ)
-            
+
             # 获取或创建Tick数据
             tick = self.get_tick(symbol)
             tick.datetime = dt
@@ -220,13 +218,13 @@ class FutuGateway(BaseGateway):
             tick.pre_close = row["prev_close_price"]
             tick.last_price = row["last_price"]
             tick.volume = row["volume"]
-            
+
             # 设置涨跌停价格
             if "price_spread" in row:
                 spread = row["price_spread"]
                 tick.limit_up = tick.last_price + spread * 10
                 tick.limit_down = tick.last_price - spread * 10
-            
+
             # 推送Tick数据
             self.on_tick(copy(tick))
             print(f'{tick.datetime} futu Tick: {symbol} {tick.name} {tick.last_price}')
@@ -236,18 +234,6 @@ class FutuGateway(BaseGateway):
         self.write_log("富途Gateway仅支持行情数据，不支持交易")
         return ""
 
-    def cancel_order(self, req):
-        """富途Gateway不支持交易"""
-        self.write_log("富途Gateway仅支持行情数据，不支持交易")
-
-    def query_account(self):
-        """富途Gateway不支持交易"""
-        self.write_log("富途Gateway仅支持行情数据，不支持交易")
-
-    def query_position(self):
-        """富途Gateway不支持交易"""
-        self.write_log("富途Gateway仅支持行情数据，不支持交易")
-
     def close(self):
         """关闭连接"""
         if self.quote_ctx:
@@ -256,7 +242,7 @@ class FutuGateway(BaseGateway):
 
 class QmtGateway(BaseGateway, XtQuantTraderCallback):
     """QMT交易Gateway - 专注于A股和港股通交易"""
-    
+
     default_setting = {
         "path": "C:/Users/Administrator/mini_qmt/",
         "session_id": 123456,
@@ -278,7 +264,7 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
         self.session_id = int(datetime.now().strftime('%H%M%S'))
         self.inited = False
         self.account_id = None
-        
+
         # 注册定时事件
         self.event_engine.register(EVENT_TIMER, self.process_timer_event)
 
@@ -288,11 +274,11 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
             account = setting['account_id']
             path = setting['path']
             self.account_id = account
-            
+
             self.trader = XtQuantTrader(path=path, session=self.session_id)
             self.trader.register_callback(self)
             self.trader.start()
-            
+
             # 连接
             cnn_msg = self.trader.connect()
             if cnn_msg == 0:
@@ -300,7 +286,7 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
             else:
                 self.write_log(f'QMT连接失败：{cnn_msg}')
                 return
-            
+
             account_types = ['STOCK', 'HUGANGTONG']
             for account_type in account_types:
                 try:
@@ -313,17 +299,17 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
                         self.write_log(f'订阅{account_type}账户失败：{sub_msg}')
                 except Exception as e:
                     self.write_log(f'创建{account_type}账户失败：{e}')
-            
+
             if self.accounts:
                 self.inited = True
                 self.write_log(f'成功初始化{len(self.accounts)}个账户类型')
             else:
                 self.write_log('未能成功初始化任何账户')
                 return
-            
+
             # 获取合约信息
             self._get_contracts()
-            
+
         except Exception as e:
             self.write_log(f"QMT连接异常: {e}")
 
@@ -343,7 +329,7 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
             if req.exchange not in self.exchanges:
                 self.write_log(f"qmt不支持订阅行情: {req.symbol} {req.exchange}")
                 return
-            
+
             account_type = EXCHANGE_TO_ACCOUNT_TYPE.get(req.exchange, 'STOCK')
             qmt_code = convert_symbol_vt2qmt(req.symbol, req.exchange, account_type)
             return xtquant.xtdata.subscribe_quote(
@@ -360,13 +346,13 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
             if req.exchange not in self.exchanges:
                 self.write_log(f"qmt不支持交易: {req.symbol} {req.exchange}")
                 return
-            
+
             # 根据交易所获取对应的账号
             account = self._get_account_by_exchange(req.exchange)
             account_type = EXCHANGE_TO_ACCOUNT_TYPE.get(req.exchange, 'STOCK')
-            
+
             order_id = self._get_order_id()
-            
+
             # 发送异步订单
             qmt_code = convert_symbol_vt2qmt(req.symbol, req.exchange, account_type)
             seq = self.trader.order_stock_async(
@@ -381,7 +367,7 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
 
             if seq == -1:
                 raise Exception(f"{qmt_code} {order_id}")
-            
+
             # 创建订单对象
             order = OrderData(
                 gateway_name=self.gateway_name,
@@ -398,7 +384,7 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
             self.orders[order_id] = order
             self.write_log(f"使用{account_type}账号发送订单: {req.symbol} {req.exchange}")
             return order.vt_orderid
-            
+
         except Exception as e:
             self.write_log(f"发送订单失败: {e}")
             return ""
@@ -410,7 +396,7 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
             if order and hasattr(order, 'reference'):
                 account = self._get_account_by_exchange(order.exchange)
                 return self.trader.cancel_order_stock_async(
-                    account=account, 
+                    account=account,
                     order_id=order.reference
                 )
         except Exception as e:
@@ -444,7 +430,7 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
         """定时事件处理"""
         if not self.inited:
             return
-            
+
         if self.count == -1:
             self.query_trade()
         self.count += 1
@@ -455,7 +441,7 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
         if self.count % 7 == 0:
             self.query_account()
             self.query_position()
-            
+
         if self.count < 21:
             return
         self.count = 0
@@ -465,7 +451,7 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
         self.write_log('开始获取合约信息')
         contract_ids = set()
         sectors = ['上证A股', '深证A股', '科创板', '创业板', '沪市ETF', '深市ETF']
-        
+
         for sector in sectors:
             try:
                 stock_list = xtquant.xtdata.get_stock_list_in_sector(sector_name=sector)
@@ -473,21 +459,21 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
                     if symbol in contract_ids:
                         continue
                     contract_ids.add(symbol)
-                    
+
                     info = xtquant.xtdata.get_instrument_detail(symbol)
                     contract_type = xtquant.xtdata.get_instrument_type(symbol)
-                    
+
                     if info is None or contract_type is None:
                         continue
-                    
+
                     try:
                         exchange = QMT_TO_VN_EXCHANGE[info['ExchangeID']]
                     except KeyError:
                         continue
-                    
+
                     if exchange not in self.exchanges:
                         continue
-                    
+
                     product = QMT_PRODUCT_MAP.get(contract_type, Product.EQUITY)
                     if product not in self.TRADE_TYPE:
                         continue
@@ -502,15 +488,15 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
                         size=100,
                         min_volume=100
                     )
-                    
+
                     self.limit_ups[contract.vt_symbol] = info['UpStopPrice']
                     self.limit_downs[contract.vt_symbol] = info['DownStopPrice']
                     self.contracts[contract.vt_symbol] = contract
                     self.on_contract(contract)
-                    
+
             except Exception as e:
                 self.write_log(f"获取{sector}合约信息失败: {e}")
-        
+
         self.write_log(f'获取合约信息完成，共{len(self.contracts)}个合约')
 
     def _get_order_id(self):
@@ -525,7 +511,7 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
                 symbol, exchange = convert_symbol_qmt2vt(code)
                 for data in data_list:
                     dt = timestamp_to_datetime(data['time']).replace(tzinfo=CHINA_TZ)
-                    
+
                     tick = TickData(
                         gateway_name=self.gateway_name,
                         symbol=symbol,
@@ -558,16 +544,16 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
                         bid_volume_4=data['bidVol'][3],
                         bid_volume_5=data['bidVol'][4],
                     )
-                    
+
                     # 设置合约名称和涨跌停价格
                     contract = self.contracts.get(tick.vt_symbol)
                     if contract:
                         tick.name = contract.name
                     tick.limit_up = self.limit_ups.get(tick.vt_symbol, 0)
                     tick.limit_down = self.limit_downs.get(tick.vt_symbol, 0)
-                    
+
                     self.on_tick(tick)
-                    
+
             except Exception as e:
                 self.write_log(f"处理行情数据失败: {e}")
 
@@ -618,7 +604,7 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
                     datetime=timestamp_to_datetime(order.order_time),
                     reference=order.order_id
                 )
-                
+
                 # 检查订单状态变化
                 old_order = self.orders.get(vn_order.orderid)
                 if old_order:
@@ -627,16 +613,16 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
                 else:
                     old_status = None
                     old_traded = 0
-                
+
                 self.orders[vn_order.orderid] = vn_order
                 self.on_order(vn_order)
-                
+
                 # 如果有成交变化，输出成交信息
                 if vn_order.traded > old_traded and old_status != Status.ALLTRADED:
                     new_traded = vn_order.traded - old_traded
                     self.write_log(f'订单成交: {vn_order.symbol} {vn_order.exchange} {vn_order.direction} '
                                 f'成交{new_traded}股，累计{vn_order.traded}/{vn_order.volume}股')
-                
+
                 # 如果订单完成，输出完成信息
                 if vn_order.status == Status.ALLTRADED:
                     self.write_log(f'✅ 订单完成: {vn_order.symbol} {vn_order.exchange} {vn_order.direction} '
@@ -658,7 +644,7 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
                 symbol, exchange = convert_symbol_qmt2vt(trade.stock_code)
                 if not trade.order_remark:
                     continue
-                    
+
                 trade_data = TradeData(
                     gateway_name=self.gateway_name,
                     symbol=symbol,
