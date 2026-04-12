@@ -103,6 +103,7 @@ if __name__ == '__main__':
     host = config.get("CONFIG", "FUTU_HOST")
     port = int(config.get("CONFIG", "FUTU_PORT"))
     group = config.get("CONFIG", "FUTU_GROUP", fallback='')
+    groups = [g.strip() for g in group.split(',') if g.strip()]
     # True->检查PARAMS_DB中是否存在参数 如果存在则不进行训练
     params_check = config.getboolean("CONFIG", "PARAMS_CHECK", fallback=False)
     # True->将训练结果更新到PARAMS_DB中
@@ -117,8 +118,8 @@ if __name__ == '__main__':
 
     # 获取股票列表
     code_pd = pd.DataFrame(columns=pd.Index(['code','name']))
-    if group:
-        ls = code_in_futu_group(group,host,port)
+    for g in groups:
+        ls = code_in_futu_group(g, host, port)
         if isinstance(ls, pd.DataFrame):
             code_pd = pd.concat([code_pd, ls[['code','name']]])
     if len(code_list) > 0:
@@ -169,7 +170,8 @@ if __name__ == '__main__':
             print(f"no code to train {trend_type}")
             continue
         
-        output_dir = f'./output/detect_{timestamp}_{ktype}_{sanitize_path_component(group)}_{indicator_type}'
+        group_label = sanitize_path_component('_'.join(groups)) if groups else ''
+        output_dir = f'./output/detect_{timestamp}_{ktype}_{group_label}_{indicator_type}'
         results, result_file = run_analysis(pd_code_list, indicator_type, config, output_dir=output_dir)
 
         if params_db is not None and params_update is True and len(db_list) >= 1 and result_file:
