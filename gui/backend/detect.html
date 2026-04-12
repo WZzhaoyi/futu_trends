@@ -8,25 +8,49 @@
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 html, body { height: 100%; overflow: hidden; }
-body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace; background: #1a1a2e; color: #e0e0e0; display: flex; flex-direction: column; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace; display: flex; flex-direction: column; transition: background .2s, color .2s; }
+
+[data-theme="dark"] {
+  --bg: #1a1a2e; --fg: #e0e0e0; --muted: #888;
+  --card-bg: #16213e; --border: #0f3460; --tag-bg: #0f3460;
+  --btn-bg: #0f3460; --btn-hover: #1a5276;
+  --chart-bg: #1a1a2e; --chart-text: #888; --chart-grid: #0f3460;
+  --ref-line: rgba(255,255,255,0.15);
+  --vol-up: rgba(255,82,82,0.3); --vol-dn: rgba(0,168,67,0.3);
+  --heading: #53c7f0;
+}
+[data-theme="light"] {
+  --bg: #f5f5f5; --fg: #222; --muted: #666;
+  --card-bg: #fff; --border: #d0d0d0; --tag-bg: #e8e8e8;
+  --btn-bg: #e0e0e0; --btn-hover: #ccc;
+  --chart-bg: #ffffff; --chart-text: #555; --chart-grid: #e0e0e0;
+  --ref-line: rgba(0,0,0,0.12);
+  --vol-up: rgba(255,82,82,0.25); --vol-dn: rgba(0,168,67,0.25);
+  --heading: #1565c0;
+}
+
+body { background: var(--bg); color: var(--fg); }
 .search { display: flex; gap: 10px; padding: 10px 16px; align-items: center; flex-shrink: 0; }
-.search input { background: #16213e; border: 1px solid #0f3460; color: #e0e0e0; padding: 6px 12px; border-radius: 6px; font-size: 13px; width: 200px; }
-.search button { background: #0f3460; color: #e0e0e0; border: none; padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
-.search button:hover { background: #1a5276; }
-#status { color: #888; font-size: 12px; }
+.search input { background: var(--card-bg); border: 1px solid var(--border); color: var(--fg); padding: 6px 12px; border-radius: 6px; font-size: 13px; width: 200px; }
+.search button { background: var(--btn-bg); color: var(--fg); border: none; padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+.search button:hover { background: var(--btn-hover); }
+#status { color: var(--muted); font-size: 12px; }
+#theme-btn { font-size: 15px; line-height: 1; padding: 4px 8px; margin-left: auto; }
 .indicators { display: flex; flex-wrap: wrap; gap: 10px; padding: 0 16px 10px; flex-shrink: 0; }
-.indicator-card { background: #16213e; border: 1px solid #0f3460; border-radius: 6px; padding: 10px 12px; flex: 1; min-width: 300px; }
-.indicator-card h3 { color: #53c7f0; margin-bottom: 6px; font-size: 14px; }
+.indicator-card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; flex: 1; min-width: 300px; }
+.indicator-card h3 { color: var(--heading); margin-bottom: 6px; font-size: 14px; }
 .params { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; }
-.param-tag { background: #0f3460; padding: 2px 6px; border-radius: 3px; font-size: 11px; }
-.meta-row { font-size: 11px; color: #888; margin-bottom: 6px; }
+.param-tag { background: var(--tag-bg); padding: 2px 6px; border-radius: 3px; font-size: 11px; }
+.meta-row { font-size: 11px; color: var(--muted); margin-bottom: 6px; }
 table { width: 100%; border-collapse: collapse; font-size: 12px; }
-th { text-align: left; padding: 3px 6px; border-bottom: 1px solid #0f3460; color: #888; font-weight: normal; }
-td { padding: 3px 6px; border-bottom: 1px solid #0f3460; }
+th { text-align: left; padding: 3px 6px; border-bottom: 1px solid var(--border); color: var(--muted); font-weight: normal; }
+td { padding: 3px 6px; border-bottom: 1px solid var(--border); }
 .wr-high { color: #4ecdc4; }
 .wr-mid { color: #f0c953; }
 .wr-low { color: #e07070; }
-#chart-container { flex: 1; min-height: 0; margin: 0 16px 10px; border: 1px solid #0f3460; border-radius: 6px; overflow: hidden; }
+#chart-container { flex: 1; min-height: 0; margin: 0 16px 10px; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; position: relative; }
+.pane-legend { position: absolute; left: 8px; z-index: 10; font-size: 11px; pointer-events: none; display: flex; gap: 10px; }
+.pane-legend span { white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -34,6 +58,7 @@ td { padding: 3px 6px; border-bottom: 1px solid #0f3460; }
   <input id="code" type="text" placeholder="US.QQQ" autofocus>
   <button onclick="fetchData()">Query</button>
   <span id="status"></span>
+  <button id="theme-btn" onclick="cycleTheme()"></button>
 </div>
 <div id="result" class="indicators"></div>
 <div id="chart-container"></div>
@@ -44,6 +69,69 @@ const input = document.getElementById('code');
 input.addEventListener('keydown', e => { if (e.key === 'Enter') fetchData(); });
 
 let currentChart = null;
+
+// --- Theme ---
+const THEME_KEY = 'detect-theme'; // localStorage key
+const themeBtn = document.getElementById('theme-btn');
+// 'auto' | 'dark' | 'light'
+let themePref = localStorage.getItem(THEME_KEY) || 'auto';
+
+function getSystemTheme() {
+  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
+
+function resolvedTheme() {
+  return themePref === 'auto' ? getSystemTheme() : themePref;
+}
+
+function getChartColors() {
+  const dark = resolvedTheme() === 'dark';
+  return {
+    bg: dark ? '#1a1a2e' : '#ffffff',
+    text: dark ? '#888' : '#555',
+    grid: dark ? '#0f3460' : '#e0e0e0',
+    up: '#ff5252', down: '#00a843',
+    macdLine: '#ff9800', signal: '#2196f3',
+    histUp: 'rgba(255,82,82,0.8)', histUpWeak: 'rgba(255,205,210,0.6)',
+    histDn: 'rgba(38,166,154,0.8)', histDnWeak: 'rgba(178,223,219,0.6)',
+    kLine: '#ff9800', dLine: '#2196f3',
+    rsiLine: '#ab47bc',
+    refLine: dark ? 'rgba(255,255,255,0.15)' : 'rgba(0,0,0,0.12)',
+    volUp: dark ? 'rgba(255,82,82,0.3)' : 'rgba(255,82,82,0.25)',
+    volDn: dark ? 'rgba(0,168,67,0.3)' : 'rgba(0,168,67,0.25)',
+  };
+}
+
+let C = getChartColors();
+
+function applyTheme() {
+  const t = resolvedTheme();
+  document.documentElement.setAttribute('data-theme', t);
+  const icons = { auto: '\u25D1', light: '\u2600', dark: '\u263E' };
+  themeBtn.textContent = icons[themePref];
+  themeBtn.title = `Theme: ${themePref}`;
+
+  C = getChartColors();
+  if (currentChart) {
+    currentChart.applyOptions({
+      layout: { background: { type: ColorType.Solid, color: C.bg }, textColor: C.text },
+      grid: { vertLines: { color: C.grid }, horzLines: { color: C.grid } },
+    });
+  }
+}
+
+function cycleTheme() {
+  const order = ['auto', 'dark', 'light'];
+  themePref = order[(order.indexOf(themePref) + 1) % 3];
+  localStorage.setItem(THEME_KEY, themePref);
+  applyTheme();
+}
+
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+  if (themePref === 'auto') applyTheme();
+});
+
+applyTheme();
 
 // URL 路径中的 code 自动填入并查询
 const pathCode = window.location.pathname.replace(/^\/detect\/?/, '');
@@ -62,17 +150,6 @@ function parseTime(t) {
   }
   return t;
 }
-
-const C = {
-  bg: '#1a1a2e', text: '#888', grid: '#0f3460',
-  up: '#ff5252', down: '#00a843',
-  macdLine: '#2196f3', signal: '#ff9800',
-  histUp: 'rgba(255,82,82,0.8)', histUpWeak: 'rgba(255,205,210,0.6)',
-  histDn: 'rgba(38,166,154,0.8)', histDnWeak: 'rgba(178,223,219,0.6)',
-  kLine: '#2196f3', dLine: '#ff9800',
-  rsiLine: '#ab47bc',
-  refLine: 'rgba(255,255,255,0.15)',
-};
 
 function addRefLines(pane, times, overbought, oversold, priceScaleId) {
   for (const val of [overbought, oversold]) {
@@ -105,6 +182,8 @@ function renderChart(kline, indicators) {
   currentChart = chart;
 
   const times = indicators.time.map(parseTime);
+  let macdLine, sigLine, hist, kSeries, dSeries, rsiSeries;
+  let macdPane, kdPane, rsiPane;
 
   // --- Main pane: Candlestick ---
   const candle = chart.addSeries(LightweightCharts.CandlestickSeries, {
@@ -123,16 +202,16 @@ function renderChart(kline, indicators) {
   vol.priceScale().applyOptions({ scaleMargins: { top: 0.8, bottom: 0.05 } });
   vol.setData(kline.data.map(d => ({
     time: parseTime(d.time), value: d.volume,
-    color: d.close >= d.open ? 'rgba(255,82,82,0.3)' : 'rgba(0,168,67,0.3)',
+    color: d.close >= d.open ? C.volUp : C.volDn,
   })));
 
   // --- MACD pane ---
   if (indicators.macd) {
-    const macdPane = chart.addPane();
+    macdPane = chart.addPane();
     macdPane.setStretchFactor(0.5);
     const m = indicators.macd;
 
-    const hist = macdPane.addSeries(LightweightCharts.HistogramSeries, {
+    hist = macdPane.addSeries(LightweightCharts.HistogramSeries, {
       priceScaleId: 'macd', priceLineVisible: false, lastValueVisible: false,
     });
     hist.setData(times.map((t, i) => ({
@@ -140,13 +219,13 @@ function renderChart(kline, indicators) {
       color: macdHistColor(m.hist[i], i > 0 ? m.hist[i - 1] : 0),
     })));
 
-    const macdLine = macdPane.addSeries(LightweightCharts.LineSeries, {
+    macdLine = macdPane.addSeries(LightweightCharts.LineSeries, {
       color: C.macdLine, lineWidth: 1, priceScaleId: 'macd',
       lastValueVisible: false, priceLineVisible: false,
     });
     macdLine.setData(times.map((t, i) => ({ time: t, value: m.vmacd[i] })));
 
-    const sigLine = macdPane.addSeries(LightweightCharts.LineSeries, {
+    sigLine = macdPane.addSeries(LightweightCharts.LineSeries, {
       color: C.signal, lineWidth: 1, priceScaleId: 'macd',
       lastValueVisible: false, priceLineVisible: false,
     });
@@ -161,17 +240,17 @@ function renderChart(kline, indicators) {
 
   // --- KD pane ---
   if (indicators.kd) {
-    const kdPane = chart.addPane();
+    kdPane = chart.addPane();
     kdPane.setStretchFactor(0.5);
     const kd = indicators.kd;
 
-    const kSeries = kdPane.addSeries(LightweightCharts.LineSeries, {
+    kSeries = kdPane.addSeries(LightweightCharts.LineSeries, {
       color: C.kLine, lineWidth: 1, priceScaleId: 'kd',
       lastValueVisible: false, priceLineVisible: false,
     });
     kSeries.setData(times.map((t, i) => ({ time: t, value: kd.k[i] })));
 
-    const dSeries = kdPane.addSeries(LightweightCharts.LineSeries, {
+    dSeries = kdPane.addSeries(LightweightCharts.LineSeries, {
       color: C.dLine, lineWidth: 1, priceScaleId: 'kd',
       lastValueVisible: false, priceLineVisible: false,
     });
@@ -182,11 +261,11 @@ function renderChart(kline, indicators) {
 
   // --- RSI pane ---
   if (indicators.rsi) {
-    const rsiPane = chart.addPane();
+    rsiPane = chart.addPane();
     rsiPane.setStretchFactor(0.5);
     const rsi = indicators.rsi;
 
-    const rsiSeries = rsiPane.addSeries(LightweightCharts.LineSeries, {
+    rsiSeries = rsiPane.addSeries(LightweightCharts.LineSeries, {
       color: C.rsiLine, lineWidth: 1, priceScaleId: 'rsi',
       lastValueVisible: false, priceLineVisible: false,
     });
@@ -195,10 +274,80 @@ function renderChart(kline, indicators) {
     addRefLines(rsiPane, times, rsi.overbought || 70, rsi.oversold || 30, 'rsi');
   }
 
+  // --- Crosshair legend per sub-pane ---
+  const legendGroups = [];
+
+  function createPaneLegend(paneIndex, entries) {
+    const legend = document.createElement('div');
+    legend.className = 'pane-legend';
+    container.appendChild(legend);
+    const items = [];
+    for (const e of entries) {
+      const span = document.createElement('span');
+      span.style.color = e.color;
+      legend.appendChild(span);
+      items.push({ series: e.series, span, label: e.label });
+    }
+    legendGroups.push({ paneIndex, legendEl: legend, items });
+  }
+
+  let nextPaneIndex = 1;
+  if (indicators.macd) {
+    createPaneLegend(nextPaneIndex++, [
+      { series: macdLine, label: 'MACD', color: C.macdLine },
+      { series: sigLine, label: 'SIG', color: C.signal },
+      { series: hist, label: 'HIST', color: C.text },
+    ]);
+  }
+  if (indicators.kd) {
+    createPaneLegend(nextPaneIndex++, [
+      { series: kSeries, label: 'K', color: C.kLine },
+      { series: dSeries, label: 'D', color: C.dLine },
+    ]);
+  }
+  if (indicators.rsi) {
+    createPaneLegend(nextPaneIndex++, [
+      { series: rsiSeries, label: 'RSI', color: C.rsiLine },
+    ]);
+  }
+
+  function positionLegends() {
+    const panes = chart.panes();
+    for (const group of legendGroups) {
+      let top = 0;
+      for (let i = 0; i < group.paneIndex && i < panes.length; i++) {
+        top += panes[i].getHeight() + 4;
+      }
+      group.legendEl.style.top = (top + 4) + 'px';
+    }
+  }
+
+  function updateLegend(param) {
+    for (const group of legendGroups) {
+      for (const item of group.items) {
+        let val = null;
+        if (param && param.seriesData) {
+          const d = param.seriesData.get(item.series);
+          if (d) val = d.value !== undefined ? d.value : d.close;
+        }
+        if (val == null) {
+          const last = item.series.data().at(-1);
+          if (last) val = last.value !== undefined ? last.value : last.close;
+        }
+        item.span.textContent = val != null ? `${item.label}: ${val.toFixed(2)}` : `${item.label}: -`;
+      }
+    }
+  }
+
+  updateLegend(null);
+  chart.subscribeCrosshairMove(updateLegend);
+
   chart.timeScale().fitContent();
+  requestAnimationFrame(positionLegends);
 
   const ro = new ResizeObserver(() => {
     chart.applyOptions({ width: container.clientWidth, height: container.clientHeight });
+    requestAnimationFrame(positionLegends);
   });
   ro.observe(container);
 }
@@ -212,25 +361,24 @@ async function fetchData() {
   resultDiv.innerHTML = '';
 
   try {
-    const [detectResp, klineResp, indResp] = await Promise.all([
-      fetch(`/api/detect/${encodeURIComponent(code)}`),
-      fetch(`/api/kline/${encodeURIComponent(code)}`),
-      fetch(`/api/indicators/${encodeURIComponent(code)}`),
-    ]);
+    const resp = await fetch(`/api/indicators/${encodeURIComponent(code)}`);
+    if (!resp.ok) throw new Error((await resp.json()).detail);
+    const data = await resp.json();
 
-    if (!detectResp.ok) throw new Error(`Detect: ${(await detectResp.json()).detail}`);
-    const detectData = await detectResp.json();
+    // detect 结果
+    if (data.detect) {
+      status.textContent = `${code} - ${Object.keys(data.detect.indicators).length} indicators`;
+      renderIndicators(data.detect.indicators);
+    } else {
+      status.textContent = code;
+    }
 
-    status.textContent = `${code} - ${Object.keys(detectData.indicators).length} indicators`;
-    renderIndicators(detectData.indicators);
-
-    if (klineResp.ok && indResp.ok) {
-      const kline = await klineResp.json();
-      const indicators = await indResp.json();
-      renderChart(kline, indicators);
+    // 图表（kline + indicators 均在同一响应中）
+    if (data.kline) {
+      renderChart({ data: data.kline }, data);
     } else {
       document.getElementById('chart-container').innerHTML =
-        '<div style="padding:20px;color:#888">Chart data unavailable</div>';
+        '<div style="padding:20px;color:var(--muted)">Chart data unavailable</div>';
     }
   } catch (e) {
     status.textContent = e.message;
@@ -247,7 +395,7 @@ function fmtNum(v) { return v != null ? v : '-'; }
 
 function renderPerf(perf, label) {
   return `<tr>
-    <td style="font-weight:500;color:#aaa;font-size:11px">${label}</td>
+    <td style="font-weight:500;color:var(--muted);font-size:11px">${label}</td>
     <td class="${wrClass(perf.support_win_rate)}">${fmtPct(perf.support_win_rate)}</td>
     <td>${fmtNum(perf.support_signals_count)}</td>
     <td>${fmtNum(perf.support_z_score)}</td>

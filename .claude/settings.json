@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(test:*)",
+      "Bash(python:*)",
+      "Bash(ls:*)",
+      "WebSearch",
+      "WebFetch(domain:openapi.futunn.com)",
+      "WebFetch(domain:tradingview.github.io)",
+      "WebFetch(domain:github.com)",
+      "Bash(grep -E \"\\\\.py$\")"
+    ]
+  }
+}

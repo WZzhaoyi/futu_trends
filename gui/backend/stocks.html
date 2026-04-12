@@ -7,24 +7,45 @@
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 html, body { height: 100%; overflow: hidden; }
-body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace; background: #1a1a2e; color: #e0e0e0; display: flex; flex-direction: column; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace; display: flex; flex-direction: column; transition: background .2s, color .2s; }
+
+[data-theme="dark"] {
+  --bg: #1a1a2e; --fg: #e0e0e0; --muted: #888;
+  --card-bg: #16213e; --border: #0f3460;
+  --btn-bg: #0f3460; --btn-hover: #1a5276;
+  --heading: #53c7f0;
+  --row-hover: #16213e;
+}
+[data-theme="light"] {
+  --bg: #f5f5f5; --fg: #222; --muted: #666;
+  --card-bg: #fff; --border: #d0d0d0;
+  --btn-bg: #e0e0e0; --btn-hover: #ccc;
+  --heading: #1565c0;
+  --row-hover: #e8e8e8;
+}
+
+body { background: var(--bg); color: var(--fg); }
 .toolbar { display: flex; gap: 10px; padding: 10px 16px; align-items: center; flex-shrink: 0; }
-.toolbar input { background: #16213e; border: 1px solid #0f3460; color: #e0e0e0; padding: 6px 12px; border-radius: 6px; font-size: 13px; width: 240px; }
-#status { color: #888; font-size: 12px; }
+.toolbar input { background: var(--card-bg); border: 1px solid var(--border); color: var(--fg); padding: 6px 12px; border-radius: 6px; font-size: 13px; width: 240px; }
+.toolbar button { background: var(--btn-bg); color: var(--fg); border: none; padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+.toolbar button:hover { background: var(--btn-hover); }
+#status { color: var(--muted); font-size: 12px; }
+#theme-btn { font-size: 15px; line-height: 1; padding: 4px 8px; margin-left: auto; }
 .table-wrap { flex: 1; min-height: 0; overflow-y: auto; padding: 0 16px 10px; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
-thead { position: sticky; top: 0; background: #1a1a2e; z-index: 1; }
-th { text-align: left; padding: 6px 10px; border-bottom: 1px solid #0f3460; color: #888; font-weight: normal; }
-td { padding: 6px 10px; border-bottom: 1px solid #0f3460; }
+thead { position: sticky; top: 0; background: var(--bg); z-index: 1; }
+th { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); color: var(--muted); font-weight: normal; }
+td { padding: 6px 10px; border-bottom: 1px solid var(--border); }
 tr.row { cursor: pointer; }
-tr.row:hover { background: #16213e; }
-.market { color: #53c7f0; font-size: 12px; min-width: 40px; }
+tr.row:hover { background: var(--row-hover); }
+.market { color: var(--heading); font-size: 12px; min-width: 40px; }
 </style>
 </head>
 <body>
 <div class="toolbar">
   <input id="search" type="text" placeholder="Search code or name..." autofocus>
   <span id="status">Loading...</span>
+  <button id="theme-btn" onclick="cycleTheme()"></button>
 </div>
 <div class="table-wrap">
   <table>
@@ -34,6 +55,35 @@ tr.row:hover { background: #16213e; }
 </div>
 
 <script>
+// --- Theme ---
+const THEME_KEY = 'detect-theme';
+const themeBtn = document.getElementById('theme-btn');
+let themePref = localStorage.getItem(THEME_KEY) || 'auto';
+
+function getSystemTheme() {
+  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
+function resolvedTheme() {
+  return themePref === 'auto' ? getSystemTheme() : themePref;
+}
+function applyTheme() {
+  document.documentElement.setAttribute('data-theme', resolvedTheme());
+  const icons = { auto: '\u25D1', light: '\u2600', dark: '\u263E' };
+  themeBtn.textContent = icons[themePref];
+  themeBtn.title = `Theme: ${themePref}`;
+}
+function cycleTheme() {
+  const order = ['auto', 'dark', 'light'];
+  themePref = order[(order.indexOf(themePref) + 1) % 3];
+  localStorage.setItem(THEME_KEY, themePref);
+  applyTheme();
+}
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+  if (themePref === 'auto') applyTheme();
+});
+applyTheme();
+
+// --- Stock list ---
 const marketNames = { SH: '沪市', SZ: '深市', HK: '港股', US: '美股' };
 let allStocks = [];
 

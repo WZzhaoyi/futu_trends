@@ -41,28 +41,90 @@ app.add_middleware(
 
 config = get_config()
 
-# 常量
 DEFAULT_MAX_COUNT = 1000
 DEFAULT_EMA_PERIOD = 240
 
+# ---- 共享数据函数 ----
+
+def _get_db_paths() -> Dict[str, Optional[str]]:
+    """获取各指标的 ParamsDB 路径"""
+    return {
+        'MACD': config.get("CONFIG", "MACD_PARAMS_DB", fallback=None),
+        'KD': config.get("CONFIG", "KD_PARAMS_DB", fallback=None),
+        'RSI': config.get("CONFIG", "RSI_PARAMS_DB", fallback=None),
+    }
+
+def _fetch_kline(code: str, max_count: int = DEFAULT_MAX_COUNT) -> pd.DataFrame:
+    """获取 K 线数据，返回带 time 列的 DataFrame。无数据时抛 HTTPException"""
+    df = get_kline_data(code, config, max_count)
+    if df is None or df.empty:
+        raise HTTPException(status_code=404, detail=f"K-line data not found for stock {code}")
+    df['time'] = df.index.astype(str)
+    return df
+
+def _read_detect(code: str, db_paths: Dict[str, Optional[str]]) -> Dict[str, Any]:
+    """从 ParamsDB 读取各指标的 best_params / meta_info / performance"""
+    result = {}
+    for indicator_type, db_path in db_paths.items():
+        if not db_path:
+            continue
+        try:
+            db = ParamsDB(db_path.split(',')[0])
+            data = db.get_stock_params(code)
+            if data and data.get('best_params'):
+                result[indicator_type] = {
+                    'best_params': data['best_params'],
+                    'meta_info': data['meta_info'],
+                    'performance': data['performance'],
+                }
+        except Exception as e:
+            logger.warning(f"Failed to get {indicator_type} params for {code}: {e}")
+    return result
+
+INDICATOR_CLASSES = {'MACD': MACD, 'KD': KD, 'RSI': RSI}
+INDICATOR_DEFAULTS = {
+    'MACD': (0, 0),
+    'KD': (20, 80),
+    'RSI': (30, 70),
+}
+
+def _calculate_indicator(indicator_type: str, df: pd.DataFrame, best_params: dict) -> Optional[Dict[str, Any]]:
+    """根据类型和参数计算单个指标，返回前端所需格式"""
+    indicator = INDICATOR_CLASSES[indicator_type]()
+    default_oversold, default_overbought = INDICATOR_DEFAULTS[indicator_type]
+
+    if indicator_type == 'MACD':
+        vmacd, signal = indicator.indicator_calculate(df.copy(), best_params)
+        return {
+            'vmacd': vmacd.fillna(0).tolist(),
+            'signal': signal.fillna(0).tolist(),
+            'hist': (2*(vmacd - signal)).fillna(0).tolist(),
+        }
+    elif indicator_type == 'KD':
+        k, d = indicator.indicator_calculate(df.copy(), best_params)
+        return {
+            'k': k.fillna(0).tolist(),
+            'd': d.fillna(0).tolist(),
+            'oversold': best_params.get('oversold', default_oversold),
+            'overbought': best_params.get('overbought', default_overbought),
+        }
+    elif indicator_type == 'RSI':
+        values = indicator.indicator_calculate(df.copy(), best_params)
+        return {
+            'values': values.fillna(0).tolist(),
+            'oversold': best_params.get('oversold', default_oversold),
+            'overbought': best_params.get('overbought', default_overbought),
+        }
+    return None
+
+# ---- API 路由 ----
+
 @app.get("/api/stocks/list")
 async def get_stock_list():
-    """
-    获取股票列表
-    
-    Returns:
-        JSONResponse: 包含股票列表的响应
-        {
-            "stocks": [
-                {"code": "SH.510300", "name": "沪深300ETF"},
-                ...
-            ]
-        }
-    """
+    """获取股票列表"""
     try:
         stocks = []
-        
-        # 从富途分组获取（支持多个 group，逗号分隔）
+
         groups_str = config.get("CONFIG", "FUTU_GROUP", fallback='')
         host = config.get("CONFIG", "FUTU_HOST", fallback='127.0.0.1')
         port = config.getint("CONFIG", "FUTU_PORT", fallback=11111)
@@ -83,13 +145,12 @@ async def get_stock_list():
                         logger.info(f"Retrieved stocks from Futu group '{group}', total unique: {len(stocks)}")
                 except Exception as e:
                     logger.warning(f"Failed to get stock list from Futu group '{group}': {e}")
-        
-        # 从配置获取
+
         code_list = config.get("CONFIG", "FUTU_CODE_LIST", fallback='').split(',')
         for code in code_list:
             if code.strip():
                 stocks.append({'code': code.strip(), 'name': code.strip()})
-        
+
         logger.info(f"Stock list loaded successfully, total {len(stocks)} stocks")
         return JSONResponse(content={'stocks': stocks})
     except Exception as e:
@@ -98,39 +159,11 @@ async def get_stock_list():
 
 @app.get("/api/kline/{code}")
 async def get_kline(code: str, max_count: int = DEFAULT_MAX_COUNT):
-    """
-    获取K线数据
-    
-    Args:
-        code: 股票代码
-        max_count: 最大K线数量，默认1000
-    
-    Returns:
-        JSONResponse: 包含K线数据的响应
-        {
-            "data": [
-                {
-                    "time": "2024-01-01",
-                    "open": 1.0,
-                    "high": 1.1,
-                    "low": 0.9,
-                    "close": 1.05,
-                    "volume": 1000000
-                },
-                ...
-            ]
-        }
-    """
+    """获取 K 线数据"""
     try:
-        df = get_kline_data(code, config, max_count)
-        if df is None or df.empty:
-            logger.warning(f"K-line data not found: {code}")
-            raise HTTPException(status_code=404, detail=f"K-line data not found for stock {code}")
-        
-        # 转换为前端需要的格式
-        df['time'] = df.index.astype(str)
+        df = _fetch_kline(code, max_count)
         result = df[['time', 'open', 'high', 'low', 'close', 'volume']].to_dict('records')
-        logger.info(f"Returning K-line data for {code}, total {len(result)} records")
+        logger.info(f"Returning K-line data for {code}, {len(result)} records")
         return JSONResponse(content={'data': result})
     except HTTPException:
         raise
@@ -141,112 +174,45 @@ async def get_kline(code: str, max_count: int = DEFAULT_MAX_COUNT):
 @app.get("/api/indicators/{code}")
 async def get_indicators(code: str):
     """
-    获取所有技术指标
-    
-    Args:
-        code: 股票代码
-    
-    Returns:
-        JSONResponse: 包含技术指标的响应
-        {
-            "time": ["2024-01-01", ...],
-            "ema": [1.0, ...],
-            "macd": {
-                "vmacd": [0.1, ...],
-                "signal": [0.05, ...],
-                "hist": [0.05, ...]
-            },
-            "kd": {...},
-            "rsi": {...}
-        }
+    聚合接口：K 线 + 技术指标 + detect 结果
+
+    Returns: { time, ema, macd?, kd?, rsi?, kline, detect? }
     """
     try:
-        # 获取K线数据
-        df = get_kline_data(code, config, max_count=DEFAULT_MAX_COUNT)
-        if df is None or df.empty:
-            logger.warning(f"K-line data not found: {code}")
-            raise HTTPException(status_code=404, detail=f"K-line data not found for stock {code}")
-        
-        df['time'] = df.index.astype(str)
-        
-        # 计算 EMA
+        df = _fetch_kline(code)
+        db_paths = _get_db_paths()
+
+        # EMA
         ema_period = config.getint("CONFIG", "EMA_PERIOD", fallback=DEFAULT_EMA_PERIOD)
         df[f'EMA_{ema_period}'] = EMA(df['close'], ema_period)
-        
+
         result: Dict[str, Any] = {
             'time': df['time'].tolist(),
             'ema': df[f'EMA_{ema_period}'].fillna(0).tolist(),
+            'kline': df[['time', 'open', 'high', 'low', 'close', 'volume']].to_dict('records'),
         }
-        
-        # 读取参数数据库路径
-        db_paths = {
-            'MACD': config.get("CONFIG", "MACD_PARAMS_DB", fallback=None),
-            'KD': config.get("CONFIG", "KD_PARAMS_DB", fallback=None),
-            'RSI': config.get("CONFIG", "RSI_PARAMS_DB", fallback=None),
-        }
-        
-        # 计算技术指标（提取重复逻辑）
-        def calculate_indicator(
-            indicator_type: str,
-            db_path: Optional[str],
-            indicator_class,
-            default_oversold: int,
-            default_overbought: int
-        ) -> Optional[Dict[str, Any]]:
-            """计算技术指标的通用函数"""
+
+        # 读取参数并计算各指标
+        for indicator_type, db_path in db_paths.items():
             if not db_path:
-                return None
-            
+                continue
             try:
                 db = ParamsDB(db_path)
                 params = db.get_stock_params(code)
-                
                 if not params or not params.get('best_params'):
                     logger.warning(f"{indicator_type} parameters not found: {code}")
-                    return None
-                
-                indicator = indicator_class()
-                best_params = params['best_params']
-                
-                if indicator_type == 'MACD':
-                    vmacd, signal = indicator.indicator_calculate(df.copy(), best_params)
-                    return {
-                        'vmacd': vmacd.fillna(0).tolist(),
-                        'signal': signal.fillna(0).tolist(),
-                        'hist': (vmacd - signal).fillna(0).tolist(),
-                    }
-                elif indicator_type == 'KD':
-                    k, d = indicator.indicator_calculate(df.copy(), best_params)
-                    return {
-                        'k': k.fillna(0).tolist(),
-                        'd': d.fillna(0).tolist(),
-                        'oversold': best_params.get('oversold', default_oversold),
-                        'overbought': best_params.get('overbought', default_overbought),
-                    }
-                elif indicator_type == 'RSI':
-                    values = indicator.indicator_calculate(df.copy(), best_params)
-                    return {
-                        'values': values.fillna(0).tolist(),
-                        'oversold': best_params.get('oversold', default_oversold),
-                        'overbought': best_params.get('overbought', default_overbought),
-                    }
+                    continue
+                ind_result = _calculate_indicator(indicator_type, df, params['best_params'])
+                if ind_result:
+                    result[indicator_type.lower()] = ind_result
             except Exception as e:
-                logger.error(f"Error calculating {indicator_type} indicator: {e}", exc_info=True)
-                return None
-        
-        # 计算各指标
-        macd_result = calculate_indicator('MACD', db_paths['MACD'], MACD, 0, 0)
-        if macd_result:
-            result['macd'] = macd_result
-        
-        kd_result = calculate_indicator('KD', db_paths['KD'], KD, 20, 80)
-        if kd_result:
-            result['kd'] = kd_result
-        
-        rsi_result = calculate_indicator('RSI', db_paths['RSI'], RSI, 30, 70)
-        if rsi_result:
-            result['rsi'] = rsi_result
-        
+                logger.error(f"Error calculating {indicator_type}: {e}", exc_info=True)
+
+        # detect 结果
+        detect = _read_detect(code, db_paths)
+        if detect:
+            result['detect'] = {'code': code, 'indicators': detect}
+
         logger.info(f"Returning indicator data for {code}")
         return JSONResponse(content=result)
     except HTTPException:
@@ -257,38 +223,17 @@ async def get_indicators(code: str):
 
 @app.get("/api/detect/{code}")
 async def get_detect_result(code: str):
-    """获取标的的 detect 结果（聚合 KD/MACD/RSI 三个指标的 performance）"""
-    db_paths = {
-        'KD': config.get("CONFIG", "KD_PARAMS_DB", fallback=None),
-        'MACD': config.get("CONFIG", "MACD_PARAMS_DB", fallback=None),
-        'RSI': config.get("CONFIG", "RSI_PARAMS_DB", fallback=None),
-    }
-
-    result = {}
-    for indicator, db_path in db_paths.items():
-        if not db_path:
-            continue
-        try:
-            db = ParamsDB(db_path.split(',')[0])
-            data = db.get_stock_params(code)
-            if data:
-                result[indicator] = {
-                    'best_params': data['best_params'],
-                    'meta_info': data['meta_info'],
-                    'performance': data['performance'],
-                }
-        except Exception as e:
-            logger.warning(f"Failed to get {indicator} params for {code}: {e}")
-
-    if not result:
+    """获取标的的 detect 结果（各指标的 best_params + performance）"""
+    detect = _read_detect(code, _get_db_paths())
+    if not detect:
         raise HTTPException(status_code=404, detail=f"No detect results found for {code}")
+    return JSONResponse(content={'code': code, 'indicators': detect})
 
-    return JSONResponse(content={'code': code, 'indicators': result})
+# ---- 页面路由 ----
 
 @app.get("/detect/{code:path}")
 @app.get("/detect")
 async def detect_page(code: str = ""):
-    """Detect 结果可视化页面，支持 /detect/SZ.159949 直接访问"""
     html_path = Path(__file__).parent / "detect.html"
     if not html_path.exists():
         raise HTTPException(status_code=404, detail="detect.html not found")
@@ -296,7 +241,6 @@ async def detect_page(code: str = ""):
 
 @app.get("/stocks")
 async def stocks_page():
-    """股票列表页面"""
     html_path = Path(__file__).parent / "stocks.html"
     if not html_path.exists():
         raise HTTPException(status_code=404, detail="stocks.html not found")
@@ -304,22 +248,12 @@ async def stocks_page():
 
 @app.get("/")
 async def root():
-    """健康检查"""
     return {"status": "ok", "message": "Futu Trends API is running"}
 
+# ---- 启动 ----
+
 def find_available_port(start_port: int = 8001, max_attempts: int = 100) -> int:
-    """
-    查找可用端口
-    
-    Args:
-        start_port: 起始端口号
-        max_attempts: 最大尝试次数
-    
-    Returns:
-        可用端口号
-    """
     import socket
-    
     for port in range(start_port, start_port + max_attempts):
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -327,19 +261,17 @@ def find_available_port(start_port: int = 8001, max_attempts: int = 100) -> int:
                 return port
         except OSError:
             continue
-    
     raise RuntimeError(f"无法找到可用端口，已尝试 {max_attempts} 个端口")
 
 if __name__ == "__main__":
     import uvicorn
     import argparse
-    
+
     parser = argparse.ArgumentParser(description='Futu Trends API Server')
     parser.add_argument('--config', type=str, help='配置文件路径')
     parser.add_argument('--port', type=int, default=8001, help='服务端口（默认8001，如果被占用会自动切换）')
     args = parser.parse_args()
-    
-    # 尝试使用指定端口，如果被占用则自动切换
+
     default_port = args.port
     try:
         actual_port = find_available_port(default_port)
@@ -347,12 +279,9 @@ if __name__ == "__main__":
             logger.warning(f"端口 {default_port} 被占用，自动切换到端口 {actual_port}")
         else:
             logger.info(f"使用端口 {actual_port}")
-        
-        # 输出端口信息到标准输出（供 Electron 读取）
+
         print(f"API_PORT={actual_port}", flush=True)
-        
         uvicorn.run(app, host="127.0.0.1", port=actual_port)
     except Exception as e:
         logger.error(f"启动服务失败: {e}", exc_info=True)
         raise
-
