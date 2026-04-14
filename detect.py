@@ -26,14 +26,13 @@ from notification_engine import NotificationEngine
     cache_expiry_days: 缓存过期时间
     return: 结果字典, 结果文件路径
 """
-def run_analysis(code_list:pd.DataFrame, indicator_type:str, config:ConfigParser, output_dir='./output', data_dir='./data/detect', cache_expiry_days=1)->tuple[dict,str]:
+def run_analysis(code_list:pd.DataFrame, indicator_type:str, config:ConfigParser, output_dir='./output', data_dir='./data/detect')->tuple[dict,str]:
     if code_list.empty:
         print(f'warning: {indicator_type} code_list is empty')
         return {},''
     
     # 确保输出目录存在
     os.makedirs(output_dir, exist_ok=True)
-    os.makedirs(data_dir, exist_ok=True)
     
     results = {}
     name_list = code_list['name'].values
@@ -46,18 +45,7 @@ def run_analysis(code_list:pd.DataFrame, indicator_type:str, config:ConfigParser
     for idx, code in enumerate(code_list['code'].values):
         print(f"\n---- Analyzing {idx+1}/{len(code_list)} {name_list[idx]} {code} {ktype}----\n")
         
-        # 检查本地数据文件
-        data_file_name = f'data_{code.replace(".", "_")}_{ktype}.csv'
-        data_file = os.path.join(data_dir, data_file_name)
-        if not os.path.exists(data_file) or (datetime.now() - datetime.fromtimestamp(os.path.getmtime(data_file))).days > cache_expiry_days:
-            # 文件不存在，下载数据
-            print(f"下载新数据: {data_file}")
-            df = get_kline_data(code, config, max_count=1300)
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                df.to_csv(data_file)
-        else:
-            print(f"使用本地数据文件: {data_file}")
-            df = pd.read_csv(data_file, index_col=0, parse_dates=True)
+        df = get_kline_data(code, config, max_count=1300, file_cache_dir=data_dir)
 
         result_file_name = os.path.join(output_dir, f'signals_{code.replace(".", "_")}_{timestamp}_{ktype}.json')
         if os.path.exists(result_file_name):

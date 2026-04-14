@@ -17,6 +17,7 @@
 
 import configparser
 from time import sleep
+import time as time_module
 import futu as ft
 import pandas as pd
 import numpy as np
@@ -30,6 +31,7 @@ import os
 import json
 import re
 import requests
+import glob as glob_module
 
 # 美股代码列表缓存
 _us_stocks_cache = None
@@ -47,6 +49,73 @@ _akshare_lock = threading.Lock()
 _proxy_configured = False
 _proxy_url = None
 _global_session = None
+
+# ---- 市场状态缓存 ----
+
+_state_cache = None
+_state_ts = 0
+_STATE_TTL = 300  # 5 分钟
+
+_MARKET_KEY_MAP = {
+    'SH': 'market_sh', 'SZ': 'market_sz',
+    'HK': 'market_hk', 'US': 'market_us',
+}
+_TRADING_STATES = {
+    'MORNING', 'AFTERNOON', 'NIGHT', 'NIGHT_OPEN',
+    'PRE_MARKET_BEGIN', 'AFTER_HOURS_BEGIN',
+    'AUCTION', 'HK_CAS', 'TRADE_AT_LAST',
+}
+
+def _is_trading(code, host, port):
+    global _state_cache, _state_ts
+    now = int(time_module.time())
+    if not _state_cache or now - _state_ts >= _STATE_TTL:
+        ctx = ft.OpenQuoteContext(host=host, port=port)
+        try:
+            ret, data = ctx.get_global_state()
+            if ret == ft.RET_OK:
+                _state_cache = data
+                _state_ts = int(data.get('timestamp', now))
+        finally:
+            ctx.close()
+    market = code.split('.')[0].upper()
+    key = _MARKET_KEY_MAP.get(market)
+    if not key or not _state_cache:
+        return True  # 未知市场或获取失败，保守当作盘中
+    return _state_cache.get(key, 'NONE') in _TRADING_STATES
+
+# ---- K线缓存 ----
+
+_kline_cache = {}  # (code, ktype) → (fetch_ts, df)
+_KLINE_TTL_TRADING = 60  # 盘中 60 秒
+
+def _is_cache_fresh(fetch_ts, df, max_count, code, config):
+    if len(df) < max_count:
+        return False
+    host = config.get("CONFIG", "FUTU_HOST", fallback="127.0.0.1")
+    port = int(config.get("CONFIG", "FUTU_PORT", fallback=11111))
+    if not _is_trading(code, host, port):
+        return True  # 不在交易，缓存永远有效
+    return int(time_module.time()) - fetch_ts < _KLINE_TTL_TRADING
+
+def _find_cache_file(cache_dir, code, ktype):
+    pattern = os.path.join(cache_dir, f'data_{code.replace(".", "_")}_{ktype}_*.csv')
+    files = glob_module.glob(pattern)
+    if not files:
+        return None, 0
+    latest = max(files, key=lambda f: int(f.rsplit('_', 1)[1].split('.')[0]))
+    fetch_ts = int(latest.rsplit('_', 1)[1].split('.')[0])
+    return latest, fetch_ts
+
+def _write_cache_file(cache_dir, code, ktype, df):
+    os.makedirs(cache_dir, exist_ok=True)
+    fetch_ts = int(time_module.time())
+    pattern = os.path.join(cache_dir, f'data_{code.replace(".", "_")}_{ktype}_*.csv')
+    for old_file in glob_module.glob(pattern):
+        os.remove(old_file)
+    new_file = os.path.join(cache_dir, f'data_{code.replace(".", "_")}_{ktype}_{fetch_ts}.csv')
+    df.to_csv(new_file)
+    return fetch_ts
 
 def setup_global_proxy(proxy_url: str = None):
     """
@@ -410,27 +479,46 @@ def fetch_akshare_data(code: str, ktype: str, max_count: int) -> pd.DataFrame:
         
         return df
 
-def get_kline_data(code: str, config: configparser.ConfigParser, max_count: int = 270) -> pd.DataFrame:
+def get_kline_data(code: str, config: configparser.ConfigParser, max_count: int = 270, file_cache_dir: str | None = None) -> pd.DataFrame:
     """
-    统一的K线获取接口
-    
+    统一的K线获取接口，支持内存缓存和可选的文件缓存。
+    缓存过期由市场交易状态决定：盘中 60s TTL，盘后永不过期。
+
     Args:
         code (str): 股票代码
         config (configparser.ConfigParser): 配置对象
         max_count (int): 获取K线的数量
-        
+        file_cache_dir (str): 文件缓存目录，None 则仅使用内存缓存
+
     Returns:
         pd.DataFrame: K线数据，包含 open, high, low, close, volume
     """
     ktype = config.get("CONFIG", "FUTU_PUSH_TYPE")
+    cache_key = (code, ktype)
+
+    # 第一层：内存缓存
+    if cache_key in _kline_cache:
+        fetch_ts, cached_df = _kline_cache[cache_key]
+        if _is_cache_fresh(fetch_ts, cached_df, max_count, code, config):
+            return cached_df.tail(max_count).copy()
+
+    # 第二层：文件缓存
+    if file_cache_dir:
+        file_path, fetch_ts = _find_cache_file(file_cache_dir, code, ktype)
+        if file_path:
+            df = pd.read_csv(file_path, index_col=0, parse_dates=True)
+            if _is_cache_fresh(fetch_ts, df, max_count, code, config):
+                _kline_cache[cache_key] = (fetch_ts, df)
+                return df.tail(max_count).copy()
+
+    # 第三层：远程拉取
     market = code.split('.')[0].upper()
     market_key = f"DATA_SOURCE_{market}"
     if config.has_option("CONFIG", market_key):
         source_type = config.get("CONFIG", market_key).lower()
     else:
         source_type = config.get("CONFIG", "DATA_SOURCE").lower()
-    
-    # 获取原始数据
+
     if source_type == 'futu':
         df = fetch_futu_data(code, ktype, max_count, config)
     elif source_type == 'yfinance':
@@ -439,53 +527,54 @@ def get_kline_data(code: str, config: configparser.ConfigParser, max_count: int 
         df = fetch_akshare_data(code, ktype, max_count)
     else:
         raise ValueError("Unsupported data source")
-    
+
     if df is None or df.empty:
         return None
-        
+
     # 确保时间索引
     df.index = pd.to_datetime(df.index)
-    
+
     # 处理特殊周期
     if ktype == 'K_HALF_DAY':
-        return convert_to_Nhour(df, session_type='HALF_DAY')
+        df = convert_to_Nhour(df, session_type='HALF_DAY')
     elif ktype == 'K_240M':
-        return convert_to_Nhour(df, n_hours=4).dropna()
+        df = convert_to_Nhour(df, n_hours=4).dropna()
     elif ktype == 'K_120M':
-        return convert_to_Nhour(df, n_hours=2).dropna()
-            
+        df = convert_to_Nhour(df, n_hours=2).dropna()
+
+    # 写缓存
+    if df is not None and not df.empty:
+        fetch_ts = int(time_module.time())
+        _, old = _kline_cache.get(cache_key, (0, pd.DataFrame()))
+        if len(df) >= len(old):
+            _kline_cache[cache_key] = (fetch_ts, df)
+        if file_cache_dir:
+            _write_cache_file(file_cache_dir, code, ktype, df)
+
     return df
 
 if __name__ == "__main__":
-    # 测试配置
-    config = configparser.ConfigParser()
-    config.read('config_template.ini',encoding='utf-8')
-    
-    # 测试不同数据源
-    test_cases = [
-        ('HK.00700', 'K_60M', 100),    # 腾讯1小时K线
-        ('HK.00700', 'K_HALF_DAY', 100), # 腾讯半日K线
-        ('US.AAPL', 'K_60M', 100),      # 苹果1小时K线
-        ('SH.000001', 'K_DAY', 250),     # 上证日K
-    ]
-    
-    for code, ktype, count in test_cases:
-        print(f"\n测试 {code} {ktype} {count}根K线:")
-        # 设置K线类型
-        config.set("CONFIG", "FUTU_PUSH_TYPE", ktype)
-        
-        # 测试Futu数据源
-        config.set("CONFIG", "DATA_SOURCE", "futu")
-        df = get_kline_data(code, config, count)
-        print(f"Futu数据源获取到 {len(df) if df is not None else 0} 根K线")
-        
-        # 测试YFinance数据源
-        config.set("CONFIG", "DATA_SOURCE", "yfinance")
-        df = get_kline_data(code, config, count)
-        print(f"YFinance数据源获取到 {len(df) if df is not None else 0} 根K线")
-        
-        # 测试AKShare数据源（仅支持日线及以上周期）
-        if ktype in ['K_DAY', 'K_WEEK', 'K_MON']:
-            config.set("CONFIG", "DATA_SOURCE", "akshare")
-            df = get_kline_data(code, config, count)
-            print(f"AKShare数据源获取到 {len(df) if df is not None else 0} 根K线")
+    import time as t
+    from ft_config import get_config
+
+    config = get_config('config_template.ini')
+    code = 'HK.00700'
+    cache_dir = './data/test_cache'
+
+    # 测试远程拉取 + 缓存写入
+    print('=== 远程拉取 ===')
+    t0 = t.time()
+    df = get_kline_data(code, config, max_count=100, file_cache_dir=cache_dir)
+    print(f'{len(df)} 条, {t.time()-t0:.2f}s')
+
+    # 测试内存缓存命中（不同 max_count）
+    print('\n=== 内存缓存 ===')
+    t0 = t.time()
+    df = get_kline_data(code, config, max_count=50, file_cache_dir=cache_dir)
+    print(f'{len(df)} 条, {t.time()-t0:.2f}s')
+
+    # 测试市场状态
+    host = config.get("CONFIG", "FUTU_HOST")
+    port = int(config.get("CONFIG", "FUTU_PORT"))
+    print(f'\n=== 市场状态 ===')
+    print(f'HK trading: {_is_trading(code, host, port)}')
