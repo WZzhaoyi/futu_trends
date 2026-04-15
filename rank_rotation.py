@@ -321,9 +321,6 @@ def _backfill_single(code_pd: pd.DataFrame, config: configparser.ConfigParser,
                 df.index = pd.to_datetime(df['time_key'])
             elif not isinstance(df.index, pd.DatetimeIndex):
                 df.index = pd.to_datetime(df.index)
-            if df.index.tz is not None:
-                df = df.copy()
-                df.index = df.index.tz_localize(None)
             df_slice = df[df.index <= target_dt]
             if df_slice.empty:
                 continue

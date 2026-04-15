@@ -6,7 +6,7 @@ from xtquant.xttrader import XtQuantTrader
 from xtquant.xttype import StockAccount
 from tools import ib_code_to_futu_code
 
-from ib_insync import *
+from ib_async import *
 import asyncio
 
 from ft_config import get_config

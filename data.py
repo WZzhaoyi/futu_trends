@@ -45,6 +45,7 @@ _futu_lock = threading.Lock()
 _yfinance_lock = threading.Lock()
 _akshare_lock = threading.Lock()
 _longbridge_lock = threading.Lock()
+_ibkr_lock = threading.Lock()
 
 # 全局代理配置
 _proxy_configured = False
@@ -534,6 +535,92 @@ def fetch_longbridge_data(code: str, ktype: str, max_count: int, config: configp
 
         return df
 
+def _ibkr_duration_str(ktype: str, max_count: int) -> str:
+    """根据 ktype 和 max_count 计算 IB reqHistoricalData 的 durationStr"""
+    if ktype in ('K_1M', 'K_5M', 'K_15M', 'K_30M', 'K_60M'):
+        hours_map = {'K_1M': 1, 'K_5M': 5, 'K_15M': 15, 'K_30M': 30, 'K_60M': 60}
+        minutes = hours_map[ktype] * max_count
+        days = max(1, math.ceil(minutes / (6.5 * 60)))  # ~6.5 交易小时/天
+        if days <= 365:
+            return f"{days} D"
+        return f"{max(1, math.ceil(days / 365))} Y"
+    elif ktype == 'K_WEEK':
+        weeks = max_count
+        days = weeks * 7
+        return f"{max(1, math.ceil(days / 365))} Y" if days > 365 else f"{days} D"
+    elif ktype == 'K_MON':
+        return f"{max(1, math.ceil(max_count / 12))} Y"
+    else:  # K_DAY and fallback
+        days = int(max_count * 1.5)  # 补偿非交易日
+        if days <= 365:
+            return f"{days} D"
+        return f"{max(1, math.ceil(days / 365))} Y"
+
+def fetch_ibkr_data(code: str, ktype: str, max_count: int, config: configparser.ConfigParser) -> pd.DataFrame | None:
+    """获取IBKR最近数据"""
+    from ib_async import IB
+    from tools import futu_code_to_ib_contract
+
+    bar_size_map = {
+        'K_1M': '1 min', 'K_5M': '5 mins', 'K_15M': '15 mins',
+        'K_30M': '30 mins', 'K_60M': '1 hour',
+        'K_DAY': '1 day', 'K_WEEK': '1 W', 'K_MON': '1 M',
+    }
+
+    with _ibkr_lock:
+        _ktype = ktype
+        request_count = max_count
+        if ktype in ['K_HALF_DAY', 'K_240M', 'K_120M']:
+            _ktype = 'K_60M'
+            multiplier = {'K_HALF_DAY': 6, 'K_240M': 4, 'K_120M': 2}.get(ktype, 1)
+            request_count = min(1000, max_count * multiplier)
+
+        bar_size = bar_size_map.get(_ktype, '1 day')
+        duration = _ibkr_duration_str(_ktype, request_count)
+        contract = futu_code_to_ib_contract(code)
+
+        host = config.get("CONFIG", "IBKR_HOST", fallback="127.0.0.1")
+        port = int(config.get("CONFIG", "IBKR_PORT", fallback=4001))
+
+        ib = IB()
+        try:
+            ib.connect(host, port, clientId=1, readonly=True)
+
+            bars = ib.reqHistoricalData(
+                contract,
+                endDateTime='',
+                durationStr=duration,
+                barSizeSetting=bar_size,
+                whatToShow='TRADES',
+                useRTH=True,
+                formatDate=1,
+            )
+
+            if not bars:
+                return None
+
+            records = []
+            for bar in bars:
+                records.append({
+                    'time_key': bar.date,
+                    'open': float(bar.open),
+                    'high': float(bar.high),
+                    'low': float(bar.low),
+                    'close': float(bar.close),
+                    'volume': int(bar.volume),
+                })
+
+            df = pd.DataFrame(records)
+            df['time_key'] = pd.to_datetime(df['time_key'])
+            df = df.set_index('time_key')
+            df = df.sort_index().tail(request_count)
+
+            sleep(0.5)
+
+            return df
+        finally:
+            ib.disconnect()
+
 def get_kline_data(code: str, config: configparser.ConfigParser, max_count: int = 270, file_cache_dir: str | None = None) -> pd.DataFrame | None:
     """
     统一的K线获取接口，支持内存缓存和可选的文件缓存。
@@ -582,14 +669,27 @@ def get_kline_data(code: str, config: configparser.ConfigParser, max_count: int 
         df = fetch_akshare_data(code, ktype, max_count)
     elif source_type == 'longbridge':
         df = fetch_longbridge_data(code, ktype, max_count, config)
+    elif source_type == 'ibkr':
+        df = fetch_ibkr_data(code, ktype, max_count, config)
     else:
         raise ValueError("Unsupported data source")
 
     if df is None or df.empty:
         return None
 
-    # 确保时间索引
+    # 确保时间索引 & 统一去掉时区（tz-naive）
+    # 各数据源返回时区情况：
+    # | 数据源      | HK              | US               |
+    # |------------|-----------------|------------------|
+    # | Futu       | naive           | naive            |
+    # | yfinance   | Asia/Hong_Kong  | America/New_York |
+    # | AKShare    | naive           | —                |
+    # | Longbridge | naive           | naive            |
+    # | IBKR       | naive           | naive            |
+    # 仅 yfinance 带时区，统一去掉以保持一致
     df.index = pd.to_datetime(df.index)
+    if df.index.tz is not None:
+        df.index = df.index.tz_localize(None)
 
     # 处理特殊周期
     if ktype == 'K_HALF_DAY':

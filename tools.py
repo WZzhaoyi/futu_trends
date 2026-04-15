@@ -24,7 +24,7 @@ from scipy import stats
 from datetime import datetime, timedelta
 import re
 import yfinance as yf
-from ib_insync import Contract
+from ib_async import Contract
 
 def get_kline_seconds(k_type:str): #根据K_1M,K_5M,K_15M,K_30M,K_60M时间含义输出秒数
     if k_type == 'K_DAY':
@@ -117,6 +117,24 @@ def ib_code_to_futu_code(contract: Contract) -> str or None:
 
     # 如果以上规则都不匹配，则返回 None
     return None
+
+def futu_code_to_ib_contract(futu_code: str) -> Contract:
+    """将富途代码转换为 ib_async 的 Contract 对象（仅股票）
+    E.g., HK.00700 -> Contract(symbol='700', secType='STK', exchange='SEHK', currency='HKD')
+    """
+    market, symbol = futu_code.split('.', 1)
+    market = market.upper()
+
+    if market == 'HK':
+        return Contract(symbol=symbol.lstrip('0') or '0', secType='STK', exchange='SEHK', currency='HKD')
+    elif market == 'US':
+        return Contract(symbol=symbol, secType='STK', exchange='SMART', currency='USD')
+    elif market == 'SH':
+        return Contract(symbol=symbol, secType='STK', exchange='SSE', currency='CNH')
+    elif market == 'SZ':
+        return Contract(symbol=symbol, secType='STK', exchange='SZSE', currency='CNH')
+    else:
+        raise ValueError(f"Unsupported market: {market}")
 
 def futu_code_to_yfinance_code(futu_code: str) -> str:
     """
