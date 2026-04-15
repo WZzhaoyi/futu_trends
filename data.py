@@ -48,8 +48,7 @@ _longbridge_lock = threading.Lock()
 
 # 全局代理配置
 _proxy_configured = False
-_proxy_url = None
-_global_session = None
+_original_requests = {}  # 保存 requests 原始方法
 
 # ---- 市场状态缓存 ----
 
@@ -118,68 +117,60 @@ def _write_cache_file(cache_dir, code, ktype, df):
     df.to_csv(new_file)
     return fetch_ts
 
-def setup_global_proxy(proxy_url: str = None):
+def setup_global_proxy(proxy_url: str | None = None):
     """
     设置全局代理，使所有 HTTP 请求（包括 yfinance）都走代理
     类似 Windows 系统中的自动设置系统代理
-    
+
     Args:
         proxy_url: 代理地址，格式如 'http://127.0.0.1:7890'
                    如果为 None，则从环境变量读取
     """
-    global _proxy_configured, _proxy_url, _global_session
-    
-    if proxy_url:
-        _proxy_url = proxy_url
-    else:
-        # 从环境变量读取
-        _proxy_url = os.environ.get('HTTP_PROXY') or os.environ.get('HTTPS_PROXY')
-    
-    if not _proxy_url:
+    global _proxy_configured
+
+    url = proxy_url or os.environ.get('HTTP_PROXY') or os.environ.get('HTTPS_PROXY')
+    if not url:
         return
-    
+
     # 方法1: 设置环境变量（requests 库会自动读取）
-    os.environ['HTTP_PROXY'] = _proxy_url
-    os.environ['HTTPS_PROXY'] = _proxy_url
-    os.environ['http_proxy'] = _proxy_url
-    os.environ['https_proxy'] = _proxy_url
-    
+    os.environ['HTTP_PROXY'] = url
+    os.environ['HTTPS_PROXY'] = url
+    os.environ['http_proxy'] = url
+    os.environ['https_proxy'] = url
+
     # 方法2: Monkey patch requests 的默认 session
     # 创建一个带代理的 session 并替换 requests 的默认方法
+    proxies = {'http': url, 'https': url}
+
     class ProxiedSession(requests.Session):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
-            self.proxies = {
-                'http': _proxy_url,
-                'https': _proxy_url
-            }
-            # 不配置重试策略：一旦陷入流控或代理失效，重试毫无意义
-    
+            self.proxies = proxies
+
     # 保存原始的 requests 方法
-    if not hasattr(requests, '_original_get'):
-        requests._original_get = requests.get
-        requests._original_post = requests.post
-        requests._original_request = requests.request
-        requests._original_session = requests.Session
-    
-    # 创建全局 session 实例
-    _global_session = ProxiedSession()
-    
+    if not _original_requests:
+        _original_requests['get'] = requests.get
+        _original_requests['post'] = requests.post
+        _original_requests['request'] = requests.request
+        _original_requests['Session'] = requests.Session
+
+    session = ProxiedSession()
+
     # 替换 requests 的全局方法
     def proxied_get(url, **kwargs):
         if 'proxies' not in kwargs:
-            kwargs['proxies'] = {'http': _proxy_url, 'https': _proxy_url}
-        return _global_session.get(url, **kwargs)
-    
+            kwargs['proxies'] = proxies
+        return session.get(url, **kwargs)
+
     def proxied_post(url, **kwargs):
         if 'proxies' not in kwargs:
-            kwargs['proxies'] = {'http': _proxy_url, 'https': _proxy_url}
-        return _global_session.post(url, **kwargs)
-    
+            kwargs['proxies'] = proxies
+        return session.post(url, **kwargs)
+
     def proxied_request(method, url, **kwargs):
         if 'proxies' not in kwargs:
-            kwargs['proxies'] = {'http': _proxy_url, 'https': _proxy_url}
-        return _global_session.request(method, url, **kwargs)
+            kwargs['proxies'] = proxies
+        return session.request(method, url, **kwargs)
     
     requests.get = proxied_get
     requests.post = proxied_post
