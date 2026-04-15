@@ -23,7 +23,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import yfinance as yf
-from tools import futu_code_to_yfinance_code
+from tools import futu_code_to_yfinance_code, futu_code_to_longbridge_code
 import math
 import akshare as ak
 import threading
@@ -44,6 +44,7 @@ _CACHE_EXPIRE_DAYS = 30
 _futu_lock = threading.Lock()
 _yfinance_lock = threading.Lock()
 _akshare_lock = threading.Lock()
+_longbridge_lock = threading.Lock()
 
 # 全局代理配置
 _proxy_configured = False
@@ -217,7 +218,7 @@ def get_us_stocks():
     
     return _us_stocks_cache
 
-def convert_to_Nhour(df: pd.DataFrame, n_hours: int = 4, session_type: str = None) -> pd.DataFrame:
+def convert_to_Nhour(df: pd.DataFrame, n_hours: int = 4, session_type: str = '') -> pd.DataFrame:
     """
     将数据转换为N小时周期或半日的K线
     
@@ -284,7 +285,7 @@ def convert_to_Nhour(df: pd.DataFrame, n_hours: int = 4, session_type: str = Non
     
     return result.dropna()  # 删除没有数据的时段
 
-def fetch_futu_data(code: str, ktype: str, max_count: int, config: configparser.ConfigParser) -> pd.DataFrame:
+def fetch_futu_data(code: str, ktype: str, max_count: int, config: configparser.ConfigParser) -> pd.DataFrame | None:
     """获取Futu最近数据"""
     with _futu_lock:
         host = config.get("CONFIG", "FUTU_HOST")
@@ -363,7 +364,7 @@ def get_yfinance_params(ktype: str, max_count: int) -> dict:
     
     return {'interval': interval, 'period': period}
 
-def fetch_yfinance_data(code: str, ktype: str, max_count: int, config: configparser.ConfigParser) -> pd.DataFrame:
+def fetch_yfinance_data(code: str, ktype: str, max_count: int, config: configparser.ConfigParser) -> pd.DataFrame | None:
     """获取YFinance最近数据"""
     global _proxy_configured
     
@@ -424,7 +425,7 @@ def get_akshare_params(ktype: str, max_count: int) -> dict:
         'adjust': 'qfq'
     }
 
-def fetch_akshare_data(code: str, ktype: str, max_count: int) -> pd.DataFrame:
+def fetch_akshare_data(code: str, ktype: str, max_count: int) -> pd.DataFrame | None:
     """获取AKShare最近数据"""
     with _akshare_lock:
         raw_code = code.split('.')[1]
@@ -479,7 +480,70 @@ def fetch_akshare_data(code: str, ktype: str, max_count: int) -> pd.DataFrame:
         
         return df
 
-def get_kline_data(code: str, config: configparser.ConfigParser, max_count: int = 270, file_cache_dir: str | None = None) -> pd.DataFrame:
+def fetch_longbridge_data(code: str, ktype: str, max_count: int, config: configparser.ConfigParser) -> pd.DataFrame | None:
+    """获取Longbridge最近数据"""
+    from longbridge.openapi import QuoteContext, Config, Period, AdjustType
+
+    period_map = {
+        'K_1M': Period.Min_1, 'K_5M': Period.Min_5, 'K_15M': Period.Min_15,
+        'K_30M': Period.Min_30, 'K_60M': Period.Min_60,
+        'K_DAY': Period.Day, 'K_WEEK': Period.Week, 'K_MON': Period.Month,
+    }
+
+    with _longbridge_lock:
+        # 确定实际请求的K线类型和数量
+        _ktype = ktype
+        request_count = max_count
+        if ktype in ['K_HALF_DAY', 'K_240M', 'K_120M']:
+            _ktype = 'K_60M'
+            multiplier = {'K_HALF_DAY': 6, 'K_240M': 4, 'K_120M': 2}.get(ktype, 1)
+            request_count = min(1000, max_count * multiplier)
+
+        period = period_map.get(_ktype, Period.Day)
+        symbol = futu_code_to_longbridge_code(code)
+
+        # 环境变量优先；未设置时从 config.ini 补位
+        for key in ("LONGBRIDGE_APP_KEY", "LONGBRIDGE_APP_SECRET", "LONGBRIDGE_ACCESS_TOKEN"):
+            if not os.environ.get(key):
+                val = config.get("CONFIG", key, fallback=None)
+                if val:
+                    os.environ[key] = val
+
+        lb_config = Config.from_apikey_env()
+        ctx = QuoteContext(lb_config)
+
+        candlesticks = ctx.history_candlesticks_by_offset(
+            symbol=symbol,
+            period=period,
+            adjust_type=AdjustType.ForwardAdjust,
+            forward=False,
+            count=request_count,
+        )
+
+        if not candlesticks:
+            return None
+
+        records = []
+        for c in candlesticks:
+            records.append({
+                'time_key': c.timestamp,
+                'open': float(c.open),
+                'high': float(c.high),
+                'low': float(c.low),
+                'close': float(c.close),
+                'volume': int(c.volume),
+            })
+
+        df = pd.DataFrame(records)
+        df['time_key'] = pd.to_datetime(df['time_key'])
+        df = df.set_index('time_key')
+        df = df.sort_index().tail(request_count)
+
+        sleep(0.5)
+
+        return df
+
+def get_kline_data(code: str, config: configparser.ConfigParser, max_count: int = 270, file_cache_dir: str | None = None) -> pd.DataFrame | None:
     """
     统一的K线获取接口，支持内存缓存和可选的文件缓存。
     缓存过期由市场交易状态决定：盘中 60s TTL，盘后永不过期。
@@ -525,6 +589,8 @@ def get_kline_data(code: str, config: configparser.ConfigParser, max_count: int 
         df = fetch_yfinance_data(code, ktype, max_count, config)
     elif source_type == 'akshare':
         df = fetch_akshare_data(code, ktype, max_count)
+    elif source_type == 'longbridge':
+        df = fetch_longbridge_data(code, ktype, max_count, config)
     else:
         raise ValueError("Unsupported data source")
 

@@ -137,6 +137,17 @@ def futu_code_to_yfinance_code(futu_code: str) -> str:
         assert re.match(r'^[A-Z]{2}.\d{6}$', futu_code)
         return '.'.join(reversed(futu_code.split('.')))
 
+def futu_code_to_longbridge_code(futu_code: str) -> str:
+    """将项目股票代码转换为 Longbridge 格式
+    E.g., HK.00700 -> 700.HK; US.AAPL -> AAPL.US; SH.600000 -> 600000.SH
+    """
+    parts = futu_code.split('.', 1)
+    market = parts[0].upper()
+    symbol = parts[1]
+    if market == 'HK':
+        symbol = symbol.lstrip('0') or '0'
+    return f"{symbol}.{market}"
+
 def map_futu_to_yfinance_params(ktype:ft.KLType=None, start:datetime=None, end:datetime=None, max_count=None):
     # 映射 ktype 到 interval
     yf_interval_map = {

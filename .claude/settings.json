@@ -4,11 +4,15 @@
       "Bash(test:*)",
       "Bash(python:*)",
       "Bash(ls:*)",
+      "Bash(grep:*)",
+      "Bash(conda activate:*)",
       "WebSearch",
       "WebFetch(domain:openapi.futunn.com)",
       "WebFetch(domain:tradingview.github.io)",
       "WebFetch(domain:github.com)",
-      "Bash(grep -E \"\\\\.py$\")"
+      "WebFetch(domain:open.longbridge.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:api.github.com)"
     ]
   }
 }

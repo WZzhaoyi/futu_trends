@@ -46,6 +46,9 @@ def run_analysis(code_list:pd.DataFrame, indicator_type:str, config:ConfigParser
         print(f"\n---- Analyzing {idx+1}/{len(code_list)} {name_list[idx]} {code} {ktype}----\n")
         
         df = get_kline_data(code, config, max_count=1300, file_cache_dir=data_dir)
+        if df is None or df.empty:
+            print(f"Warning: Failed to get data for {code}, skipping")
+            continue
 
         result_file_name = os.path.join(output_dir, f'signals_{code.replace(".", "_")}_{timestamp}_{ktype}.json')
         if os.path.exists(result_file_name):
