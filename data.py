@@ -23,7 +23,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import yfinance as yf
-from tools import futu_code_to_yfinance_code, futu_code_to_longbridge_code
+from tools import futu_code_to_yfinance_code, futu_code_to_longbridge_code, futu_code_to_ib_contract
 import math
 import akshare as ak
 import threading
@@ -32,6 +32,7 @@ import json
 import re
 import requests
 import glob as glob_module
+from ib_async import IB
 
 # 美股代码列表缓存
 _us_stocks_cache = None
@@ -558,8 +559,6 @@ def _ibkr_duration_str(ktype: str, max_count: int) -> str:
 
 def fetch_ibkr_data(code: str, ktype: str, max_count: int, config: configparser.ConfigParser) -> pd.DataFrame | None:
     """获取IBKR最近数据"""
-    from ib_async import IB
-    from tools import futu_code_to_ib_contract
 
     bar_size_map = {
         'K_1M': '1 min', 'K_5M': '5 mins', 'K_15M': '15 mins',
