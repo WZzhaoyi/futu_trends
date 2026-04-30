@@ -358,12 +358,18 @@ async function fetchData() {
   const status = document.getElementById('status');
   const resultDiv = document.getElementById('result');
   status.textContent = 'Loading...';
-  resultDiv.innerHTML = '';
 
   try {
     const resp = await fetch(`/api/indicators/${encodeURIComponent(code)}`);
     if (!resp.ok) throw new Error((await resp.json()).detail);
     const data = await resp.json();
+
+    const newPath = `/detect/${encodeURIComponent(code)}`;
+    if (window.location.pathname !== newPath) {
+      window.history.pushState({ code }, '', newPath);
+    }
+
+    resultDiv.innerHTML = '';
 
     // detect 结果
     if (data.detect) {
