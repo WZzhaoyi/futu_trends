@@ -1,6 +1,8 @@
 import json
 import logging
 import os
+
+import re as _re
 from ft_config import get_config
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -391,6 +393,7 @@ if __name__ == "__main__":
     code_list = config.get("CONFIG", "FUTU_CODE_LIST", fallback='').split(',')
     code_list = [code for code in code_list if code.strip()]
     push_type = config.get("CONFIG", "FUTU_PUSH_TYPE")
+    _futu_kw_str = config.get('CONFIG', 'FUTU_KEYWORD', fallback='')
 
     # 获取股票列表
     code_pd = pd.DataFrame(columns=pd.Index(['code','name']))
@@ -418,27 +421,27 @@ if __name__ == "__main__":
 
     header = '名称 | 信号 | 动量 | 20D% | 60D% | 评分'
     raw_msg = '{} {} {}:\n{}\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group if group else '', push_type, header, '\n'.join(trends_df['msg']))
-    _futu_kw_str = config.get('CONFIG', 'FUTU_KEYWORD', fallback='')
+
+    # 原始消息（telegram/email/webhook 去除到价区间 [low,high]）
+    raw_msg_clean = _re.sub(r'\[\d+\.?\d*,\d+\.?\d*\]', '', raw_msg)
+
+    notification = NotificationEngine(config)
+    notification.send_telegram_message(raw_msg_clean,'https://www.futunn.com/')
+    notification.send_email(f'{group} {push_type}',raw_msg_clean)
+    notification.send_webhook(raw_msg_clean)
+
     _futu_keywords = [k.strip() for k in _futu_kw_str.split(',') if k.strip()]
     if _futu_keywords:
         filter_df = trends_df[trends_df['msg'].apply(lambda msg: any(kw in msg for kw in _futu_keywords))]
     else:
         filter_df = trends_df.iloc[0:0]
 
-    notification = NotificationEngine(config)
-
-    # futu分组/到价提醒
     if len(filter_df) > 0:
+        # futu分组/到价提醒
         target_prices = filter_df['msg'].str.extract(r'\[(\d+\.?\d*),(\d+\.?\d*)\]')
         notification.send_futu_message([str(code) for code in filter_df.index.tolist()],filter_df['msg'].tolist(),target_prices[1].tolist(),target_prices[0].tolist())
 
-    # 原始消息（telegram/email 去除到价区间 [low,high]）
-    import re as _re
-    raw_msg_clean = _re.sub(r'\[\d+\.?\d*,\d+\.?\d*\]', '', raw_msg)
-    notification.send_telegram_message(raw_msg_clean,'https://www.futunn.com/')
-    notification.send_email(f'{group} {push_type}',raw_msg_clean)
-    notification.send_webhook(raw_msg_clean)
+        filter_msg = '{} {} {}:\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group if group else '', push_type, '\n'.join(filter_df['msg']))
+        # google sheet
+        notification.send_google_sheet_message(filter_msg)
 
-    # google sheet
-    if len(filter_df) > 0:
-        notification.send_google_sheet_message('{} {} {}:\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group if group else '', push_type, '\n'.join(filter_df['msg'])))
