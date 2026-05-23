@@ -10,6 +10,7 @@ from datetime import datetime
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import configparser
+from futu_group import sync_futu_group
 from notification_engine import NotificationEngine
 from ft_config import get_config
 
@@ -119,6 +120,59 @@ def get_stock_concepts_eastmoney(stock_code, blacklist_set):
         # print(f"抓取失败 {stock_code}: {e}") # 调试时可开启
         return []
 
+def ashare_code_to_futu_code(stock_code):
+    """转换A股代码为Futu代码格式"""
+    if stock_code is None:
+        return None
+    stock_code = str(stock_code).strip()
+    if not stock_code.isdigit():
+        return None
+    stock_code = stock_code.zfill(6)
+    if len(stock_code) != 6:
+        return None
+    if stock_code.startswith('6'):
+        return f"SH.{stock_code}"
+    if stock_code.startswith(('0', '3')):
+        return f"SZ.{stock_code}"
+    return None
+
+def select_futu_group(config, now=None):
+    """
+    从FUTU_GROUP选择A股概念同步分组。
+    配置一个分组时直接使用；配置多个分组时，上午使用第一个，下午使用第二个。
+    """
+    group = config.get("CONFIG", "FUTU_GROUP", fallback="")
+    groups = [g.strip() for g in group.split(',') if g.strip()]
+    if not groups:
+        return ""
+    if len(groups) == 1:
+        return groups[0]
+
+    now = now or datetime.now()
+    return groups[0] if now.hour < 12 else groups[1]
+
+def sync_ashare_concepts_to_futu_group(df, config):
+    """将本次获得的A股标的同步到FUTU_GROUP目标分组"""
+    if df.empty:
+        print("[!] 无竞价数据，跳过同步futu group")
+        return
+
+    group_name = select_futu_group(config)
+    if not group_name:
+        print("[!] 未配置FUTU_GROUP，跳过同步futu group")
+        return
+
+    host = config.get("CONFIG", "FUTU_HOST")
+    port = int(config.get("CONFIG", "FUTU_PORT"))
+    codes = [ashare_code_to_futu_code(code) for code in df['code'].tolist()]
+    codes = [code for code in codes if code]
+    if not codes:
+        print("[!] 无可同步的A股futu代码，跳过同步futu group")
+        return
+
+    print(f"[*] 同步 {len(codes)} 个标的到 futu group: {group_name}")
+    sync_futu_group(group_name, codes, host=host, port=port, overwrite=True)
+
 def analyze_ashare_concepts(blacklist_file=None, top_n=TOP_N, output_json_dir=None):
     """
     分析A股竞价主线概念
@@ -212,6 +266,7 @@ if __name__ == "__main__":
     
     # 发送报告
     notification_engine = NotificationEngine(config)
+    sync_ashare_concepts_to_futu_group(df, config)
     notification_engine.send_email("【金额排名详情】{}".format(now), msg)
     notification_engine.send_telegram_message(msg)
     notification_engine.send_webhook(msg)

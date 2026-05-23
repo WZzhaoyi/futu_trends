@@ -1,9 +1,9 @@
 import configparser
 import time
 import os
-from futu import RET_OK, ModifyUserSecurityOp, OpenQuoteContext
 from xtquant.xttrader import XtQuantTrader
 from xtquant.xttype import StockAccount
+from futu_group import sync_futu_group
 from tools import ib_code_to_futu_code
 
 from ib_async import *
@@ -114,17 +114,4 @@ if __name__ == "__main__":
     port = int(config.get("CONFIG", "FUTU_PORT"))
     group_name = config.get("CONFIG", "FUTU_GROUP")
     
-    clear_group = True
-    
-    quote_ctx = OpenQuoteContext(host=host, port=port)
-    ret, data = quote_ctx.get_user_security(group_name)
-    if ret == RET_OK:
-        if clear_group:
-            old_code_list = list(data['code'])
-            if old_code_list:
-                print(f'清空{group_name}')
-                quote_ctx.modify_user_security(group_name, ModifyUserSecurityOp.MOVE_OUT, old_code_list)
-        quote_ctx.modify_user_security(group_name, ModifyUserSecurityOp.ADD, qmt_code_list + ibkr_code_list)
-    else:
-        print(f'获取{group_name}失败 {data}')
-    quote_ctx.close()
+    sync_futu_group(group_name, qmt_code_list + ibkr_code_list, host=host, port=port, overwrite=True)

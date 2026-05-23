@@ -27,15 +27,24 @@ import time
 import os
 import json
 from requests_html import HTMLSession
-from futu import OpenQuoteContext, RET_OK, SetPriceReminderOp, PriceReminderType, PriceReminderFreq, ModifyUserSecurityOp
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 import httplib2
 from google_auth_httplib2 import AuthorizedHttp
+from futu_group import sync_futu_group
 
 from .webhook import WebhookNotifier, HookResult
 
 logger = logging.getLogger(__name__)
+
+
+def _valid_target_prices(recent_high, recent_low):
+    try:
+        recent_high = float(recent_high)
+        recent_low = float(recent_low)
+    except (TypeError, ValueError):
+        return False
+    return recent_high > 0 and recent_low > 0 and recent_high != recent_low
 
 
 class NotificationEngine:
@@ -84,29 +93,29 @@ class NotificationEngine:
             logger.warning('没有futu关键词，跳过存入futu group')
             return
 
-        quote_ctx = OpenQuoteContext(host=self.host, port=self.port)
-
         for keyword in self.futu_keyword:
+            matched_codes = []
+            matched_highs = []
+            matched_lows = []
             for code, msg, recent_high, recent_low in zip(codes, messages, highs, lows):
-                if keyword in msg:
-                    if recent_high == recent_low or recent_high == 0 or recent_low == 0:
-                        continue
-                    ret_del, data_del = quote_ctx.set_price_reminder(code=code, op=SetPriceReminderOp.DEL_ALL)
-                    ret_up, data_up = quote_ctx.set_price_reminder(code=code, op=SetPriceReminderOp.ADD, reminder_type=PriceReminderType.PRICE_UP,reminder_freq=PriceReminderFreq.ONCE,value=float(recent_high))
-                    ret_down, data_down = quote_ctx.set_price_reminder(code=code, op=SetPriceReminderOp.ADD, reminder_type=PriceReminderType.PRICE_DOWN,reminder_freq=PriceReminderFreq.ONCE,value=float(recent_low))
-                    if ret_del == RET_OK and ret_up == RET_OK and ret_down == RET_OK:
-                        logger.info('%s 价格提醒 [%s,%s]', code, recent_low, recent_high)
-                    else:
-                        logger.error('%s 价格提醒失败 %s %s %s', code, data_del, data_up, data_down)
+                if keyword not in msg:
+                    continue
+                if not _valid_target_prices(recent_high, recent_low):
+                    continue
+                matched_codes.append(code)
+                matched_highs.append(recent_high)
+                matched_lows.append(recent_low)
 
-                    ret, data = quote_ctx.modify_user_security(keyword, ModifyUserSecurityOp.ADD, [code])
-                    if ret == RET_OK:
-                        logger.info('%s 存入%s', code, keyword)
-                    else:
-                        logger.error('存入%s失败 %s', keyword, data)
-                    time.sleep(3)
-
-        quote_ctx.close()
+            if matched_codes:
+                sync_futu_group(
+                    keyword,
+                    matched_codes,
+                    host=self.host,
+                    port=self.port,
+                    price_up_list=matched_highs,
+                    price_down_list=matched_lows,
+                    overwrite=False,
+                )
 
 
     def send_email(self, subject: str, message_html: str):
