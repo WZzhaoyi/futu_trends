@@ -19,6 +19,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # ================= 配置区域 =================
 BLACKLIST_FILE = "./env/concept_blacklist.txt"
 TOP_N = 30           # 分析竞价金额前多少名
+MIN_BIDDING_AMOUNT = 1.0  # 最低竞价成交额(亿)
 MIN_SLEEP = 0.5     # 最小随机延时(秒)
 MAX_SLEEP = 3       # 最大随机延时(秒)
 OUTPUT_JSON_DIR = "./output/concepts"  # 输出JSON文件路径
@@ -43,7 +44,7 @@ def load_blacklist(blacklist_file=None):
         print(f"[!] 未找到 {blacklist_file}，使用默认空黑名单")
     return blacklist
 
-def get_realtime_bidding_list(top_n=TOP_N):
+def get_realtime_bidding_list(top_n=TOP_N, min_amount=MIN_BIDDING_AMOUNT):
     """获取9:25实时竞价排名 (使用东财直连API)"""
     print(f"[*] [{datetime.now().time()}] 正在请求东财直连 API...")
     
@@ -66,11 +67,15 @@ def get_realtime_bidding_list(top_n=TOP_N):
             # 过滤掉无成交额的（停牌等）
             if item['f6'] == '-': 
                 continue
+
+            amount = float(item['f6']) / 100000000
+            if amount <= min_amount:
+                continue
             
             result.append({
                 "code": item['f12'],
                 "name": item['f14'],
-                "amount": round(float(item['f6']) / 100000000, 2),
+                "amount": round(amount, 2),
                 "pct": item['f3']
             })
         print(f"[*] 成功获取 Top {len(result)} 数据")
@@ -173,13 +178,14 @@ def sync_ashare_concepts_to_futu_group(df, config):
     print(f"[*] 同步 {len(codes)} 个标的到 futu group: {group_name}")
     sync_futu_group(group_name, codes, host=host, port=port, overwrite=True)
 
-def analyze_ashare_concepts(blacklist_file=None, top_n=TOP_N, output_json_dir=None):
+def analyze_ashare_concepts(blacklist_file=None, top_n=TOP_N, min_amount=MIN_BIDDING_AMOUNT, output_json_dir=None):
     """
     分析A股竞价主线概念
     
     参数:
         blacklist_file: 黑名单文件路径，默认使用配置中的路径
         top_n: 分析竞价金额前多少名，默认30
+        min_amount: 最低竞价成交额(亿)，默认1亿
         output_json_file: 输出JSON文件路径，默认使用配置中的路径
     
     返回:
@@ -189,7 +195,7 @@ def analyze_ashare_concepts(blacklist_file=None, top_n=TOP_N, output_json_dir=No
     blacklist = load_blacklist(blacklist_file)
     
     # 2. 获取竞价排名
-    top_stocks = get_realtime_bidding_list(top_n)
+    top_stocks = get_realtime_bidding_list(top_n, min_amount)
     if not top_stocks:
         print("[!] 无数据，返回空DataFrame")
         return pd.DataFrame(columns=['code', 'name', 'amount', 'pct', 'concepts'])
