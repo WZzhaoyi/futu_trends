@@ -26,6 +26,9 @@ import re
 import yfinance as yf
 from ib_async import Contract
 
+FUTU_MARKET_PREFIXES = ("US", "HK", "SH", "SZ")
+
+
 def get_kline_seconds(k_type:str): #根据K_1M,K_5M,K_15M,K_30M,K_60M时间含义输出秒数
     if k_type == 'K_DAY':
         return 24 * 60 * 60  # 一天的秒数
@@ -154,6 +157,18 @@ def futu_code_to_yfinance_code(futu_code: str) -> str:
     else:
         assert re.match(r'^[A-Z]{2}.\d{6}$', futu_code)
         return '.'.join(reversed(futu_code.split('.')))
+
+
+def to_yfinance_code(code: str) -> str:
+    """将项目代码或 Yahoo 原生代码转换为 yfinance ticker。"""
+    raw_code = code.strip()
+    upper_code = raw_code.upper()
+    market = upper_code.split(".", 1)[0] if "." in upper_code else ""
+    if market in FUTU_MARKET_PREFIXES:
+        return futu_code_to_yfinance_code(upper_code)
+
+    return raw_code
+
 
 def futu_code_to_longbridge_code(futu_code: str) -> str:
     """将项目股票代码转换为 Longbridge 格式

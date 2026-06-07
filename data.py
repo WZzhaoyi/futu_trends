@@ -23,7 +23,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 import yfinance as yf
-from tools import futu_code_to_yfinance_code, futu_code_to_longbridge_code, futu_code_to_ib_contract
+from tools import to_yfinance_code, futu_code_to_longbridge_code, futu_code_to_ib_contract
 import math
 import akshare as ak
 import threading
@@ -70,6 +70,11 @@ _TRADING_STATES = {
 
 def _is_trading(code, host, port):
     global _state_cache, _state_ts
+    market = code.split('.')[0].upper()
+    key = _MARKET_KEY_MAP.get(market)
+    if not key:
+        return True  # 未知市场无法查询交易状态，按盘中短缓存处理
+
     now = int(time_module.time())
     if not _state_cache or now - _state_ts >= _STATE_TTL:
         ctx = ft.OpenQuoteContext(host=host, port=port)
@@ -80,9 +85,7 @@ def _is_trading(code, host, port):
                 _state_ts = int(data.get('timestamp', now))
         finally:
             ctx.close()
-    market = code.split('.')[0].upper()
-    key = _MARKET_KEY_MAP.get(market)
-    if not key or not _state_cache:
+    if not _state_cache:
         return True  # 未知市场或获取失败，保守当作盘中
     return _state_cache.get(key, 'NONE') in _TRADING_STATES
 
@@ -119,6 +122,17 @@ def _write_cache_file(cache_dir, code, ktype, df):
     df.to_csv(new_file)
     return fetch_ts
 
+def _normalize_proxy_url(proxy_url: str | None) -> str | None:
+    if not proxy_url:
+        return None
+    proxy_url = proxy_url.strip()
+    if not proxy_url:
+        return None
+    if "://" not in proxy_url:
+        return f"http://{proxy_url}"
+    return proxy_url
+
+
 def setup_global_proxy(proxy_url: str | None = None):
     """
     设置全局代理，使所有 HTTP 请求（包括 yfinance）都走代理
@@ -130,7 +144,7 @@ def setup_global_proxy(proxy_url: str | None = None):
     """
     global _proxy_configured
 
-    url = proxy_url or os.environ.get('HTTP_PROXY') or os.environ.get('HTTPS_PROXY')
+    url = _normalize_proxy_url(proxy_url or os.environ.get('HTTP_PROXY') or os.environ.get('HTTPS_PROXY'))
     if not url:
         return
 
@@ -349,7 +363,7 @@ def get_yfinance_params(ktype: str, max_count: int) -> dict:
     if interval.endswith('m') or interval == '1h':
         period = '60d'
     elif interval == '1d':
-        period = '5y' if max_count > 730 else '2y' if max_count > 365 else '1y' if max_count > 180 else '6mo'
+        period = 'max' if max_count > 1300 else '5y' if max_count > 730 else '2y' if max_count > 365 else '1y' if max_count > 180 else '6mo'
     elif interval == '1wk':
         period = '10y' if max_count > 260 else '5y' if max_count > 52 else '1y'
     else:  # 月线
@@ -370,7 +384,7 @@ def fetch_yfinance_data(code: str, ktype: str, max_count: int, config: configpar
         
         sleep(1)
             
-        yf_code = futu_code_to_yfinance_code(code)
+        yf_code = to_yfinance_code(code)
         params = get_yfinance_params(ktype, max_count)
         
         tic = yf.Ticker(yf_code)
@@ -707,7 +721,7 @@ def get_kline_data(code: str, config: configparser.ConfigParser, max_count: int 
         if file_cache_dir:
             _write_cache_file(file_cache_dir, code, ktype, df)
 
-    return df
+    return df.tail(max_count).copy()
 
 if __name__ == "__main__":
     import time as t
