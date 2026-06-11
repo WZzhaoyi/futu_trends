@@ -5,8 +5,13 @@ import json
 import time
 import random
 import os
+import shutil
+import subprocess
+import contextlib
+import io
 from collections import Counter
 from datetime import datetime
+from urllib.parse import urlencode
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import configparser
@@ -18,13 +23,96 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 # ================= 配置区域 =================
 BLACKLIST_FILE = "./env/concept_blacklist.txt"
-TOP_N = 30           # 分析竞价金额前多少名
+TOP_N = 20           # 分析竞价金额前多少名
 MIN_BIDDING_AMOUNT = 1.0  # 最低竞价成交额(亿)
 MIN_SLEEP = 0.5     # 最小随机延时(秒)
 MAX_SLEEP = 3       # 最大随机延时(秒)
 OUTPUT_JSON_DIR = "./output/concepts"  # 输出JSON文件路径
+CONCEPT_BOARD_TOP_N = 20  # 输出东财概念板块排名前多少名
+EASTMONEY_TIMEOUT = 5
+EASTMONEY_HEADERS = {"User-Agent": "Mozilla/5.0"}
+EASTMONEY_UT = "bd1d9ddb04089700cf9c27f6f7426281"
+EASTMONEY_STOCK_URLS = [
+    "https://43.push2.eastmoney.com/api/qt/clist/get",
+    "https://82.push2.eastmoney.com/api/qt/clist/get",
+    "https://push2.eastmoney.com/api/qt/clist/get",
+]
+EASTMONEY_CONCEPT_URLS = [
+    "https://79.push2.eastmoney.com/api/qt/clist/get",
+    "https://push2.eastmoney.com/api/qt/clist/get",
+]
 
 # ================= 核心功能函数 =================
+
+def to_float(value):
+    """安全转换行情字段为 float，兼容 '-'、None、NaN。"""
+    if value is None or pd.isna(value) or value == "-":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+def format_concept_ranking_line(item):
+    """格式化题材排名消息，兼容东财涨幅榜和 F10 统计兜底榜。"""
+    pct = item.get("pct")
+    if pct is None:
+        return f"{item['rank']}|{item['concept']}|出现:{item.get('up_count') or 0}次"
+    return f"{item['rank']}|{item['concept']}|{pct}%|领涨:{item.get('leader', '')} {item.get('leader_pct')}%"
+
+def request_eastmoney_clist(urls, params):
+    """请求东财 clist 小分页接口；优先直连，失败后再尝试环境代理。"""
+    errors = []
+
+    for trust_env in (False, True):
+        session = requests.Session()
+        session.trust_env = trust_env
+        for url in urls:
+            try:
+                response = session.get(
+                    url,
+                    params=params,
+                    headers=EASTMONEY_HEADERS,
+                    timeout=EASTMONEY_TIMEOUT,
+                )
+                response.raise_for_status()
+                data = response.json()
+                if data.get("rc") == 0 and data.get("data"):
+                    return data
+                errors.append(f"{url} rc={data.get('rc')} data={data.get('data')}")
+            except Exception as e:
+                errors.append(f"{url} trust_env={trust_env}: {e}")
+
+    curl_path = shutil.which("curl")
+    if curl_path:
+        for url in urls:
+            try:
+                query = urlencode(params, safe=":+,!")
+                request_url = f"{url}?{query}"
+                completed = subprocess.run(
+                    [
+                        curl_path,
+                        "--noproxy",
+                        "*",
+                        "-A",
+                        EASTMONEY_HEADERS["User-Agent"],
+                        "-sS",
+                        "--max-time",
+                        str(EASTMONEY_TIMEOUT),
+                        request_url,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                data = json.loads(completed.stdout)
+                if data.get("rc") == 0 and data.get("data"):
+                    return data
+                errors.append(f"curl {url} rc={data.get('rc')} data={data.get('data')}")
+            except Exception as e:
+                errors.append(f"curl {url}: {e}")
+
+    raise RuntimeError("; ".join(errors[-4:]))
 
 def load_blacklist(blacklist_file=None):
     """读取本地黑名单配置"""
@@ -45,43 +133,142 @@ def load_blacklist(blacklist_file=None):
     return blacklist
 
 def get_realtime_bidding_list(top_n=TOP_N, min_amount=MIN_BIDDING_AMOUNT):
-    """获取9:25实时竞价排名 (使用东财直连API)"""
-    print(f"[*] [{datetime.now().time()}] 正在请求东财直连 API...")
-    
-    url = "https://43.push2.eastmoney.com/api/qt/clist/get"
-    params = {
-        "pn": 1, "pz": top_n, "po": 1, "np": 1, 
-        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-        "fltt": 2, "invt": 2, "fid": "f6",
-        "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
-        "fields": "f12,f14,f6,f3"
-    }
+    """获取A股全市场实时成交额排名 (使用东财直连小分页 API)"""
+    print(f"[*] [{datetime.now().time()}] 正在请求东财成交额小分页 API...")
     
     try:
-        res = requests.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=3)
-        data = res.json()
-        stock_list = data['data']['diff']
-        
+        params = {
+            "pn": 1,
+            "pz": top_n,
+            "po": 1,
+            "np": 1,
+            "ut": EASTMONEY_UT,
+            "fltt": 2,
+            "invt": 2,
+            "fid": "f6",
+            "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+            "fields": "f12,f14,f6,f3",
+        }
+        data = request_eastmoney_clist(EASTMONEY_STOCK_URLS, params)
+        stock_list = data["data"].get("diff") or []
+
         result = []
         for item in stock_list:
-            # 过滤掉无成交额的（停牌等）
-            if item['f6'] == '-': 
+            amount_raw = to_float(item.get("f6"))
+            if amount_raw is None:
                 continue
-
-            amount = float(item['f6']) / 100000000
+            amount = amount_raw / 100000000
             if amount <= min_amount:
                 continue
-            
+
+            pct = to_float(item.get("f3"))
             result.append({
-                "code": item['f12'],
-                "name": item['f14'],
+                "code": str(item.get("f12", "")).strip().zfill(6),
+                "name": item.get("f14", ""),
                 "amount": round(amount, 2),
-                "pct": item['f3']
+                "pct": round(pct, 2) if pct is not None else None
             })
-        print(f"[*] 成功获取 Top {len(result)} 数据")
+        print(f"[*] 成功获取成交额 Top {len(result)} 数据")
         return result
     except Exception as e:
-        print(f"[!] API 请求失败: {e}")
+        print(f"[!] 东财成交额小分页 API 请求失败: {e}")
+        return get_realtime_bidding_list_sina(top_n, min_amount)
+
+def get_realtime_bidding_list_sina(top_n=TOP_N, min_amount=MIN_BIDDING_AMOUNT):
+    """获取A股全市场实时成交额排名 (新浪兜底源，较慢，避免高频调用)"""
+    print(f"[*] [{datetime.now().time()}] 正在请求新浪 A 股实时行情兜底源...")
+
+    try:
+        import akshare as ak
+
+        # AkShare 的新浪接口会打印 tqdm 进度条；脚本通知场景下静音即可。
+        with contextlib.redirect_stderr(io.StringIO()):
+            df = ak.stock_zh_a_spot()
+
+        required_columns = {"代码", "名称", "成交额", "涨跌幅"}
+        missing_columns = required_columns - set(df.columns)
+        if missing_columns:
+            print(f"[!] 新浪实时行情缺少字段: {sorted(missing_columns)}")
+            return []
+
+        df = df.copy()
+        df["成交额"] = pd.to_numeric(df["成交额"], errors="coerce")
+        df["涨跌幅"] = pd.to_numeric(df["涨跌幅"], errors="coerce")
+        df = df.dropna(subset=["成交额"])
+        df = df[df["成交额"] > min_amount * 100000000]
+        df = df.sort_values("成交额", ascending=False)
+
+        result = []
+        for _, item in df.iterrows():
+            raw_code = str(item["代码"]).strip().lower()
+            if raw_code.startswith(("sh", "sz")):
+                code = raw_code[2:]
+            else:
+                continue
+            if not code.startswith(("6", "0", "3")):
+                continue
+
+            pct = to_float(item["涨跌幅"])
+            result.append({
+                "code": code.zfill(6),
+                "name": item["名称"],
+                "amount": round(float(item["成交额"]) / 100000000, 2),
+                "pct": round(pct, 2) if pct is not None else None
+            })
+            if len(result) >= top_n:
+                break
+
+        print(f"[*] 新浪兜底源成功获取成交额 Top {len(result)} 数据")
+        return result
+    except Exception as e:
+        print(f"[!] 新浪 A 股实时行情兜底源请求失败: {e}")
+        return []
+
+def get_concept_board_ranking(top_n=CONCEPT_BOARD_TOP_N, blacklist_set=None):
+    """获取东财概念板块涨幅排名 (使用东财直连小分页 API)"""
+    print(f"[*] [{datetime.now().time()}] 正在请求东财概念板块小分页 API...")
+
+    try:
+        params = {
+            "pn": 1,
+            "pz": top_n,
+            "po": 1,
+            "np": 1,
+            "ut": EASTMONEY_UT,
+            "fltt": 2,
+            "invt": 2,
+            "fid": "f3",
+            "fs": "m:90+t:3+f:!50",
+            "fields": "f2,f3,f4,f8,f12,f14,f20,f104,f105,f128,f136",
+        }
+        data = request_eastmoney_clist(EASTMONEY_CONCEPT_URLS, params)
+        concept_list = data["data"].get("diff") or []
+
+        rankings = []
+        for rank, item in enumerate(concept_list, 1):
+            concept = item.get("f14", "")
+            if blacklist_set and concept in blacklist_set:
+                continue
+
+            pct = to_float(item.get("f3"))
+            turnover = to_float(item.get("f8"))
+            leader_pct = to_float(item.get("f136"))
+            rankings.append({
+                "rank": rank,
+                "concept": concept,
+                "code": item.get("f12", ""),
+                "pct": round(pct, 2) if pct is not None else None,
+                "turnover": round(turnover, 2) if turnover is not None else None,
+                "up_count": int(item["f104"]) if to_float(item.get("f104")) is not None else None,
+                "down_count": int(item["f105"]) if to_float(item.get("f105")) is not None else None,
+                "leader": item.get("f128", ""),
+                "leader_pct": round(leader_pct, 2) if leader_pct is not None else None,
+            })
+
+        print(f"[*] 成功获取概念板块 Top {len(rankings)} 数据")
+        return rankings
+    except Exception as e:
+        print(f"[!] 东财概念板块小分页 API 请求失败: {e}")
         return []
 
 def get_stock_concepts_eastmoney(stock_code, blacklist_set):
@@ -193,17 +380,22 @@ def analyze_ashare_concepts(blacklist_file=None, top_n=TOP_N, min_amount=MIN_BID
     """
     # 1. 加载黑名单
     blacklist = load_blacklist(blacklist_file)
+
+    # 2. 获取东财概念板块实时排名
+    concept_board_rankings = get_concept_board_ranking(blacklist_set=blacklist)
     
-    # 2. 获取竞价排名
+    # 3. 获取成交额排名
     top_stocks = get_realtime_bidding_list(top_n, min_amount)
     if not top_stocks:
         print("[!] 无数据，返回空DataFrame")
-        return pd.DataFrame(columns=['code', 'name', 'amount', 'pct', 'concepts'])
+        df = pd.DataFrame(columns=['code', 'name', 'amount', 'pct', 'concepts'])
+        df.attrs["concept_board_rankings"] = concept_board_rankings
+        return df
     
     print(f"[*] 开始顺序抓取 Top {len(top_stocks)} 个股概念...")
     start_time = time.time()
     
-    # 3. 顺序抓取概念
+    # 4. 顺序抓取概念
     results = []
     for idx, stock_info in enumerate(top_stocks, 1):
         print(f"[*] 正在处理 {idx}/{len(top_stocks)}: {stock_info['code']} {stock_info['name']}")
@@ -214,18 +406,35 @@ def analyze_ashare_concepts(blacklist_file=None, top_n=TOP_N, min_amount=MIN_BID
     cost_time = time.time() - start_time
     print(f"[*] 概念抓取完成，耗时: {cost_time:.2f} 秒")
     
-    # 4. 构建DataFrame
+    # 5. 构建DataFrame
     df = pd.DataFrame(results)
+    df.attrs["concept_board_rankings"] = concept_board_rankings
     
-    # 5. 统计热点概念
+    # 6. 统计热点概念
     all_concepts = []
     for stock in results:
         all_concepts.extend(stock['concepts'])
     
     concept_counter = Counter(all_concepts)
     hot_concepts = concept_counter.most_common(10)
+    if not concept_board_rankings:
+        concept_board_rankings = [
+            {
+                "rank": idx,
+                "concept": concept,
+                "code": "",
+                "pct": None,
+                "turnover": None,
+                "up_count": count,
+                "down_count": None,
+                "leader": "",
+                "leader_pct": None,
+            }
+            for idx, (concept, count) in enumerate(hot_concepts, 1)
+        ]
+        df.attrs["concept_board_rankings"] = concept_board_rankings
     
-    # 6. 保存JSON文件
+    # 7. 保存JSON文件
     if output_json_dir is None:
         output_json_dir = OUTPUT_JSON_DIR
     if not os.path.exists(output_json_dir):
@@ -236,6 +445,7 @@ def analyze_ashare_concepts(blacklist_file=None, top_n=TOP_N, min_amount=MIN_BID
         'date': datetime.now().strftime('%Y-%m-%d'),
         'time': datetime.now().strftime('%H:%M:%S'),
         'stocks': results,
+        'concept_board_rankings': concept_board_rankings,
         'hot_concepts': [{'concept': concept, 'count': count} for concept, count in hot_concepts]
     }
     
@@ -261,6 +471,13 @@ if __name__ == "__main__":
     # 输出报告
     msg = ''
     msg += "【金额排名详情】 {}".format(now)
+    msg += "\n"
+    msg += "【题材排名】"
+    msg += "\n"
+    concept_rankings = df.attrs.get("concept_board_rankings", [])
+    for item in concept_rankings[:10]:
+        msg += format_concept_ranking_line(item)
+        msg += "\n"
     msg += "\n"
     msg += "代码|名称|金额(亿)|涨幅%|概念"
     msg += "\n"
