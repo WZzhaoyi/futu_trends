@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import ast
 import math
 import argparse
 import os
+import re
 import sys
 from collections import defaultdict
+from datetime import datetime
+from itertools import combinations
 from pathlib import Path
+from typing import Any
+
+import pandas as pd
 
 
 def bootstrap_vnpy_workspace_for_script() -> None:
@@ -178,50 +185,175 @@ class MomentumRotationStrategy(StrategyTemplate):
         return annualized_return * r_squared
 
 
-DEFAULT_BACKTEST_SYMBOLS = ["US.QQQ", "US.GLD", "US.SPY", "US.FXI"]
+# Ten-year universe optimization snapshot, 2016-06-12 to 2026-06-12, benchmark US.SPY.
+# Ranked by Sortino ratio after optimizing regression_window in 20..30:
+# 1. US.QQQ US.GLD US.SPY US.UUP, window=22, total=455.08%, annual=45.27%, max_dd=-28.20%, Sharpe=0.9011, Sortino=3.3519, Calmar=1.6052
+# 2. US.QQQ US.SPY US.FXI US.UUP, window=21, total=476.73%, annual=47.43%, max_dd=-30.33%, Sharpe=0.8314, Sortino=3.3432, Calmar=1.5638
+# 3. US.QQQ US.GLD US.SPY US.FXI, window=22, total=520.53%, annual=51.78%, max_dd=-27.78%, Sharpe=0.7683, Sortino=3.1438, Calmar=1.8643
+
+DEFAULT_MODE = "optimize-universe"
+DEFAULT_START = "2016-06-12"
+DEFAULT_END = "2026-06-12"
+DEFAULT_CAPITAL = 1_000_000
+DEFAULT_DATA_SOURCE = "project"
+DEFAULT_MAX_WORKERS = 4
+DEFAULT_OPTIMIZATION_METHOD = "bf"
+DEFAULT_OPTIMIZATION_TARGET = "sortino_ratio"
+DEFAULT_CANDIDATE_SYMBOLS = ["US.QQQ", "US.GLD", "US.SPY", "US.FXI", "US.UUP", "US.TLT"]
+DEFAULT_BACKTEST_SYMBOLS = DEFAULT_CANDIDATE_SYMBOLS[:4]
+DEFAULT_UNIVERSE_SIZE = 4
+DEFAULT_BENCHMARK_SYMBOL = "US.SPY"
 DEFAULT_STRATEGY_SETTING = {
     "regression_window": 22,
     "allocation": 1.0,
     "min_score": float("-inf"),
 }
+DEFAULT_OPTIMIZATION_PARAMETERS = [
+    ("regression_window", 20, 30, 1),
+]
+
+
+def make_optimization_parameters(parameter_cls: type) -> list[Any]:
+    return [
+        parameter_cls(name, start, end, step)
+        for name, start, end, step in DEFAULT_OPTIMIZATION_PARAMETERS
+    ]
+
+
+def make_backtest_config(
+    args: argparse.Namespace,
+    symbols: list[str],
+    config_cls: type,
+    data_source: str | None = None,
+) -> Any:
+    strategy_setting = dict(DEFAULT_STRATEGY_SETTING)
+    strategy_setting["initial_capital"] = DEFAULT_CAPITAL
+
+    return config_cls(
+        symbols=symbols,
+        start=args.start,
+        end=args.end,
+        capital=DEFAULT_CAPITAL,
+        data_source=data_source or DEFAULT_DATA_SOURCE,
+        config_path=args.config,
+        benchmark_symbol=DEFAULT_BENCHMARK_SYMBOL,
+        strategy_setting=strategy_setting,
+    )
+
+
+def export_universe_results(rows: list[dict[str, Any]], output_root: Path) -> Path:
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    path = output_root / f"momentumrotationstrategy_universe_optimization_{stamp}.csv"
+    pd.DataFrame(rows).sort_values("target", ascending=False).to_csv(path, index=False)
+    return path
+
+
+def parse_setting_text(setting_text: str) -> dict[str, Any]:
+    try:
+        safe_text = re.sub(r"(?<![\w.])-inf(?![\w.])", "-1e309", setting_text)
+        safe_text = re.sub(r"(?<![\w.])inf(?![\w.])", "1e309", safe_text)
+        setting = ast.literal_eval(safe_text)
+    except (SyntaxError, ValueError):
+        return {}
+
+    return setting if isinstance(setting, dict) else {}
+
+
+def run_universe_optimization(
+    args: argparse.Namespace,
+    config_cls: type,
+    parameter_cls: type,
+    output_root: Path,
+    prepare_history_func: Any,
+    run_optimization_func: Any,
+) -> list[dict[str, Any]]:
+    candidates = DEFAULT_CANDIDATE_SYMBOLS
+    optimization_parameters = make_optimization_parameters(parameter_cls)
+    rows: list[dict[str, Any]] = []
+    combos = list(combinations(candidates, DEFAULT_UNIVERSE_SIZE))
+    combo_source = DEFAULT_DATA_SOURCE
+
+    if DEFAULT_DATA_SOURCE == "project":
+        print(f"Preparing history data for candidate universe: {' '.join(candidates)}")
+        prepare_history_func(make_backtest_config(args, candidates, config_cls))
+        combo_source = "database"
+
+    for index, combo in enumerate(combos, start=1):
+        symbols = list(combo)
+        print(f"Universe {index}/{len(combos)}: {' '.join(symbols)}")
+        config = make_backtest_config(args, symbols, config_cls, data_source=combo_source)
+        results = run_optimization_func(
+            MomentumRotationStrategy,
+            config,
+            optimization_parameters,
+            target=DEFAULT_OPTIMIZATION_TARGET,
+            method=DEFAULT_OPTIMIZATION_METHOD,
+            max_workers=DEFAULT_MAX_WORKERS,
+        )
+        best_setting, best_target, best_statistics = results[0]
+        row = {
+            "symbols": " ".join(symbols),
+            "target": best_target,
+            "setting": best_setting,
+        }
+        for key, value in parse_setting_text(best_setting).items():
+            row[f"param_{key}"] = value
+        row.update(best_statistics)
+        rows.append(row)
+
+    path = export_universe_results(rows, output_root)
+    print(f"Universe optimization result: {path}")
+    return rows
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Momentum rotation vn.py backtest")
-    parser.add_argument("--symbols", nargs="+", default=DEFAULT_BACKTEST_SYMBOLS)
-    parser.add_argument("--start", default="2014-09-09")
-    parser.add_argument("--end", default="2025-09-09")
-    parser.add_argument("--capital", type=int, default=1_000_000)
-    parser.add_argument("--source", choices=["project", "database"], default="project")
+    parser.add_argument(
+        "mode",
+        nargs="?",
+        choices=["backtest", "optimize", "optimize-universe"],
+        default=DEFAULT_MODE,
+    )
+    parser.add_argument("--start", default=DEFAULT_START)
+    parser.add_argument("--end", default=DEFAULT_END)
     parser.add_argument("--config", default=None)
-    parser.add_argument("--refresh-data", action="store_true")
-    parser.add_argument("--proxy", default=None)
-    parser.add_argument("--no-proxy", action="store_true")
-    parser.add_argument("--show-chart", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
-    from backtest import BacktestConfig, run_strategy_backtest
+    from backtest import (
+        BacktestConfig,
+        OUTPUT_ROOT,
+        OptimizationParameter,
+        prepare_history_data,
+        run_strategy_backtest,
+        run_strategy_optimization,
+    )
 
     args = parse_args()
-    strategy_setting = dict(DEFAULT_STRATEGY_SETTING)
-    strategy_setting["initial_capital"] = args.capital
-
-    config = BacktestConfig(
-        symbols=args.symbols,
-        start=args.start,
-        end=args.end,
-        capital=args.capital,
-        data_source=args.source,
-        config_path=args.config,
-        refresh_data=args.refresh_data,
-        proxy=args.proxy,
-        no_proxy=args.no_proxy,
-        show_chart=args.show_chart,
-        strategy_setting=strategy_setting,
-    )
-    run_strategy_backtest(MomentumRotationStrategy, config)
+    if args.mode == "optimize-universe":
+        run_universe_optimization(
+            args,
+            BacktestConfig,
+            OptimizationParameter,
+            OUTPUT_ROOT,
+            prepare_history_data,
+            run_strategy_optimization,
+        )
+    elif args.mode == "optimize":
+        config = make_backtest_config(args, DEFAULT_BACKTEST_SYMBOLS, BacktestConfig)
+        optimization_parameters = make_optimization_parameters(OptimizationParameter)
+        run_strategy_optimization(
+            MomentumRotationStrategy,
+            config,
+            optimization_parameters,
+            target=DEFAULT_OPTIMIZATION_TARGET,
+            method=DEFAULT_OPTIMIZATION_METHOD,
+            max_workers=DEFAULT_MAX_WORKERS,
+        )
+    else:
+        config = make_backtest_config(args, DEFAULT_BACKTEST_SYMBOLS, BacktestConfig)
+        run_strategy_backtest(MomentumRotationStrategy, config)
 
 
 if __name__ == "__main__":

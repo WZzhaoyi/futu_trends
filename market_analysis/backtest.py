@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import argparse
+import ast
 import configparser
-import importlib
 import os
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -19,6 +18,7 @@ DATA_ROOT = PROJECT_ROOT / "data"
 VNPY_ROOT = DATA_ROOT / ".vntrader"
 CACHE_ROOT = DATA_ROOT / "vnpy_cache"
 OUTPUT_ROOT = PROJECT_ROOT / "output" / "backtest"
+CUSTOM_OPTIMIZATION_TARGETS = {"sortino_ratio", "calmar_ratio"}
 
 
 @dataclass(frozen=True)
@@ -47,13 +47,16 @@ class BacktestConfig:
     proxy: str | None = None
     no_proxy: bool = False
     show_chart: bool = False
-    strategy: str = "momentum_rotation_strategy:MomentumRotationStrategy"
-    strategy_setting: dict[str, Any] = field(default_factory=lambda: {
-        "regression_window": 22,
-        "initial_capital": 1_000_000,
-        "allocation": 1.0,
-        "min_score": float("-inf"),
-    })
+    benchmark_symbol: str | None = None
+    strategy_setting: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class OptimizationParameter:
+    name: str
+    start: float
+    end: float | None = None
+    step: float | None = None
 
 
 def prepare_vnpy_workspace() -> None:
@@ -105,6 +108,7 @@ def load_project_config(path: str | None = None) -> configparser.ConfigParser:
 
 
 def import_vnpy_modules():
+    from vnpy.trader.optimize import OptimizationSetting
     from vnpy.trader.constant import Exchange, Interval
     from vnpy.trader.database import get_database
     from vnpy.trader.object import BarData
@@ -119,51 +123,9 @@ def import_vnpy_modules():
         "Interval": Interval,
         "BarData": BarData,
         "BacktestingEngine": BacktestingEngine,
+        "OptimizationSetting": OptimizationSetting,
         "get_database": get_database,
     }
-
-
-def load_strategy_class(strategy_path: str) -> type:
-    if ":" in strategy_path:
-        module_name, class_name = strategy_path.split(":", 1)
-    else:
-        module_name, class_name = strategy_path.rsplit(".", 1)
-
-    module = importlib.import_module(module_name)
-    strategy_class = getattr(module, class_name)
-    return strategy_class
-
-
-def parse_strategy_setting(values: list[str]) -> dict[str, Any]:
-    settings: dict[str, Any] = {}
-    for value in values:
-        if "=" not in value:
-            raise ValueError(f"Invalid strategy setting: {value}. Expected KEY=VALUE.")
-
-        key, raw = value.split("=", 1)
-        settings[key] = parse_scalar(raw)
-
-    return settings
-
-
-def parse_scalar(raw: str) -> Any:
-    lowered = raw.lower()
-    if lowered == "true":
-        return True
-    if lowered == "false":
-        return False
-    if lowered in {"none", "null"}:
-        return None
-
-    try:
-        return int(raw)
-    except ValueError:
-        pass
-
-    try:
-        return float(raw)
-    except ValueError:
-        return raw
 
 
 def resolve_symbol(code: str, exchange_cls: Any) -> SymbolSpec:
@@ -290,6 +252,172 @@ def ensure_history_data(config: BacktestConfig, specs: list[SymbolSpec], vnpy: d
             print(f"Imported {len(bars):>5} bars: {spec.code} -> {spec.vt_symbol}")
 
 
+def history_specs(config: BacktestConfig, vnpy: dict[str, Any]) -> list[SymbolSpec]:
+    symbols = list(dict.fromkeys(config.symbols + ([config.benchmark_symbol] if config.benchmark_symbol else [])))
+    return resolve_specs(symbols, vnpy)
+
+
+def load_benchmark_close(config: BacktestConfig, vnpy: dict[str, Any]) -> pd.Series:
+    if not config.benchmark_symbol:
+        return pd.Series(dtype=float)
+
+    spec = resolve_specs([config.benchmark_symbol], vnpy)[0]
+    exchange = getattr(vnpy["Exchange"], spec.exchange_name)
+    database = vnpy["get_database"]()
+    bars = database.load_bar_data(
+        spec.symbol,
+        exchange,
+        vnpy["Interval"].DAILY,
+        datetime.strptime(config.start, "%Y-%m-%d"),
+        datetime.strptime(config.end, "%Y-%m-%d"),
+    )
+    if not bars:
+        raise RuntimeError(f"No benchmark data for {config.benchmark_symbol}")
+
+    index = pd.to_datetime([bar.datetime for bar in bars])
+    if index.tz is not None:
+        index = index.tz_localize(None)
+
+    close = pd.Series(
+        [bar.close_price for bar in bars],
+        index=index.normalize(),
+        name="benchmark_close",
+        dtype=float,
+    )
+    return close.sort_index()
+
+
+def calculate_drawdown(equity: pd.Series) -> tuple[pd.Series, pd.Series]:
+    highlevel = equity.cummax()
+    drawdown = equity - highlevel
+    ddpercent = drawdown / highlevel * 100
+    return drawdown, ddpercent
+
+
+def add_benchmark_metrics(daily_df: pd.DataFrame, config: BacktestConfig, vnpy: dict[str, Any]) -> tuple[pd.DataFrame, dict[str, float]]:
+    if not config.benchmark_symbol:
+        return daily_df, {}
+
+    df = daily_df.copy()
+    dates = pd.to_datetime(df.index).normalize()
+    benchmark_close = load_benchmark_close(config, vnpy).reindex(dates).ffill()
+    if benchmark_close.isna().all():
+        raise RuntimeError(f"No aligned benchmark data for {config.benchmark_symbol}")
+
+    first_close = benchmark_close.dropna().iloc[0]
+    benchmark_equity = benchmark_close / first_close * config.capital
+    benchmark_return = benchmark_equity.pct_change().fillna(0) * 100
+
+    strategy_equity = pd.Series(df["balance"].astype(float).to_numpy(), index=dates, name="strategy_balance")
+    strategy_return = strategy_equity.pct_change().fillna(0) * 100
+    excess_return = strategy_return - benchmark_return
+    excess_equity = (1 + excess_return / 100).cumprod() * config.capital
+    excess_drawdown, excess_ddpercent = calculate_drawdown(excess_equity)
+
+    df["benchmark_symbol"] = config.benchmark_symbol
+    df["benchmark_close"] = benchmark_close.to_numpy()
+    df["benchmark_balance"] = benchmark_equity.to_numpy()
+    df["benchmark_return"] = benchmark_return.to_numpy()
+    df["excess_return"] = excess_return.to_numpy()
+    df["excess_balance"] = excess_equity.to_numpy()
+    df["excess_drawdown"] = excess_drawdown.to_numpy()
+    df["excess_ddpercent"] = excess_ddpercent.to_numpy()
+
+    total_days = max((dates[-1] - dates[0]).days, 1)
+    annual_factor = 365 / total_days
+    benchmark_total_return = (benchmark_equity.iloc[-1] / benchmark_equity.iloc[0] - 1) * 100
+    benchmark_annual_return = ((benchmark_equity.iloc[-1] / benchmark_equity.iloc[0]) ** annual_factor - 1) * 100
+    benchmark_max_ddpercent = calculate_drawdown(benchmark_equity)[1].min()
+    benchmark_downside = (benchmark_return / 100 - (config.risk_free / 100) / config.annual_days).clip(upper=0)
+    benchmark_downside_deviation = (benchmark_downside.pow(2).mean() ** 0.5) * (config.annual_days ** 0.5)
+    excess_total_return = (strategy_equity.iloc[-1] / strategy_equity.iloc[0] - benchmark_equity.iloc[-1] / benchmark_equity.iloc[0]) * 100
+    tracking_error = excess_return.std() * (config.annual_days ** 0.5)
+    information_ratio = (
+        excess_return.mean() / excess_return.std() * (config.annual_days ** 0.5)
+        if excess_return.std()
+        else 0
+    )
+
+    statistics = {
+        "benchmark_symbol": config.benchmark_symbol,
+        "benchmark_total_return": benchmark_total_return,
+        "benchmark_annual_return": benchmark_annual_return,
+        "benchmark_max_ddpercent": benchmark_max_ddpercent,
+        "benchmark_sortino_ratio": (benchmark_annual_return / 100 - config.risk_free / 100) / benchmark_downside_deviation if benchmark_downside_deviation else 0,
+        "benchmark_calmar_ratio": benchmark_annual_return / abs(benchmark_max_ddpercent) if benchmark_max_ddpercent else 0,
+        "excess_total_return": excess_total_return,
+        "excess_annual_return": ((strategy_equity.iloc[-1] / strategy_equity.iloc[0]) ** annual_factor - (benchmark_equity.iloc[-1] / benchmark_equity.iloc[0]) ** annual_factor) * 100,
+        "excess_max_ddpercent": excess_ddpercent.min(),
+        "tracking_error": tracking_error,
+        "information_ratio": information_ratio,
+    }
+    return df, statistics
+
+
+def benchmark_statistics(config: BacktestConfig, vnpy: dict[str, Any]) -> dict[str, float]:
+    if not config.benchmark_symbol:
+        return {}
+
+    close = load_benchmark_close(config, vnpy)
+    if close.empty:
+        return {}
+
+    equity = close / close.iloc[0] * config.capital
+    dates = pd.to_datetime(equity.index).normalize()
+    total_days = max((dates[-1] - dates[0]).days, 1)
+    annual_factor = 365 / total_days
+    total_return = (equity.iloc[-1] / equity.iloc[0] - 1) * 100
+    annual_return = ((equity.iloc[-1] / equity.iloc[0]) ** annual_factor - 1) * 100
+    max_ddpercent = calculate_drawdown(equity)[1].min()
+    daily_return = equity.pct_change().fillna(0)
+    target_daily_return = (config.risk_free / 100) / config.annual_days
+    downside = (daily_return - target_daily_return).clip(upper=0)
+    downside_deviation = (downside.pow(2).mean() ** 0.5) * (config.annual_days ** 0.5)
+    return {
+        "benchmark_symbol": config.benchmark_symbol,
+        "benchmark_total_return": total_return,
+        "benchmark_annual_return": annual_return,
+        "benchmark_max_ddpercent": max_ddpercent,
+        "benchmark_sortino_ratio": (annual_return / 100 - config.risk_free / 100) / downside_deviation if downside_deviation else 0,
+        "benchmark_calmar_ratio": annual_return / abs(max_ddpercent) if max_ddpercent else 0,
+    }
+
+
+def add_benchmark_statistics(statistics: dict[str, Any], benchmark: dict[str, float]) -> dict[str, Any]:
+    if not benchmark:
+        return statistics
+
+    enriched = dict(statistics)
+    enriched.update(benchmark)
+    total_return = enriched.get("total_return")
+    annual_return = enriched.get("annual_return")
+    if total_return is not None:
+        enriched["excess_total_return"] = total_return - benchmark["benchmark_total_return"]
+    if annual_return is not None:
+        enriched["excess_annual_return"] = annual_return - benchmark["benchmark_annual_return"]
+    return enriched
+
+
+def calculate_risk_ratios(daily_df: pd.DataFrame, statistics: dict[str, Any], config: BacktestConfig) -> dict[str, float]:
+    balance = pd.Series(daily_df["balance"].astype(float).to_numpy(), index=pd.to_datetime(daily_df.index))
+    daily_return = balance.pct_change().fillna(0)
+    target_daily_return = (config.risk_free / 100) / config.annual_days
+    downside = (daily_return - target_daily_return).clip(upper=0)
+    downside_deviation = (downside.pow(2).mean() ** 0.5) * (config.annual_days ** 0.5)
+
+    annual_excess_return = statistics.get("annual_return", 0) / 100 - config.risk_free / 100
+    sortino_ratio = annual_excess_return / downside_deviation if downside_deviation else 0
+
+    max_ddpercent = abs(statistics.get("max_ddpercent", 0))
+    calmar_ratio = statistics.get("annual_return", 0) / max_ddpercent if max_ddpercent else 0
+
+    return {
+        "sortino_ratio": sortino_ratio,
+        "calmar_ratio": calmar_ratio,
+        "annual_downside_deviation": downside_deviation * 100,
+    }
+
+
 def export_trades(engine: Any, path: Path) -> None:
     rows: list[dict[str, Any]] = []
     for trade in engine.trades.values():
@@ -306,22 +434,64 @@ def export_trades(engine: Any, path: Path) -> None:
         pd.DataFrame(rows).to_csv(path, index=False)
 
 
-def run_backtest(config: BacktestConfig) -> dict[str, Any]:
-    prepare_vnpy_workspace()
-    strategy_class = load_strategy_class(config.strategy)
-    return run_strategy_backtest(strategy_class, config)
+def export_optimization_results(results: list[tuple], path: Path) -> None:
+    rows: list[dict[str, Any]] = []
+    for setting_text, target_value, statistics in results:
+        row: dict[str, Any] = {
+            "setting": setting_text,
+            "target": target_value,
+        }
+
+        setting = parse_setting_text(setting_text)
+
+        for key, value in setting.items():
+            row[f"param_{key}"] = value
+
+        row.update(statistics)
+        rows.append(row)
+
+    pd.DataFrame(rows).to_csv(path, index=False)
 
 
-def run_strategy_backtest(strategy_class: type, config: BacktestConfig) -> dict[str, Any]:
-    prepare_vnpy_workspace()
-    vnpy = import_vnpy_modules()
-    exchange_cls = vnpy["Exchange"]
-    specs = [resolve_symbol(symbol, exchange_cls) for symbol in config.symbols]
-    vt_symbols = [spec.vt_symbol for spec in specs]
+def parse_setting_text(setting_text: str) -> dict[str, Any]:
+    try:
+        safe_setting_text = re.sub(r"(?<![\w.])-inf(?![\w.])", "-1e309", setting_text)
+        safe_setting_text = re.sub(r"(?<![\w.])inf(?![\w.])", "1e309", safe_setting_text)
+        setting = ast.literal_eval(safe_setting_text)
+    except (SyntaxError, ValueError):
+        return {}
 
-    ensure_history_data(config, specs, vnpy)
+    return setting if isinstance(setting, dict) else {}
 
-    engine = vnpy["BacktestingEngine"]()
+
+def build_optimization_setting(
+    optimization_cls: type,
+    strategy_setting: dict[str, Any],
+    parameters: list[OptimizationParameter],
+    target: str,
+) -> Any:
+    optimization_setting = optimization_cls()
+    optimized_names = {parameter.name for parameter in parameters}
+
+    for key, value in strategy_setting.items():
+        if key not in optimized_names:
+            optimization_setting.add_parameter(key, value)
+
+    for parameter in parameters:
+        ok, message = optimization_setting.add_parameter(
+            parameter.name,
+            parameter.start,
+            parameter.end,
+            parameter.step,
+        )
+        if not ok:
+            raise ValueError(f"Invalid optimization parameter {parameter.name}: {message}")
+
+    optimization_setting.set_target(target)
+    return optimization_setting
+
+
+def configure_engine(engine: Any, vnpy: dict[str, Any], vt_symbols: list[str], config: BacktestConfig) -> None:
     interval = vnpy["Interval"].DAILY
     start = datetime.strptime(config.start, "%Y-%m-%d")
     end = datetime.strptime(config.end, "%Y-%m-%d")
@@ -340,10 +510,79 @@ def run_strategy_backtest(strategy_class: type, config: BacktestConfig) -> dict[
         annual_days=config.annual_days,
     )
 
+
+def resolve_specs(symbols: list[str], vnpy: dict[str, Any]) -> list[SymbolSpec]:
+    exchange_cls = vnpy["Exchange"]
+    return [resolve_symbol(symbol, exchange_cls) for symbol in symbols]
+
+
+def prepare_history_data(config: BacktestConfig) -> None:
+    prepare_vnpy_workspace()
+    vnpy = import_vnpy_modules()
+    specs = history_specs(config, vnpy)
+    ensure_history_data(config, specs, vnpy)
+
+
+def prepare_engine(strategy_class: type, config: BacktestConfig, vnpy: dict[str, Any]) -> Any:
+    specs = history_specs(config, vnpy)
+    vt_symbols = [spec.vt_symbol for spec in specs]
+
+    ensure_history_data(config, specs, vnpy)
+    strategy_specs = resolve_specs(config.symbols, vnpy)
+    vt_symbols = [spec.vt_symbol for spec in strategy_specs]
+
+    engine = vnpy["BacktestingEngine"]()
+    configure_engine(engine, vnpy, vt_symbols, config)
+
     strategy_setting = dict(config.strategy_setting)
     strategy_setting["initial_capital"] = config.capital
-
     engine.add_strategy(strategy_class, strategy_setting)
+    return engine
+
+
+def evaluate_strategy_statistics(strategy_class: type, config: BacktestConfig, vnpy: dict[str, Any]) -> dict[str, Any]:
+    engine = prepare_engine(strategy_class, config, vnpy)
+    engine.load_data()
+    engine.run_backtesting()
+
+    daily_df = engine.calculate_result()
+    if daily_df is None or daily_df.empty:
+        raise RuntimeError("Backtest produced no daily result. Check imported history data and strategy trades.")
+
+    statistics = engine.calculate_statistics(daily_df, output=False)
+    statistics.update(calculate_risk_ratios(daily_df, statistics, config))
+    _, benchmark_stats = add_benchmark_metrics(daily_df, config, vnpy)
+    statistics.update(benchmark_stats)
+    return statistics
+
+
+def enrich_optimization_results(
+    strategy_class: type,
+    config: BacktestConfig,
+    vnpy: dict[str, Any],
+    results: list[tuple],
+    target: str,
+) -> list[tuple]:
+    enriched_results: list[tuple] = []
+    for setting_text, target_value, statistics in results:
+        setting = parse_setting_text(setting_text)
+        if setting:
+            result_config = replace(config, strategy_setting=setting)
+            statistics = evaluate_strategy_statistics(strategy_class, result_config, vnpy)
+
+        if target in statistics:
+            target_value = statistics[target]
+
+        enriched_results.append((setting_text, target_value, statistics))
+
+    enriched_results.sort(reverse=True, key=lambda result: result[1])
+    return enriched_results
+
+
+def run_strategy_backtest(strategy_class: type, config: BacktestConfig) -> dict[str, Any]:
+    prepare_vnpy_workspace()
+    vnpy = import_vnpy_modules()
+    engine = prepare_engine(strategy_class, config, vnpy)
     engine.load_data()
     engine.run_backtesting()
 
@@ -352,6 +591,9 @@ def run_strategy_backtest(strategy_class: type, config: BacktestConfig) -> dict[
         raise RuntimeError("Backtest produced no daily result. Check imported history data and strategy trades.")
 
     statistics = engine.calculate_statistics(daily_df)
+    statistics.update(calculate_risk_ratios(daily_df, statistics, config))
+    daily_df, benchmark_stats = add_benchmark_metrics(daily_df, config, vnpy)
+    statistics.update(benchmark_stats)
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     strategy_name = re.sub(r"[^0-9A-Za-z_]+", "_", strategy_class.__name__).lower()
@@ -370,68 +612,56 @@ def run_strategy_backtest(strategy_class: type, config: BacktestConfig) -> dict[
     return statistics
 
 
-def parse_args() -> BacktestConfig:
-    parser = argparse.ArgumentParser(description="vn.py daily portfolio backtest")
-    parser.add_argument("--symbols", nargs="+", default=["US.QQQ", "US.GLD", "US.SPY", "US.FXI"])
-    parser.add_argument("--start", default="2014-09-09")
-    parser.add_argument("--end", default="2025-09-09")
-    parser.add_argument("--capital", type=int, default=1_000_000)
-    parser.add_argument("--rate", type=float, default=0.001)
-    parser.add_argument("--slippage", type=float, default=0.01)
-    parser.add_argument("--size", type=int, default=1)
-    parser.add_argument("--pricetick", type=float, default=0.001)
-    parser.add_argument("--annual-days", type=int, default=250)
-    parser.add_argument("--source", choices=["project", "database"], default="project")
-    parser.add_argument("--config", default=None, help="Project config path. Defaults to config.ini then config_template.ini")
-    parser.add_argument("--refresh-data", action="store_true")
-    parser.add_argument("--proxy", default=None, help="Override project config HTTP proxy, for example 127.0.0.1:10802")
-    parser.add_argument("--no-proxy", action="store_true", help="Ignore HTTP_PROXY/HTTPS_PROXY for this run")
-    parser.add_argument(
-        "--strategy",
-        default="momentum_rotation_strategy:MomentumRotationStrategy",
-        help="Strategy class path, for example momentum_rotation_strategy:MomentumRotationStrategy",
-    )
-    parser.add_argument(
-        "--strategy-setting",
-        action="append",
-        default=[],
-        metavar="KEY=VALUE",
-        help="Additional strategy setting. Can be repeated.",
-    )
-    parser.add_argument("--regression-window", type=int, default=22)
-    parser.add_argument("--allocation", type=float, default=1.0)
-    parser.add_argument("--min-score", type=float, default=float("-inf"))
-    parser.add_argument("--show-chart", action="store_true")
-    args = parser.parse_args()
+def run_strategy_optimization(
+    strategy_class: type,
+    config: BacktestConfig,
+    parameters: list[OptimizationParameter],
+    target: str = "sharpe_ratio",
+    method: str = "bf",
+    max_workers: int | None = None,
+    ga_ngen_size: int = 30,
+) -> list[tuple]:
+    if not parameters:
+        raise ValueError(
+            "No optimization parameters configured. "
+            "Pass --optimization-parameter KEY=START:END:STEP or define them in the strategy script."
+        )
+    if target in CUSTOM_OPTIMIZATION_TARGETS and method != "bf":
+        raise ValueError(f"{target} optimization is only supported with brute force method.")
 
-    strategy_setting = {
-        "regression_window": args.regression_window,
-        "initial_capital": args.capital,
-        "allocation": args.allocation,
-        "min_score": args.min_score,
-    }
-    strategy_setting.update(parse_strategy_setting(args.strategy_setting))
+    prepare_vnpy_workspace()
+    vnpy = import_vnpy_modules()
+    engine = prepare_engine(strategy_class, config, vnpy)
+    engine_target = "sharpe_ratio" if target in CUSTOM_OPTIMIZATION_TARGETS else target
 
-    return BacktestConfig(
-        symbols=args.symbols,
-        start=args.start,
-        end=args.end,
-        capital=args.capital,
-        rate=args.rate,
-        slippage=args.slippage,
-        size=args.size,
-        pricetick=args.pricetick,
-        annual_days=args.annual_days,
-        data_source=args.source,
-        config_path=args.config,
-        refresh_data=args.refresh_data,
-        proxy=args.proxy,
-        no_proxy=args.no_proxy,
-        show_chart=args.show_chart,
-        strategy=args.strategy,
-        strategy_setting=strategy_setting,
+    strategy_setting = dict(config.strategy_setting)
+    strategy_setting["initial_capital"] = config.capital
+    optimization_setting = build_optimization_setting(
+        vnpy["OptimizationSetting"],
+        strategy_setting,
+        parameters,
+        engine_target,
     )
 
+    if method == "bf":
+        results = engine.run_bf_optimization(optimization_setting, max_workers=max_workers)
+    elif method == "ga":
+        results = engine.run_ga_optimization(
+            optimization_setting,
+            max_workers=max_workers,
+            ngen_size=ga_ngen_size,
+        )
+    else:
+        raise ValueError(f"Unsupported optimization method: {method}")
 
-if __name__ == "__main__":
-    run_backtest(parse_args())
+    if not results:
+        raise RuntimeError("Optimization produced no results.")
+
+    results = enrich_optimization_results(strategy_class, config, vnpy, results, target)
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    strategy_name = re.sub(r"[^0-9A-Za-z_]+", "_", strategy_class.__name__).lower()
+    optimization_path = OUTPUT_ROOT / f"{strategy_name}_optimization_{stamp}.csv"
+    export_optimization_results(results, optimization_path)
+    print(f"Optimization result: {optimization_path}")
+    return results
