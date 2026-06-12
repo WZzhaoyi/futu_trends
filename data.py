@@ -22,17 +22,14 @@ import futu as ft
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-import yfinance as yf
 from tools import to_yfinance_code, futu_code_to_longbridge_code, futu_code_to_ib_contract
 import math
-import akshare as ak
 import threading
 import os
 import json
 import re
 import requests
 import glob as glob_module
-from ib_async import IB
 
 # 美股代码列表缓存
 _us_stocks_cache = None
@@ -198,6 +195,8 @@ def setup_global_proxy(proxy_url: str | None = None):
 
 def get_us_stocks():
     """获取美股代码列表，使用缓存避免重复调用"""
+    import akshare as ak
+
     global _us_stocks_cache
     
     # 如果内存缓存存在，直接返回
@@ -373,6 +372,8 @@ def get_yfinance_params(ktype: str, max_count: int) -> dict:
 
 def fetch_yfinance_data(code: str, ktype: str, max_count: int, config: configparser.ConfigParser) -> pd.DataFrame | None:
     """获取YFinance最近数据"""
+    import yfinance as yf
+
     global _proxy_configured
     
     with _yfinance_lock:
@@ -434,6 +435,8 @@ def get_akshare_params(ktype: str, max_count: int) -> dict:
 
 def fetch_akshare_data(code: str, ktype: str, max_count: int) -> pd.DataFrame | None:
     """获取AKShare最近数据"""
+    import akshare as ak
+
     with _akshare_lock:
         raw_code = code.split('.')[1]
         params = get_akshare_params(ktype, max_count)
@@ -519,21 +522,53 @@ def fetch_longbridge_data(code: str, ktype: str, max_count: int, config: configp
         lb_config = Config.from_apikey_env()
         ctx = QuoteContext(lb_config)
 
-        candlesticks = ctx.history_candlesticks_by_offset(
-            symbol=symbol,
-            period=period,
-            adjust_type=AdjustType.ForwardAdjust,
-            forward=False,
-            count=request_count,
-        )
+        all_candlesticks = []
+        cursor = None
+        remaining = request_count
+        chunk_size = 900
 
-        if not candlesticks:
+        while remaining > 0:
+            count = min(chunk_size, remaining)
+            kwargs = {
+                "symbol": symbol,
+                "period": period,
+                "adjust_type": AdjustType.ForwardAdjust,
+                "forward": False,
+                "count": count,
+            }
+            if cursor is not None:
+                kwargs["time"] = cursor
+
+            candlesticks = ctx.history_candlesticks_by_offset(**kwargs)
+            if not candlesticks:
+                break
+
+            all_candlesticks.extend(candlesticks)
+            remaining -= len(candlesticks)
+
+            oldest = min(pd.Timestamp(c.timestamp) for c in candlesticks)
+            next_cursor = oldest - pd.Timedelta(seconds=1)
+            if cursor is not None and next_cursor >= pd.Timestamp(cursor):
+                break
+            cursor = next_cursor.to_pydatetime()
+
+            if len(candlesticks) < count:
+                break
+
+            sleep(0.2)
+
+        if not all_candlesticks:
             return None
 
         records = []
-        for c in candlesticks:
+        seen = set()
+        for c in all_candlesticks:
+            timestamp = pd.Timestamp(c.timestamp)
+            if timestamp in seen:
+                continue
+            seen.add(timestamp)
             records.append({
-                'time_key': c.timestamp,
+                'time_key': timestamp,
                 'open': float(c.open),
                 'high': float(c.high),
                 'low': float(c.low),
@@ -573,6 +608,7 @@ def _ibkr_duration_str(ktype: str, max_count: int) -> str:
 
 def fetch_ibkr_data(code: str, ktype: str, max_count: int, config: configparser.ConfigParser) -> pd.DataFrame | None:
     """获取IBKR最近数据"""
+    from ib_async import IB
 
     bar_size_map = {
         'K_1M': '1 min', 'K_5M': '5 mins', 'K_15M': '15 mins',
@@ -651,6 +687,13 @@ def get_kline_data(code: str, config: configparser.ConfigParser, max_count: int 
     ktype = config.get("CONFIG", "FUTU_PUSH_TYPE")
     cache_key = (code, ktype)
 
+    market = code.split('.')[0].upper()
+    market_key = f"DATA_SOURCE_{market}"
+    if config.has_option("CONFIG", market_key):
+        source_type = config.get("CONFIG", market_key).lower()
+    else:
+        source_type = config.get("CONFIG", "DATA_SOURCE").lower()
+
     # 第一层：内存缓存
     if cache_key in _kline_cache:
         fetch_ts, cached_df = _kline_cache[cache_key]
@@ -667,13 +710,6 @@ def get_kline_data(code: str, config: configparser.ConfigParser, max_count: int 
                 return df.tail(max_count).copy()
 
     # 第三层：远程拉取
-    market = code.split('.')[0].upper()
-    market_key = f"DATA_SOURCE_{market}"
-    if config.has_option("CONFIG", market_key):
-        source_type = config.get("CONFIG", market_key).lower()
-    else:
-        source_type = config.get("CONFIG", "DATA_SOURCE").lower()
-
     if source_type == 'futu':
         df = fetch_futu_data(code, ktype, max_count, config)
     elif source_type == 'yfinance':

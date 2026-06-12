@@ -1,164 +1,228 @@
-from datetime import timedelta
-import datetime
-import numpy as np
+from __future__ import annotations
+
 import math
-from typing import List, Dict
+import argparse
+import os
+import sys
+from collections import defaultdict
+from pathlib import Path
 
-from vnpy.trader.database import get_database
-from vnpy_portfoliostrategy import StrategyTemplate as PortfolioTemplate
+
+def bootstrap_vnpy_workspace_for_script() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    data_root = project_root / "data"
+    data_root.mkdir(parents=True, exist_ok=True)
+    data_root.joinpath(".vntrader").mkdir(parents=True, exist_ok=True)
+
+    for path in (project_root, Path(__file__).resolve().parent):
+        path_str = str(path)
+        if path_str not in sys.path:
+            sys.path.insert(0, path_str)
+
+    os.chdir(data_root)
+
+
+if __name__ == "__main__":
+    bootstrap_vnpy_workspace_for_script()
+
+import numpy as np
+
+from vnpy.trader.constant import Direction
 from vnpy.trader.object import BarData, TradeData
-from vnpy.trader.constant import Exchange, Interval
 from vnpy.trader.utility import ArrayManager
+from vnpy_portfoliostrategy import StrategyTemplate
 
-class MomentumRotationStrategy(PortfolioTemplate):
-    """
-    基于动量评分的多ETF轮动策略
-    - 评分公式: 年化收益率 * R-squared
-    - 每日调仓，始终持有评分最高的ETF
-    """
 
-    # --- 策略参数 ---
-    regression_window: int = 24         # 线性回归窗口
-    fixed_capital: int = 1_000_000      # 初始市值
-    empty_symbol: str = ""              # 空仓合约代码
-    daily_stop_ratio: float = 0         # 日内涨幅止盈比例
+class MomentumRotationStrategy(StrategyTemplate):
+    """Daily multi-asset momentum rotation strategy for vn.py portfolio backtesting."""
 
-    holding_symbol: str = ""            # 持仓合约代码
-    holding_volume: int = 0             # 持仓数量
-    cash: int = 0                       # 现金
-    
+    author = "futu_trends"
+
+    regression_window: int = 22
+    initial_capital: int = 1_000_000
+    allocation: float = 1.0
+    min_score: float = float("-inf")
+
+    holding_symbol: str = ""
+    sizing_cash: float = 0
+    last_target_volume: int = 0
+
     parameters = [
         "regression_window",
-        "fixed_capital",
-        "empty_symbol",
-        "daily_stop_ratio"
+        "initial_capital",
+        "allocation",
+        "min_score",
     ]
 
     variables = [
         "holding_symbol",
-        "holding_volume",
-        "cash"
+        "sizing_cash",
+        "last_target_volume",
     ]
-    
 
-    def __init__(self, strategy_engine, strategy_name, vt_symbols, setting):
-        super().__init__(strategy_engine=strategy_engine,
-        strategy_name=strategy_name,
-        vt_symbols=vt_symbols,
-        setting=setting)
-        self.fixed_capital = setting.get("fixed_capital", 1_000_000)
-        self.empty_symbol = setting.get("empty_symbol", "")
-        self.regression_window = setting.get("regression_window", 24)
-        self.daily_stop_ratio = setting.get("daily_stop_ratio", 0)
-        self.cash = self.fixed_capital
-
-    def write_log(self, msg: str, source: str = ""):
-        print(msg)
-
-    def on_init(self):
-        """策略初始化"""
-        size: int = self.regression_window + 10
-
-        # 创建每个合约的时序数据容器
+    def __init__(self, strategy_engine, strategy_name: str, vt_symbols: list[str], setting: dict) -> None:
+        super().__init__(strategy_engine, strategy_name, vt_symbols, setting)
         self.ams: dict[str, ArrayManager] = {}
+        self.last_prices: dict[str, float] = {}
+        self.last_scores: dict[str, float] = {}
+        self.sizing_cash = float(self.initial_capital)
 
+    def on_init(self) -> None:
+        size = max(self.regression_window + 5, 10)
+        self.ams = {vt_symbol: ArrayManager(size) for vt_symbol in self.vt_symbols}
+        self.write_log("Momentum rotation strategy initialized")
+
+    def on_start(self) -> None:
+        self.write_log("Momentum rotation strategy started")
+
+    def on_stop(self) -> None:
+        self.write_log("Momentum rotation strategy stopped")
+
+    def on_bars(self, bars: dict[str, BarData]) -> None:
+        for vt_symbol, bar in bars.items():
+            self.last_prices[vt_symbol] = bar.close_price
+            self.ams[vt_symbol].update_bar(bar)
+
+        scores = self.calculate_scores()
+        if not scores:
+            self.put_event()
+            return
+
+        self.last_scores = scores
+        target_symbol = self.select_target_symbol(scores)
+        targets = self.calculate_targets(target_symbol)
+
+        changed = False
         for vt_symbol in self.vt_symbols:
-            self.ams[vt_symbol] = ArrayManager(size)
+            target = targets[vt_symbol]
+            if self.get_target(vt_symbol) != target:
+                self.set_target(vt_symbol, target)
+                changed = True
 
-        self.write_log("策略初始化")
-
-    def on_start(self):
-        """策略启动"""
-        self.write_log("策略启动")
-
-    def on_stop(self):
-        """策略停止"""
-        self.write_log("策略停止")
-
-    def on_bars(self, bars: dict[str, BarData]):
-        """每个K线收盘时触发"""
-        for vt_symbol, bar in bars.items():
-            am: ArrayManager = self.ams[vt_symbol]
-            am.update_bar(bar)
-
-        # 计算每只ETF的分数
-        score_data: dict[str, float] = {}
-
-        for vt_symbol, bar in bars.items():
-            am: ArrayManager = self.ams[vt_symbol]
-            if not am.inited:
-                return
-
-            data: np.array = am.close[-self.regression_window:]
-            score_data[vt_symbol] = self.calculate_momentum_score(data)
-        
-        # self.set_target(self.holding_symbol, 0)
-        # 选出得分领先的ETF
-        target_symbol: str = max(score_data, key=score_data.get)
-        
-        # 日内止盈
-        if self.holding_symbol == target_symbol and self.daily_stop_ratio > 0:
-            am: ArrayManager = self.ams[self.holding_symbol]
-            if not am.inited or len(am.close) < 2:
-                return
-            today_close_price = am.close[-1]
-            last_close_price = am.close[-2]
-            daily_return = (today_close_price / last_close_price) - 1
-            if daily_return > self.daily_stop_ratio:
-                self.holding_volume = int(self.holding_volume / 3)
-                self.set_target(self.holding_symbol, self.holding_volume)
-                self.rebalance_portfolio(bars)
-                self.write_log(f"日内止盈，{self.holding_symbol} 止盈 {daily_return}")
-                self.put_event()
-                return
-        
-        # 合约切换
-        if target_symbol != self.holding_symbol:
-            cash = self.holding_volume * bars[self.holding_symbol].close_price + self.cash if self.holding_symbol else self.cash
-            
-            # print(self.get_pos(self.holding_symbol))
-            # 重置合约
-            self.set_target(self.holding_symbol, 0)
-            # print(self.holding_symbol, target_symbol)
-
-            self.holding_symbol: str = target_symbol
-            # 特定合约执行空仓
-            if self.holding_symbol == self.empty_symbol:
-                self.cash += cash
-                self.holding_volume = 0
-                self.rebalance_portfolio(bars)
-                self.put_event()
-                return
-
-            price: float = bars[self.holding_symbol].close_price
-
-            # 交易数量
-            volume: int = int((cash / price))
-            # print(volume, price, cash)
-            self.holding_volume = volume
-            self.set_target(self.holding_symbol, volume)
-            self.cash = cash - volume * price
-
-            # 根据设置好的目标仓位进行交易
+        if changed:
+            self.holding_symbol = target_symbol or ""
+            self.last_target_volume = targets.get(target_symbol, 0) if target_symbol else 0
             self.rebalance_portfolio(bars)
 
-        # 推送UI更新
         self.put_event()
 
-    def calculate_momentum_score(self, data: np.array) -> float:
-        """计算强弱得分"""
-        # 确保数据中没有0或负数
+    def update_trade(self, trade: TradeData) -> None:
+        super().update_trade(trade)
+
+        size = self.get_size(trade.vt_symbol)
+        turnover = trade.price * trade.volume * size
+        if trade.direction == Direction.LONG:
+            self.sizing_cash -= turnover
+        else:
+            self.sizing_cash += turnover
+
+    def calculate_scores(self) -> dict[str, float]:
+        scores: dict[str, float] = {}
+        for vt_symbol in self.vt_symbols:
+            am = self.ams[vt_symbol]
+            if not am.inited:
+                return {}
+
+            closes = am.close[-self.regression_window:]
+            score = self.calculate_momentum_score(closes)
+            if math.isfinite(score):
+                scores[vt_symbol] = score
+
+        return scores
+
+    def select_target_symbol(self, scores: dict[str, float]) -> str | None:
+        target_symbol = max(scores, key=scores.get)
+        if scores[target_symbol] < self.min_score:
+            return None
+        return target_symbol
+
+    def calculate_targets(self, target_symbol: str | None) -> dict[str, int]:
+        targets: defaultdict[str, int] = defaultdict(int)
+        if not target_symbol:
+            return targets
+
+        price = self.last_prices.get(target_symbol, 0)
+        if price <= 0:
+            return targets
+
+        portfolio_value = self.calculate_portfolio_value()
+        target_notional = max(portfolio_value, 0) * self.allocation
+        size = self.get_size(target_symbol)
+        volume = int(target_notional / (price * size))
+        targets[target_symbol] = max(volume, 0)
+        return targets
+
+    def calculate_portfolio_value(self) -> float:
+        value = self.sizing_cash
+        for vt_symbol in self.vt_symbols:
+            price = self.last_prices.get(vt_symbol)
+            if price is None:
+                continue
+            value += self.get_pos(vt_symbol) * price * self.get_size(vt_symbol)
+        return value
+
+    @staticmethod
+    def calculate_momentum_score(data: np.ndarray) -> float:
+        if len(data) < 2 or np.any(data <= 0):
+            return float("-inf")
+
         x = np.arange(len(data))
         y = np.log(data)
-
         slope, intercept = np.polyfit(x, y, 1)
-        annualized_returns = math.pow(math.exp(slope), 250) - 1
-        
-        # 计算R-squared
+        annualized_return = math.exp(slope * 250) - 1
+
         y_pred = slope * x + intercept
         ss_res = np.sum((y - y_pred) ** 2)
         ss_tot = np.sum((y - np.mean(y)) ** 2)
-        r_squared = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
-        
-        score = annualized_returns * r_squared
-        return score
+        r_squared = 1 - ss_res / ss_tot if ss_tot else 0
+        return annualized_return * r_squared
+
+
+DEFAULT_BACKTEST_SYMBOLS = ["US.QQQ", "US.GLD", "US.SPY", "US.FXI"]
+DEFAULT_STRATEGY_SETTING = {
+    "regression_window": 22,
+    "allocation": 1.0,
+    "min_score": float("-inf"),
+}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Momentum rotation vn.py backtest")
+    parser.add_argument("--symbols", nargs="+", default=DEFAULT_BACKTEST_SYMBOLS)
+    parser.add_argument("--start", default="2014-09-09")
+    parser.add_argument("--end", default="2025-09-09")
+    parser.add_argument("--capital", type=int, default=1_000_000)
+    parser.add_argument("--source", choices=["project", "database"], default="project")
+    parser.add_argument("--config", default=None)
+    parser.add_argument("--refresh-data", action="store_true")
+    parser.add_argument("--proxy", default=None)
+    parser.add_argument("--no-proxy", action="store_true")
+    parser.add_argument("--show-chart", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> None:
+    from backtest import BacktestConfig, run_strategy_backtest
+
+    args = parse_args()
+    strategy_setting = dict(DEFAULT_STRATEGY_SETTING)
+    strategy_setting["initial_capital"] = args.capital
+
+    config = BacktestConfig(
+        symbols=args.symbols,
+        start=args.start,
+        end=args.end,
+        capital=args.capital,
+        data_source=args.source,
+        config_path=args.config,
+        refresh_data=args.refresh_data,
+        proxy=args.proxy,
+        no_proxy=args.no_proxy,
+        show_chart=args.show_chart,
+        strategy_setting=strategy_setting,
+    )
+    run_strategy_backtest(MomentumRotationStrategy, config)
+
+
+if __name__ == "__main__":
+    main()
