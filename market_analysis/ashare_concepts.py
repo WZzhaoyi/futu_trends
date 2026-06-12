@@ -132,6 +132,12 @@ def load_blacklist(blacklist_file=None):
         print(f"[!] 未找到 {blacklist_file}，使用默认空黑名单")
     return blacklist
 
+def is_blacklisted_concept(concept_name, blacklist_set):
+    """黑名单关键词匹配：概念名包含任一黑名单词即过滤。"""
+    if not concept_name or not blacklist_set:
+        return False
+    return any(keyword in concept_name for keyword in blacklist_set)
+
 def get_realtime_bidding_list(top_n=TOP_N, min_amount=MIN_BIDDING_AMOUNT):
     """获取A股全市场实时成交额排名 (使用东财直连小分页 API)"""
     print(f"[*] [{datetime.now().time()}] 正在请求东财成交额小分页 API...")
@@ -247,7 +253,7 @@ def get_concept_board_ranking(top_n=CONCEPT_BOARD_TOP_N, blacklist_set=None):
         rankings = []
         for rank, item in enumerate(concept_list, 1):
             concept = item.get("f14", "")
-            if blacklist_set and concept in blacklist_set:
+            if is_blacklisted_concept(concept, blacklist_set):
                 continue
 
             pct = to_float(item.get("f3"))
@@ -304,7 +310,7 @@ def get_stock_concepts_eastmoney(stock_code, blacklist_set):
             for item in data['ssbk']:
                 c_name = item.get('BOARD_NAME', '')
                 # 过滤黑名单
-                if c_name and c_name not in blacklist_set:
+                if c_name and not is_blacklisted_concept(c_name, blacklist_set):
                     clean_concepts.append(c_name)
         
         return clean_concepts
