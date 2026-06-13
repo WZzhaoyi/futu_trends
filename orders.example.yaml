@@ -11,19 +11,24 @@
 #   - data_gateway: FUTU
 #   - order_gateway: SIM 或 QMT
 # - 支持条件组嵌套，logical_operator/operator 支持 AND、OR。
-# - 支持叶子条件比较符: >、<、>=、<=、==、!=。
+# - 支持叶子条件比较符: >、<、>=、<=、==、!=、contains。
 # - 支持 TickData 字段作为变量，例如 datetime、last_price、open_price、high_price、
 #   low_price、pre_close、volume、bid_price_1、ask_price_1 等。
+# - 支持 signal.* 虚拟变量，复用 trends.py 与 get_kline_data 缓存:
+#   signal.breakout 的值就是 trends.py 指标函数返回的信号字符串，可用 contains 做关键词匹配。
+#   可用信号: breakout、reverse、continue、top_down、balance。
 # - datetime 比较值格式必须为: YYYY-MM-DD HH:MM:SS +0800。
 # - SIM 是极简订单源: 不看交易时段、不看价格档位，收到订单立即模拟全部成交。
 # - QMT 当前只作为订单源使用；免费版行情能力不作为条件单依赖。
 # - 订单状态会写入 ORDER_EVENT_LOG，并通过通知链路推送状态变化和成交回报。
+# - cancel.conditions 与下单 conditions 复用同一套条件语法；条件满足时尝试撤销该配置提交的未终态订单。
+# - 配置采用严格校验：重复 id、trigger_once 等未实现字段都会导致启动失败。
 #
 # 当前不支持:
 # - 条件持续时长，例如“价格保持 5 秒”。
 # - 跨订单状态条件，例如“上一笔成交后再下第二笔”。
 # - 盘前/盘后/午间休市等交易时段规则校验。
-# - 自动撤单、改单、止盈止损联动。
+# - 改单、止盈止损联动。
 # - 多标的同一条件组，例如“A 上涨且 B 下跌”。
 # - QMT 实盘前置风控；真实风控仍以迅投/券商客户端为准。
 
@@ -37,7 +42,6 @@ orders:
     exchange: "HK"
     data_gateway: "FUTU"
     order_gateway: "SIM"
-    trigger_once: true
     conditions:
       logical_operator: "AND"
       items:
@@ -68,7 +72,6 @@ orders:
     exchange: "HK"
     data_gateway: "FUTU"
     order_gateway: "SIM"
-    trigger_once: true
     conditions:
       operator: "AND"
       conditions:
@@ -103,7 +106,6 @@ orders:
     exchange: "SZ"
     data_gateway: "FUTU"
     order_gateway: "QMT"
-    trigger_once: true
     conditions:
       logical_operator: "AND"
       items:
@@ -118,3 +120,33 @@ orders:
         action: "buy"
         quantity: 100
         price: 10.5
+    cancel:
+      enabled: false
+      conditions:
+        logical_operator: "AND"
+        items:
+          - variable: "datetime"
+            operator: ">="
+            value: "2099-12-31 09:30:00 +0800"
+          - variable: "last_price"
+            operator: "<"
+            value: 10
+
+  # 示例 4: 复用 trends.py 的突破信号。
+  # 数据源、K线周期和缓存由 config.ini / get_kline_data 控制，不在订单YAML重复配置。
+  - id: futu_sim_breakout_signal
+    enabled: false
+    description: "FUTU行情 + trends.py signal.breakout"
+    symbol: "000001"
+    exchange: "SZ"
+    data_gateway: "FUTU"
+    order_gateway: "SIM"
+    conditions:
+      logical_operator: "AND"
+      items:
+        - variable: "signal.breakout"
+          operator: "contains"
+          value: "breakthrough"
+    actions:
+      - type: "notify"
+        message: "EMA突破信号触发"

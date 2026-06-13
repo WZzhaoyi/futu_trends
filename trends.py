@@ -12,9 +12,29 @@ from signal_analysis import get_target_price, MACD, KD, RSI
 from tools import MA, EMA, calc_momentum, calc_returns_score, code_in_futu_group
 import datetime
 import configparser
+import time
 from notification_engine import NotificationEngine
 from decimal import Decimal, ROUND_HALF_UP
 import pandas as pd
+
+PARAMS_CACHE_TTL_SECONDS = 6 * 60 * 60
+_params_cache = {}
+
+
+def _get_cached_stock_params(db_path: str | None, code: str):
+    if db_path is None:
+        return None
+
+    cache_key = (os.path.abspath(db_path), code)
+    now = time.time()
+    cached = _params_cache.get(cache_key)
+    if cached and now - cached['ts'] < PARAMS_CACHE_TTL_SECONDS:
+        return cached['data']
+
+    data = ParamsDB(db_path).get_stock_params(code)
+    _params_cache[cache_key] = {'ts': now, 'data': data}
+    return data
+
 
 def round_decimal(value, places=2):
     """
@@ -44,10 +64,7 @@ def is_reverse(df: pd.DataFrame, code: str, config: configparser.ConfigParser) -
     
     # 从数据库读取参数
     db_path = config.get("CONFIG", "KD_PARAMS_DB", fallback=None)
-    data = None
-    if db_path is not None:
-        db = ParamsDB(db_path)
-        data = db.get_stock_params(code)
+    data = _get_cached_stock_params(db_path, code)
     
     # 如果数据库中没有找到参数，使用默认参数
     if data is None:
@@ -99,10 +116,7 @@ def is_continue(df:pd.DataFrame, code:str, config:configparser.ConfigParser)->st
     
     # 从数据库读取参数
     db_path = config.get("CONFIG", "MACD_PARAMS_DB", fallback=None)
-    data = None
-    if db_path is not None:
-        db = ParamsDB(db_path)
-        data = db.get_stock_params(code)
+    data = _get_cached_stock_params(db_path, code)
     
     # 如果数据库中没有找到参数，使用默认参数
     if data is None:
@@ -154,11 +168,9 @@ def is_breakout(df:pd.DataFrame, code:str, config:configparser.ConfigParser)->st
     N = 240
     # 从数据库读取参数 默认N=240
     db_path = config.get("CONFIG", "EMA_PARAMS_DB", fallback=None)
-    if db_path is not None:
-        db = ParamsDB(db_path)
-        data = db.get_stock_params(code)
-        if data is not None:
-            N = data['best_params']['ema_period']
+    data = _get_cached_stock_params(db_path, code)
+    if data is not None:
+        N = data['best_params']['ema_period']
 
     close = df['close']
     close_ema = EMA(close, N)
@@ -182,10 +194,7 @@ def is_top_down(df:pd.DataFrame, code:str, config:configparser.ConfigParser) -> 
     assert len(df) >= 90
     # 从数据库读取参数
     db_path = config.get("CONFIG", "RSI_PARAMS_DB", fallback=None)
-    data = None
-    if db_path is not None:
-        db = ParamsDB(db_path)
-        data = db.get_stock_params(code)
+    data = _get_cached_stock_params(db_path, code)
     
     # 如果数据库中没有找到参数，使用默认参数
     if data is None:
@@ -444,4 +453,3 @@ if __name__ == "__main__":
         filter_msg = '{} {} {}:\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group if group else '', push_type, '\n'.join(filter_df['msg']))
         # google sheet
         notification.send_google_sheet_message(filter_msg)
-

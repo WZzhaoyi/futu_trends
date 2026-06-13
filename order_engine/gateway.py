@@ -286,6 +286,10 @@ class FutuGateway(BaseGateway):
         self.write_log("富途Gateway仅支持行情数据，不支持交易")
         return ""
 
+    def cancel_order(self, req: CancelRequest):
+        self.write_log("富途Gateway不支持撤单")
+        return None
+
     def close(self):
         """关闭连接"""
         if self.quote_ctx:
@@ -457,14 +461,24 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
         """撤销订单"""
         try:
             order = self.orders.get(req.orderid)
-            if order and hasattr(order, 'reference'):
-                account = self._get_account_by_exchange(order.exchange)
-                return self.trader.cancel_order_stock_async(
-                    account=account,
-                    order_id=order.reference
-                )
+            if not order:
+                self.write_log(f"撤销订单失败: 未找到订单 {req.orderid}")
+                return None
+            if not order.reference:
+                self.write_log(f"撤销订单失败: 订单 {req.orderid} 尚无柜台编号")
+                return None
+            account = self._get_account_by_exchange(order.exchange)
+            seq = self.trader.cancel_order_stock_async(
+                account=account,
+                order_id=order.reference
+            )
+            if seq == -1:
+                self.write_log(f"撤销订单失败: {req.orderid} cancel_order_stock_async返回-1")
+                return None
+            return seq
         except Exception as e:
             self.write_log(f"撤销订单失败: {e}")
+            return None
 
     def query_account(self):
         """查询账户信息"""
@@ -813,6 +827,10 @@ class SimGateway(BaseGateway):
         self.on_trade(trade)
         self.write_log(f"SIM模拟成交: {req.symbol}.{req.exchange.value} {req.direction.value} {req.volume}@{req.price}")
         return filled_order.vt_orderid
+
+    def cancel_order(self, req: CancelRequest):
+        self.write_log(f"SIM订单已即时成交，无法撤单: {req.orderid}")
+        return None
 
     def close(self):
         self.write_log("SIM订单Gateway已关闭")

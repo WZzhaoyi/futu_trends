@@ -9,7 +9,7 @@ from order_engine.event_engine import (
     EVENT_LOG, EVENT_TICK, EVENT_ORDER, EVENT_TRADE,
     EVENT_ACCOUNT, EVENT_POSITION, EVENT_CONTRACT,
 )
-from order_engine.models import LogData, OrderRequest, SubscribeRequest
+from order_engine.models import CancelRequest, LogData, OrderRequest, SubscribeRequest
 
 
 class BaseGateway:
@@ -26,6 +26,9 @@ class BaseGateway:
         raise NotImplementedError
 
     def send_order(self, req: OrderRequest) -> str:
+        raise NotImplementedError
+
+    def cancel_order(self, req: CancelRequest):
         raise NotImplementedError
 
     def close(self):
@@ -97,6 +100,12 @@ class MainEngine:
         if gateway:
             return gateway.send_order(req)
         return ""
+
+    def cancel_order(self, req: CancelRequest, gateway_name: str):
+        gateway = self._gateways.get(gateway_name)
+        if gateway:
+            return gateway.cancel_order(req)
+        return None
 
     def add_engine(self, engine_class: Type[BaseEngine]) -> BaseEngine:
         engine = engine_class(self, self.event_engine)
