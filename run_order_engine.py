@@ -5,7 +5,9 @@ from datetime import datetime
 
 from ft_config import get_config
 from notification_engine import NotificationEngine
-from order_engine import ConditionOrderEngine, MainEngine, EventEngine, FutuGateway, QmtGateway
+from order_engine import ConditionOrderEngine, MainEngine, EventEngine, FutuGateway, QmtGateway, SimGateway
+
+GATEWAY_NAMES = {"FUTU", "QMT", "SIM"}
 
 
 def main():
@@ -14,20 +16,33 @@ def main():
     event_engine = EventEngine()
     main_engine = MainEngine(event_engine)
 
-    futu_setting = {
-        "host": config.get("CONFIG", "FUTU_HOST"),
-        "port": int(config.get("CONFIG", "FUTU_PORT")),
-    }
-    main_engine.add_gateway(FutuGateway, "FUTU")
-    main_engine.connect(futu_setting, "FUTU")
+    data_gateway_name = config.get("CONFIG", "ORDER_DATA_GATEWAY", fallback="FUTU").strip().upper()
+    order_gateway_name = config.get("CONFIG", "ORDER_TRADE_GATEWAY", fallback="QMT").strip().upper()
+    gateway_names = {data_gateway_name, order_gateway_name}
+    unknown_gateways = gateway_names - GATEWAY_NAMES
+    if unknown_gateways:
+        raise ValueError(f"不支持的网关: {', '.join(sorted(unknown_gateways))}")
 
-    qmt_setting = {
-        "path": config.get("CONFIG", "QMT_PATH"),
-        "session_id": int(time.time()),
-        "account_id": config.get("CONFIG", "QMT_ACCOUNT_ID"),
-    }
-    main_engine.add_gateway(QmtGateway, "QMT")
-    main_engine.connect(qmt_setting, "QMT")
+    if "FUTU" in gateway_names:
+        futu_setting = {
+            "host": config.get("CONFIG", "FUTU_HOST"),
+            "port": int(config.get("CONFIG", "FUTU_PORT")),
+        }
+        main_engine.add_gateway(FutuGateway, "FUTU")
+        main_engine.connect(futu_setting, "FUTU")
+
+    if "QMT" in gateway_names:
+        qmt_setting = {
+            "path": config.get("CONFIG", "QMT_PATH"),
+            "session_id": int(time.time()),
+            "account_id": config.get("CONFIG", "QMT_ACCOUNT_ID"),
+        }
+        main_engine.add_gateway(QmtGateway, "QMT")
+        main_engine.connect(qmt_setting, "QMT")
+
+    if "SIM" in gateway_names:
+        main_engine.add_gateway(SimGateway, "SIM")
+        main_engine.connect({}, "SIM")
 
     # 远程通知
     notification_engine = NotificationEngine(config)

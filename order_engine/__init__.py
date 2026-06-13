@@ -9,7 +9,7 @@ from order_engine.models import (
 
 
 def __getattr__(name):
-    if name in ("FutuGateway", "QmtGateway"):
-        from order_engine.gateway import FutuGateway, QmtGateway
-        return {"FutuGateway": FutuGateway, "QmtGateway": QmtGateway}[name]
+    if name in ("FutuGateway", "QmtGateway", "SimGateway"):
+        from order_engine.gateway import FutuGateway, QmtGateway, SimGateway
+        return {"FutuGateway": FutuGateway, "QmtGateway": QmtGateway, "SimGateway": SimGateway}[name]
     raise AttributeError(f"module 'order_engine' has no attribute {name!r}")

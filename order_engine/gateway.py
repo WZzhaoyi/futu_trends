@@ -1,24 +1,40 @@
-import futu as ft
 import threading
-import time
-import datetime
 from datetime import datetime
 from copy import copy
-from typing import Dict, Set
+from typing import Dict
 from zoneinfo import ZoneInfo
 
 from order_engine.core import BaseGateway
-from order_engine.event_engine import EVENT_TICK, EVENT_ORDER, EVENT_TRADE, EVENT_ACCOUNT, EVENT_POSITION, EVENT_TIMER
+from order_engine.event_engine import EVENT_TIMER
 from order_engine.models import (
     TickData, OrderRequest, OrderData, TradeData, PositionData, AccountData,
     SubscribeRequest, ContractData, CancelRequest,
     Exchange, Direction, Offset, Status, OrderType, Product,
 )
 
-from xtquant import xtconstant
-from xtquant.xttrader import XtQuantTrader, XtQuantTraderCallback
-from xtquant.xttype import StockAccount, XtTrade, XtAsset, XtOrder, XtOrderError, XtOrderResponse, XtPosition, XtCancelError, XtCancelOrderResponse
-import xtquant.xtdata
+try:
+    import futu as ft
+    FUTU_IMPORT_ERROR = None
+except Exception as exc:
+    ft = None
+    FUTU_IMPORT_ERROR = exc
+
+try:
+    from xtquant import xtconstant
+    from xtquant.xttrader import XtQuantTrader, XtQuantTraderCallback
+    from xtquant.xttype import (
+        StockAccount, XtTrade, XtAsset, XtOrder, XtOrderError, XtOrderResponse,
+        XtPosition, XtCancelError, XtCancelOrderResponse,
+    )
+    import xtquant.xtdata
+    XTQUANT_IMPORT_ERROR = None
+except Exception as exc:
+    xtconstant = None
+    XtQuantTrader = None
+    XtQuantTraderCallback = object
+    StockAccount = XtTrade = XtAsset = XtOrder = XtOrderError = XtOrderResponse = object
+    XtPosition = XtCancelError = XtCancelOrderResponse = object
+    XTQUANT_IMPORT_ERROR = exc
 
 # 富途交易所映射（Exchange.value 即为 Futu 交易所代码）
 EXCHANGE_FUTU2VT = {
@@ -49,8 +65,8 @@ EXCHANGE_TO_ACCOUNT_TYPE = {
 
 # QMT交易类型映射
 QMT_TRADE_TYPE = {
-    Direction.LONG: xtconstant.STOCK_BUY,
-    Direction.SHORT: xtconstant.STOCK_SELL,
+    Direction.LONG: getattr(xtconstant, "STOCK_BUY", None),
+    Direction.SHORT: getattr(xtconstant, "STOCK_SELL", None),
 }
 QMT_TO_VN_TRADE_TYPE = {v: k for k, v in QMT_TRADE_TYPE.items()}
 
@@ -169,6 +185,10 @@ class FutuGateway(BaseGateway):
 
     def connect(self, setting: dict):
         """连接行情接口"""
+        if ft is None:
+            self.write_log(f"富途行情Gateway不可用: {FUTU_IMPORT_ERROR}")
+            return
+
         try:
             self.quote_ctx = ft.OpenQuoteContext(host=setting["host"], port=setting["port"])
 
@@ -304,6 +324,10 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
 
     def connect(self, setting: dict):
         """连接交易接口"""
+        if XtQuantTrader is None:
+            self.write_log(f"QMT交易Gateway不可用: {XTQUANT_IMPORT_ERROR}")
+            return
+
         try:
             account = setting['account_id']
             path = setting['path']
@@ -367,6 +391,9 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
         try:
             if not self.inited or not self.trader:
                 self.write_log("QMT尚未初始化，拒绝下单")
+                return ""
+            if xtconstant is None:
+                self.write_log(f"QMT常量不可用，拒绝下单: {XTQUANT_IMPORT_ERROR}")
                 return ""
 
             if req.exchange not in self.exchanges:
@@ -719,3 +746,73 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
         if self.trader:
             self.trader.stop()
             self.write_log("QMT交易Gateway已关闭")
+
+
+class SimGateway(BaseGateway):
+    """极简模拟订单Gateway：收到订单即默认全部成交。"""
+
+    default_setting = {}
+    exchanges = [Exchange.SSE, Exchange.SZSE, Exchange.SEHK, Exchange.SHHK, Exchange.SZHK, Exchange.SMART]
+
+    def __init__(self, event_engine, name="SIM"):
+        super().__init__(event_engine, name)
+        self.order_seq = 0
+        self.trade_seq = 0
+
+    def connect(self, setting: dict):
+        self.write_log("SIM订单Gateway已启用，订单将立即模拟成交")
+
+    def subscribe(self, req: SubscribeRequest):
+        self.write_log(f"SIM不提供行情，跳过订阅: {req.symbol} {req.exchange}")
+
+    def send_order(self, req: OrderRequest) -> str:
+        self.order_seq += 1
+        self.trade_seq += 1
+        now = datetime.now(CHINA_TZ)
+        order_id = f"SIM#{self.order_seq}"
+        trade_id = f"SIM_TRADE#{self.trade_seq}"
+
+        submitting_order = OrderData(
+            gateway_name=self.gateway_name,
+            symbol=req.symbol,
+            exchange=req.exchange,
+            orderid=order_id,
+            type=req.type,
+            direction=req.direction,
+            offset=req.offset,
+            volume=req.volume,
+            traded=0,
+            price=req.price,
+            status=Status.SUBMITTING,
+            datetime=now,
+            reference=order_id,
+            raw_status="SIM_SUBMITTING",
+            status_msg="模拟提交",
+        )
+        self.on_order(submitting_order)
+
+        filled_order = copy(submitting_order)
+        filled_order.traded = req.volume
+        filled_order.status = Status.ALLTRADED
+        filled_order.raw_status = "SIM_FILLED"
+        filled_order.status_msg = "模拟成交"
+        filled_order.datetime = now
+        self.on_order(filled_order)
+
+        trade = TradeData(
+            gateway_name=self.gateway_name,
+            symbol=req.symbol,
+            exchange=req.exchange,
+            orderid=order_id,
+            tradeid=trade_id,
+            direction=req.direction,
+            price=req.price,
+            volume=req.volume,
+            datetime=now,
+        )
+        self.on_trade(trade)
+        self.write_log(f"SIM模拟成交: {req.symbol}.{req.exchange.value} {req.direction.value} {req.volume}@{req.price}")
+        return filled_order.vt_orderid
+
+    def close(self):
+        self.write_log("SIM订单Gateway已关闭")

@@ -1,0 +1,120 @@
+# 条件单配置示例
+#
+# 使用方式:
+# 1. 复制本文件为 orders.yaml
+# 2. 在 config.ini 中设置 ORDER_CONFIG=orders.yaml
+# 3. 测试订单链路时先使用 order_gateway: SIM
+# 4. 确认触发、推送、ORDER_EVENT_LOG 正常后，再切换到 QMT
+#
+# 当前功能边界:
+# - 行情源和订单源可以分别配置:
+#   - data_gateway: FUTU
+#   - order_gateway: SIM 或 QMT
+# - 支持条件组嵌套，logical_operator/operator 支持 AND、OR。
+# - 支持叶子条件比较符: >、<、>=、<=、==、!=。
+# - 支持 TickData 字段作为变量，例如 datetime、last_price、open_price、high_price、
+#   low_price、pre_close、volume、bid_price_1、ask_price_1 等。
+# - datetime 比较值格式必须为: YYYY-MM-DD HH:MM:SS +0800。
+# - SIM 是极简订单源: 不看交易时段、不看价格档位，收到订单立即模拟全部成交。
+# - QMT 当前只作为订单源使用；免费版行情能力不作为条件单依赖。
+# - 订单状态会写入 ORDER_EVENT_LOG，并通过通知链路推送状态变化和成交回报。
+#
+# 当前不支持:
+# - 条件持续时长，例如“价格保持 5 秒”。
+# - 跨订单状态条件，例如“上一笔成交后再下第二笔”。
+# - 盘前/盘后/午间休市等交易时段规则校验。
+# - 自动撤单、改单、止盈止损联动。
+# - 多标的同一条件组，例如“A 上涨且 B 下跌”。
+# - QMT 实盘前置风控；真实风控仍以迅投/券商客户端为准。
+
+orders:
+  # 示例 1: 收盘也可测试的复合条件。
+  # Futu 提供 snapshot/tick，SIM 收到订单后立即成交。
+  - id: futu_sim_time_price_smoke
+    enabled: false
+    description: "FUTU行情 + SIM订单: 时间窗口与价格区间测试"
+    symbol: "00700"
+    exchange: "HK"
+    data_gateway: "FUTU"
+    order_gateway: "SIM"
+    trigger_once: true
+    conditions:
+      logical_operator: "AND"
+      items:
+        - variable: "datetime"
+          operator: ">="
+          value: "2000-01-01 00:00:00 +0800"
+        - variable: "datetime"
+          operator: "<="
+          value: "2099-12-31 23:59:59 +0800"
+        - variable: "last_price"
+          operator: ">"
+          value: 0
+        - variable: "last_price"
+          operator: "<"
+          value: 999999
+    actions:
+      - type: "limit"
+        action: "buy"
+        quantity: 100
+        price: 0
+
+  # 示例 2: 嵌套复合条件。
+  # 等价于: 时间窗口成立 AND (价格突破上沿 OR 价格跌破下沿)。
+  - id: nested_or_price_band
+    enabled: false
+    description: "嵌套条件: 时间窗口 + 上破/下破"
+    symbol: "00700"
+    exchange: "HK"
+    data_gateway: "FUTU"
+    order_gateway: "SIM"
+    trigger_once: true
+    conditions:
+      operator: "AND"
+      conditions:
+        - variable: "datetime"
+          operator: ">="
+          value: "2000-01-01 00:00:00 +0800"
+        - variable: "datetime"
+          operator: "<="
+          value: "2099-12-31 23:59:59 +0800"
+        - operator: "OR"
+          conditions:
+            - variable: "last_price"
+              operator: ">"
+              value: 470
+            - variable: "last_price"
+              operator: "<"
+              value: 450
+    actions:
+      - type: "notify"
+        message: "触发价格区间条件"
+      - type: "limit"
+        action: "buy"
+        quantity: 100
+        price: 463.6
+
+  # 示例 3: Futu 行情触发，QMT 订单源下单。
+  # 使用前必须确认测试机已登录并连接迅投/miniQMT，QMT_ACCOUNT_ID 配置正确。
+  - id: futu_qmt_limit_order
+    enabled: false
+    description: "FUTU行情 + QMT订单: 限价买入示例"
+    symbol: "000001"
+    exchange: "SZ"
+    data_gateway: "FUTU"
+    order_gateway: "QMT"
+    trigger_once: true
+    conditions:
+      logical_operator: "AND"
+      items:
+        - variable: "datetime"
+          operator: ">="
+          value: "2000-01-01 00:00:00 +0800"
+        - variable: "last_price"
+          operator: ">="
+          value: 10.5
+    actions:
+      - type: "limit"
+        action: "buy"
+        quantity: 100
+        price: 10.5

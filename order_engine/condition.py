@@ -42,6 +42,8 @@ class ConditionOrderEngine(BaseEngine):
         self.order_snapshots = {}
         self.order_history = []
         self.order_history_path = None
+        self.data_gateway_name = "FUTU"
+        self.order_gateway_name = "QMT"
 
     def write_log(self, msg: str, source: str = "") -> None:
         log = LogData(msg=msg, gateway_name=source)
@@ -54,6 +56,8 @@ class ConditionOrderEngine(BaseEngine):
         if not self.yaml_config_path:
             raise ValueError("ORDER_CONFIG未配置")
         self.order_history_path = config.get("CONFIG", "ORDER_EVENT_LOG", fallback="order_events.jsonl").strip()
+        self.data_gateway_name = config.get("CONFIG", "ORDER_DATA_GATEWAY", fallback="FUTU").strip().upper()
+        self.order_gateway_name = config.get("CONFIG", "ORDER_TRADE_GATEWAY", fallback="QMT").strip().upper()
         if self.order_history_path:
             history_dir = os.path.dirname(os.path.abspath(self.order_history_path))
             os.makedirs(history_dir, exist_ok=True)
@@ -81,15 +85,16 @@ class ConditionOrderEngine(BaseEngine):
                     notify_calc(log.msg)
                 self.event_engine.register(EVENT_LOG, process_log)
 
-            # 订阅行情 暂定futu
+            # 订阅条件单行情源，默认FUTU；单个条件单可用data_gateway覆盖
             symbols_to_subscribe = set()
             for order in self.active_orders.values():
                 req = SubscribeRequest(symbol=order['symbol'], exchange=EXCHANGE_MAP[order['exchange']])
-                symbols_to_subscribe.add((req.symbol, req.exchange))
+                data_gateway = str(order.get("data_gateway", self.data_gateway_name)).upper()
+                symbols_to_subscribe.add((req.symbol, req.exchange, data_gateway))
 
-            for symbol, exchange in symbols_to_subscribe:
+            for symbol, exchange, data_gateway in symbols_to_subscribe:
                 req = SubscribeRequest(symbol=symbol, exchange=exchange)
-                self.main_engine.subscribe(req, "FUTU")
+                self.main_engine.subscribe(req, data_gateway)
 
         else:
             self.write_log(f"yaml配置不存在: {self.yaml_config_path}")
@@ -100,6 +105,9 @@ class ConditionOrderEngine(BaseEngine):
         for order_id, order in list(self.active_orders.items()):
             # 检查标的匹配
             if tick.symbol != order['symbol'] or tick.exchange != EXCHANGE_MAP[order['exchange']]:
+                continue
+            data_gateway = str(order.get("data_gateway", self.data_gateway_name)).upper()
+            if tick.gateway_name and tick.gateway_name.upper() != data_gateway:
                 continue
 
             if self._check_condition(order, tick):
@@ -194,7 +202,10 @@ class ConditionOrderEngine(BaseEngine):
                     success = False
                     continue
 
-                vt_orderid = self.main_engine.send_order(req, "QMT")
+                order_gateway = str(
+                    action.get("order_gateway", order.get("order_gateway", self.order_gateway_name))
+                ).upper()
+                vt_orderid = self.main_engine.send_order(req, order_gateway)
                 if vt_orderid:
                     sent_orders += 1
                     self.write_log(f"条件单 {order['id']} 已提交订单: {vt_orderid}")
