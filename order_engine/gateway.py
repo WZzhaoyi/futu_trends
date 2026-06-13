@@ -56,12 +56,28 @@ QMT_TO_VN_TRADE_TYPE = {v: k for k, v in QMT_TRADE_TYPE.items()}
 
 # QMT订单状态映射
 QMT_ORDER_STATUS = {
+    48: Status.SUBMITTING,  # 未报
     49: Status.SUBMITTING,
     50: Status.NOTTRADED,
+    51: Status.CANCELLING,   # 已报待撤
+    52: Status.CANCELLING,   # 部成待撤
+    53: Status.CANCELLED,    # 部撤
     55: Status.PARTTRADED,
     56: Status.ALLTRADED,
     54: Status.CANCELLED,
     57: Status.REJECTED,
+}
+QMT_ORDER_STATUS_TEXT = {
+    48: "未报",
+    49: "待报",
+    50: "已报",
+    51: "已报待撤",
+    52: "部成待撤",
+    53: "部撤",
+    54: "已撤",
+    55: "部成",
+    56: "已成",
+    57: "废单",
 }
 
 # 产品类型映射
@@ -124,7 +140,17 @@ def convert_symbol_qmt2vt(code: str, market: str = None) -> tuple:
 
 def timestamp_to_datetime(timestamp: int) -> datetime:
     """时间戳转换为datetime"""
-    return datetime.fromtimestamp(timestamp / 1000)
+    if timestamp in (None, ""):
+        return None
+
+    text = str(timestamp).split(".")[0]
+    if len(text) == 14 and text[:2] in ("19", "20"):
+        return datetime.strptime(text, "%Y%m%d%H%M%S").replace(tzinfo=CHINA_TZ)
+
+    ts = float(timestamp)
+    if ts > 1_000_000_000_000:
+        ts = ts / 1000
+    return datetime.fromtimestamp(ts, CHINA_TZ)
 
 class FutuGateway(BaseGateway):
     """富途行情Gateway - 专注于行情推送"""
@@ -167,6 +193,9 @@ class FutuGateway(BaseGateway):
 
     def subscribe(self, req: SubscribeRequest):
         """订阅行情"""
+        if not self.quote_ctx:
+            self.write_log(f"富途行情Gateway未连接，无法订阅: {req.symbol} {req.exchange}")
+            return
 
         if req.exchange not in self.exchanges:
             self.write_log(f"futu不支持订阅行情: {req.symbol} {req.exchange}")
@@ -174,11 +203,14 @@ class FutuGateway(BaseGateway):
 
         futu_symbol = convert_symbol_vt2futu(req.symbol, req.exchange)
 
-        code, data = self.quote_ctx.subscribe(futu_symbol, "QUOTE", True)
-        if code:
-            self.write_log(f"订阅行情失败：{data}")
-        else:
-            self.write_log(f"订阅行情成功: {futu_symbol}")
+        try:
+            code, data = self.quote_ctx.subscribe(futu_symbol, "QUOTE", True)
+            if code:
+                self.write_log(f"订阅行情失败：{data}")
+            else:
+                self.write_log(f"订阅行情成功: {futu_symbol}")
+        except Exception as e:
+            self.write_log(f"订阅行情异常: {futu_symbol} {e}")
 
     def get_tick(self, code: str) -> TickData:
         """获取或创建Tick数据"""
@@ -261,6 +293,8 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
         self.limit_ups = {}
         self.limit_downs = {}
         self.count = -1
+        self._order_seq = 0
+        self._order_lock = threading.Lock()
         self.session_id = int(datetime.now().strftime('%H%M%S'))
         self.inited = False
         self.account_id = None
@@ -308,7 +342,7 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
                 return
 
             # 获取合约信息
-            self._get_contracts()
+            self.write_log('QMT订单功能初始化完成，跳过行情和合约加载')
 
         except Exception as e:
             self.write_log(f"QMT连接异常: {e}")
@@ -325,33 +359,43 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
 
     def subscribe(self, req: SubscribeRequest):
         """订阅行情"""
-        try:
-            if req.exchange not in self.exchanges:
-                self.write_log(f"qmt不支持订阅行情: {req.symbol} {req.exchange}")
-                return
-
-            account_type = EXCHANGE_TO_ACCOUNT_TYPE.get(req.exchange, 'STOCK')
-            qmt_code = convert_symbol_vt2qmt(req.symbol, req.exchange, account_type)
-            return xtquant.xtdata.subscribe_quote(
-                stock_code=qmt_code,
-                period='tick',
-                callback=self._on_tick
-            )
-        except Exception as e:
-            self.write_log(f"订阅行情失败: {e}")
+        self.write_log(f"QMT免费版仅用于订单，跳过行情订阅: {req.symbol} {req.exchange}")
 
     def send_order(self, req: OrderRequest):
         """发送订单"""
+        order = None
         try:
+            if not self.inited or not self.trader:
+                self.write_log("QMT尚未初始化，拒绝下单")
+                return ""
+
             if req.exchange not in self.exchanges:
                 self.write_log(f"qmt不支持交易: {req.symbol} {req.exchange}")
-                return
+                return ""
 
             # 根据交易所获取对应的账号
             account = self._get_account_by_exchange(req.exchange)
             account_type = EXCHANGE_TO_ACCOUNT_TYPE.get(req.exchange, 'STOCK')
 
             order_id = self._get_order_id()
+            order = OrderData(
+                gateway_name=self.gateway_name,
+                symbol=req.symbol,
+                exchange=req.exchange,
+                orderid=order_id,
+                type=req.type,
+                direction=req.direction,
+                offset=req.offset,
+                volume=req.volume,
+                price=req.price,
+                status=Status.SUBMITTING,
+                datetime=datetime.now(CHINA_TZ),
+                raw_status="LOCAL_SUBMITTING",
+                status_msg="本地已提交",
+            )
+            with self._order_lock:
+                self.orders[order_id] = order
+            self.on_order(copy(order))
 
             # 发送异步订单
             qmt_code = convert_symbol_vt2qmt(req.symbol, req.exchange, account_type)
@@ -366,26 +410,19 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
             )
 
             if seq == -1:
-                raise Exception(f"{qmt_code} {order_id}")
+                raise Exception(f"{qmt_code} {order_id} order_stock_async返回-1")
 
-            # 创建订单对象
-            order = OrderData(
-                gateway_name=self.gateway_name,
-                symbol=req.symbol,
-                exchange=req.exchange,
-                orderid=order_id,
-                type=req.type,
-                direction=req.direction,
-                offset=req.offset,
-                volume=req.volume,
-                price=req.price,
-                status=Status.SUBMITTING
-            )
-            self.orders[order_id] = order
             self.write_log(f"使用{account_type}账号发送订单: {req.symbol} {req.exchange}")
             return order.vt_orderid
 
         except Exception as e:
+            if order:
+                order.status = Status.REJECTED
+                order.raw_status = "LOCAL_ERROR"
+                order.status_msg = str(e)
+                with self._order_lock:
+                    self.orders[order.orderid] = order
+                self.on_order(copy(order))
             self.write_log(f"发送订单失败: {e}")
             return ""
 
@@ -501,8 +538,9 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
 
     def _get_order_id(self):
         """生成订单ID"""
-        self.count += 1
-        return f'{self.session_id}#{self.count}'
+        with self._order_lock:
+            self._order_seq += 1
+            return f'{self.session_id}#{self._order_seq}'
 
     def _on_tick(self, datas):
         """行情推送回调"""
@@ -591,48 +629,29 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
         for order in order_list:
             try:
                 symbol, exchange = convert_symbol_qmt2vt(order.stock_code)
+                raw_status = getattr(order, "order_status", None)
+                status = QMT_ORDER_STATUS.get(raw_status, Status.UNKNOWN)
+                status_msg = QMT_ORDER_STATUS_TEXT.get(raw_status, f"未知状态:{raw_status}")
+                orderid = order.order_remark or str(order.order_id)
                 vn_order = OrderData(
-                    orderid=order.order_remark,
+                    orderid=orderid,
                     symbol=symbol,
                     exchange=exchange,
                     price=order.price,
                     volume=order.order_volume,
                     traded=order.traded_volume,
                     gateway_name=self.gateway_name,
-                    status=QMT_ORDER_STATUS.get(order.order_status, Status.SUBMITTING),
+                    status=status,
                     direction=QMT_TO_VN_TRADE_TYPE.get(order.order_type, Direction.LONG),
                     datetime=timestamp_to_datetime(order.order_time),
-                    reference=order.order_id
+                    reference=order.order_id,
+                    raw_status=raw_status,
+                    status_msg=status_msg,
                 )
 
-                # 检查订单状态变化
-                old_order = self.orders.get(vn_order.orderid)
-                if old_order:
-                    old_status = old_order.status
-                    old_traded = old_order.traded
-                else:
-                    old_status = None
-                    old_traded = 0
-
-                self.orders[vn_order.orderid] = vn_order
-                self.on_order(vn_order)
-
-                # 如果有成交变化，输出成交信息
-                if vn_order.traded > old_traded and old_status != Status.ALLTRADED:
-                    new_traded = vn_order.traded - old_traded
-                    self.write_log(f'订单成交: {vn_order.symbol} {vn_order.exchange} {vn_order.direction} '
-                                f'成交{new_traded}股，累计{vn_order.traded}/{vn_order.volume}股')
-
-                # 如果订单完成，输出完成信息
-                if vn_order.status == Status.ALLTRADED:
-                    self.write_log(f'✅ 订单完成: {vn_order.symbol} {vn_order.exchange} {vn_order.direction} '
-                                    f'全部成交{vn_order.traded}股')
-                elif vn_order.status == Status.CANCELLED:
-                    self.write_log(f'⏹️ 订单撤销: {vn_order.symbol} {vn_order.exchange} {vn_order.direction} '
-                                    f'已撤销，成交{vn_order.traded}股')
-                elif vn_order.status == Status.REJECTED:
-                    self.write_log(f'❌ 订单拒绝: {vn_order.symbol} {vn_order.exchange} {vn_order.direction} '
-                                    f'被拒绝')
+                with self._order_lock:
+                    self.orders[vn_order.orderid] = vn_order
+                self.on_order(copy(vn_order))
 
             except Exception as e:
                 self.write_log(f"处理订单信息失败: {e}")
@@ -664,10 +683,16 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
     def on_order_stock_async_response(self, response: XtOrderResponse):
         """异步下单响应"""
         self.write_log(f'下单响应: {response.order_remark} - {response.error_msg or "成功"}')
-        order = self.orders.get(response.order_remark)
-        if order and response.error_msg:
-            order.status = Status.REJECTED
-            self.on_order(order)
+        with self._order_lock:
+            order = self.orders.get(response.order_remark)
+            if order and getattr(response, "order_id", None):
+                order.reference = response.order_id
+            if order and response.error_msg:
+                order.status = Status.REJECTED
+                order.raw_status = "ASYNC_ERROR"
+                order.status_msg = response.error_msg
+                self.orders[order.orderid] = order
+                self.on_order(copy(order))
 
     def on_cancel_order_stock_async_response(self, response: XtCancelOrderResponse):
         """异步撤单响应"""
@@ -676,10 +701,14 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
     def on_order_error(self, order_error: XtOrderError):
         """订单错误回调"""
         self.write_log(f'订单错误: {order_error.error_msg}')
-        order = self.orders.get(order_error.order_remark)
-        if order:
-            order.status = Status.REJECTED
-            self.on_order(order)
+        with self._order_lock:
+            order = self.orders.get(order_error.order_remark)
+            if order:
+                order.status = Status.REJECTED
+                order.raw_status = "ORDER_ERROR"
+                order.status_msg = order_error.error_msg
+                self.orders[order.orderid] = order
+                self.on_order(copy(order))
 
     def on_cancel_error(self, cancel_error: XtCancelError):
         """撤单错误回调"""

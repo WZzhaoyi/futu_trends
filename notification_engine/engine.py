@@ -180,11 +180,14 @@ class NotificationEngine:
         headers = {
             'Content-Type': 'application/json',
         }
-        data = f'{{"chat_id":"{self.TELEGRAM_CHAT_ID}", "text":"{text}", "reply_markup": {{"inline_keyboard":' \
-               f' [[{{"text":"🔗查看原文", "url":"{link}"}}]]}}}} '
+        data = {
+            "chat_id": self.TELEGRAM_CHAT_ID,
+            "text": text,
+            "reply_markup": {"inline_keyboard": [[{"text": "查看原文", "url": link}]]},
+        }
         url = f'https://api.telegram.org/bot{self.TELEGRAM_BOT_TOKEN}/sendMessage'
         try:
-            self.SESSION.post(url, headers=headers, data=data.encode('utf-8'), proxies=self.PROXIES)
+            self.SESSION.post(url, headers=headers, json=data, proxies=self.PROXIES)
             logger.info('Telegram Sent: %s', self.TELEGRAM_CHAT_ID)
         except:
             logger.error('网络代理错误，请检查确认后关闭本程序重试')

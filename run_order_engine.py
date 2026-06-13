@@ -33,6 +33,7 @@ def main():
     notification_engine = NotificationEngine(config)
     def notify_calc(msg: str):
         print(f'{datetime.now().strftime("%Y-%m-%d %H:%M:%S")} {msg}')
+        notification_engine.send_webhook(msg)
         notification_engine.send_telegram_message(msg)
         notification_engine.send_email(msg, msg)
 

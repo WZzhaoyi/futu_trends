@@ -32,8 +32,10 @@ class Status(str, Enum):
     NOTTRADED = "NOTTRADED"
     PARTTRADED = "PARTTRADED"
     ALLTRADED = "ALLTRADED"
+    CANCELLING = "CANCELLING"
     CANCELLED = "CANCELLED"
     REJECTED = "REJECTED"
+    UNKNOWN = "UNKNOWN"
 
 
 class OrderType(str, Enum):
@@ -132,6 +134,8 @@ class OrderData:
     status: Status = Status.SUBMITTING
     datetime: datetime = None
     reference: str = ""
+    raw_status: int | str | None = None
+    status_msg: str = ""
 
     @property
     def vt_orderid(self) -> str:
