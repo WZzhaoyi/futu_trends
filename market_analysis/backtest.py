@@ -8,6 +8,7 @@ import sys
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import pandas as pd
@@ -19,6 +20,96 @@ VNPY_ROOT = DATA_ROOT / ".vntrader"
 CACHE_ROOT = DATA_ROOT / "vnpy_cache"
 OUTPUT_ROOT = PROJECT_ROOT / "output" / "backtest"
 CUSTOM_OPTIMIZATION_TARGETS = {"sortino_ratio", "calmar_ratio"}
+
+
+def format_elapsed(seconds: float) -> str:
+    total_seconds = max(int(seconds), 0)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{seconds:02d}s"
+    if minutes:
+        return f"{minutes}m{seconds:02d}s"
+    return f"{seconds}s"
+
+
+def format_metric(value: Any, digits: int = 2, suffix: str = "") -> str:
+    if value is None:
+        return "n/a"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "n/a"
+    if pd.isna(number):
+        return "n/a"
+    return f"{number:.{digits}f}{suffix}"
+
+
+def result_rows_from_optimization(results: list[tuple], symbols: list[str] | None = None) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    symbol_text = " ".join(symbols) if symbols else None
+
+    for setting_text, target_value, statistics in results:
+        row: dict[str, Any] = {
+            "target": target_value,
+            "setting": setting_text,
+        }
+        if symbol_text:
+            row["symbols"] = symbol_text
+
+        for key, value in parse_setting_text(setting_text).items():
+            row[f"param_{key}"] = value
+        row.update(statistics)
+        rows.append(row)
+
+    return rows
+
+
+def print_result_rows(rows: list[dict[str, Any]], title: str, limit: int = 3) -> None:
+    if not rows:
+        return
+
+    print(title, flush=True)
+    for index, row in enumerate(rows[:limit], start=1):
+        symbols = row.get("symbols") or " ".join(str(symbol) for symbol in row.get("vt_symbols", []))
+        setting = parse_setting_text(str(row.get("setting", "")))
+        regression_window = row.get("param_regression_window", setting.get("regression_window"))
+
+        print(f"{index}. {symbols}".rstrip(), flush=True)
+        if regression_window is not None:
+            print(
+                f"   window={regression_window}, "
+                f"total={format_metric(row.get('total_return'), suffix='%')}, "
+                f"annual={format_metric(row.get('annual_return'), suffix='%')}",
+                flush=True,
+            )
+        else:
+            print(
+                f"   total={format_metric(row.get('total_return'), suffix='%')}, "
+                f"annual={format_metric(row.get('annual_return'), suffix='%')}",
+                flush=True,
+            )
+        print(
+            f"   max_dd={format_metric(row.get('max_ddpercent'), suffix='%')}, "
+            f"Sharpe={format_metric(row.get('sharpe_ratio'), digits=4)}, "
+            f"Sortino={format_metric(row.get('sortino_ratio'), digits=4)}, "
+            f"Calmar={format_metric(row.get('calmar_ratio'), digits=4)}",
+            flush=True,
+        )
+        if row.get("benchmark_symbol"):
+            print(
+                f"   benchmark={row.get('benchmark_symbol')}, "
+                f"benchmark_total={format_metric(row.get('benchmark_total_return'), suffix='%')}, "
+                f"excess_total={format_metric(row.get('excess_total_return'), suffix='%')}",
+                flush=True,
+            )
+        print("", flush=True)
+
+
+def print_backtest_summary(symbols: list[str], statistics: dict[str, Any]) -> None:
+    row = {"symbols": " ".join(symbols)}
+    row.update(statistics)
+    print_result_rows([row], "Backtest result:", limit=1)
 
 
 @dataclass(frozen=True)
@@ -249,7 +340,7 @@ def ensure_history_data(config: BacktestConfig, specs: list[SymbolSpec], vnpy: d
         bars = dataframe_to_bars(df, spec, exchange, interval, bar_cls)
         if bars:
             database.save_bar_data(bars)
-            print(f"Imported {len(bars):>5} bars: {spec.code} -> {spec.vt_symbol}")
+            print(f"Imported {len(bars):>5} bars: {spec.code} -> {spec.vt_symbol}", flush=True)
 
 
 def history_specs(config: BacktestConfig, vnpy: dict[str, Any]) -> list[SymbolSpec]:
@@ -434,22 +525,8 @@ def export_trades(engine: Any, path: Path) -> None:
         pd.DataFrame(rows).to_csv(path, index=False)
 
 
-def export_optimization_results(results: list[tuple], path: Path) -> None:
-    rows: list[dict[str, Any]] = []
-    for setting_text, target_value, statistics in results:
-        row: dict[str, Any] = {
-            "setting": setting_text,
-            "target": target_value,
-        }
-
-        setting = parse_setting_text(setting_text)
-
-        for key, value in setting.items():
-            row[f"param_{key}"] = value
-
-        row.update(statistics)
-        rows.append(row)
-
+def export_optimization_results(results: list[tuple], path: Path, symbols: list[str] | None = None) -> None:
+    rows = result_rows_from_optimization(results, symbols)
     pd.DataFrame(rows).to_csv(path, index=False)
 
 
@@ -602,9 +679,10 @@ def run_strategy_backtest(strategy_class: type, config: BacktestConfig) -> dict[
     daily_df.to_csv(daily_path)
     export_trades(engine, trades_path)
 
-    print(f"Daily result: {daily_path}")
+    print(f"Daily result: {daily_path}", flush=True)
     if trades_path.exists():
-        print(f"Trades:       {trades_path}")
+        print(f"Trades:       {trades_path}", flush=True)
+    print_backtest_summary(config.symbols, statistics)
 
     if config.show_chart:
         engine.show_chart(daily_df)
@@ -643,6 +721,18 @@ def run_strategy_optimization(
         engine_target,
     )
 
+    parameter_text = ", ".join(
+        f"{parameter.name}={parameter.start}:{parameter.end}:{parameter.step}"
+        for parameter in parameters
+    )
+    started_at = perf_counter()
+    print(
+        "Optimization started: "
+        f"symbols={' '.join(config.symbols)}, target={target}, method={method}, "
+        f"parameters={parameter_text}",
+        flush=True,
+    )
+
     if method == "bf":
         results = engine.run_bf_optimization(optimization_setting, max_workers=max_workers)
     elif method == "ga":
@@ -657,11 +747,22 @@ def run_strategy_optimization(
     if not results:
         raise RuntimeError("Optimization produced no results.")
 
+    if target in CUSTOM_OPTIMIZATION_TARGETS:
+        print(f"Optimization enrichment started: target={target}", flush=True)
     results = enrich_optimization_results(strategy_class, config, vnpy, results, target)
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     strategy_name = re.sub(r"[^0-9A-Za-z_]+", "_", strategy_class.__name__).lower()
     optimization_path = OUTPUT_ROOT / f"{strategy_name}_optimization_{stamp}.csv"
-    export_optimization_results(results, optimization_path)
-    print(f"Optimization result: {optimization_path}")
+    export_optimization_results(results, optimization_path, config.symbols)
+    print(
+        f"Optimization result: {optimization_path} "
+        f"(elapsed={format_elapsed(perf_counter() - started_at)})",
+        flush=True,
+    )
+    print_result_rows(
+        result_rows_from_optimization(results, config.symbols),
+        "Top 3 optimization results:",
+        limit=3,
+    )
     return results

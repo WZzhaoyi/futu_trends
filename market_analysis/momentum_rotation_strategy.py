@@ -10,6 +10,7 @@ from collections import defaultdict
 from datetime import datetime
 from itertools import combinations
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import pandas as pd
@@ -49,6 +50,7 @@ class MomentumRotationStrategy(StrategyTemplate):
     initial_capital: int = 1_000_000
     allocation: float = 1.0
     min_score: float = float("-inf")
+    cash_symbols: tuple[str, ...] = ()
 
     holding_symbol: str = ""
     sizing_cash: float = 0
@@ -59,6 +61,7 @@ class MomentumRotationStrategy(StrategyTemplate):
         "initial_capital",
         "allocation",
         "min_score",
+        "cash_symbols",
     ]
 
     variables = [
@@ -72,6 +75,7 @@ class MomentumRotationStrategy(StrategyTemplate):
         self.ams: dict[str, ArrayManager] = {}
         self.last_prices: dict[str, float] = {}
         self.last_scores: dict[str, float] = {}
+        self.cash_vt_symbols = self.normalize_cash_symbols(self.cash_symbols)
         self.sizing_cash = float(self.initial_capital)
 
     def on_init(self) -> None:
@@ -148,6 +152,9 @@ class MomentumRotationStrategy(StrategyTemplate):
         if not target_symbol:
             return targets
 
+        if target_symbol in self.cash_vt_symbols:
+            return targets
+
         price = self.last_prices.get(target_symbol, 0)
         if price <= 0:
             return targets
@@ -158,6 +165,19 @@ class MomentumRotationStrategy(StrategyTemplate):
         volume = int(target_notional / (price * size))
         targets[target_symbol] = max(volume, 0)
         return targets
+
+    @staticmethod
+    def normalize_cash_symbols(symbols: list[str] | tuple[str, ...]) -> set[str]:
+        cash_vt_symbols: set[str] = set()
+        for symbol in symbols:
+            normalized = symbol.strip().upper()
+            if not normalized:
+                continue
+            if normalized.startswith("US."):
+                cash_vt_symbols.add(f"{normalized.removeprefix('US.')}.SMART")
+            else:
+                cash_vt_symbols.add(normalized)
+        return cash_vt_symbols
 
     def calculate_portfolio_value(self) -> float:
         value = self.sizing_cash
@@ -186,10 +206,14 @@ class MomentumRotationStrategy(StrategyTemplate):
 
 
 # Ten-year universe optimization snapshot, 2016-06-12 to 2026-06-12, benchmark US.SPY.
-# Ranked by Sortino ratio after optimizing regression_window in 20..30:
-# 1. US.QQQ US.GLD US.SPY US.UUP, window=22, total=455.08%, annual=45.27%, max_dd=-28.20%, Sharpe=0.9011, Sortino=3.3519, Calmar=1.6052
-# 2. US.QQQ US.SPY US.FXI US.UUP, window=21, total=476.73%, annual=47.43%, max_dd=-30.33%, Sharpe=0.8314, Sortino=3.3432, Calmar=1.5638
-# 3. US.QQQ US.GLD US.SPY US.FXI, window=22, total=520.53%, annual=51.78%, max_dd=-27.78%, Sharpe=0.7683, Sortino=3.1438, Calmar=1.8643
+# Candidate pool: US.QQQ, US.GLD, US.SPY, US.FXI, US.UUP, US.TLT.
+# US.UUP participates in momentum ranking as a cash/timing signal. If selected, the strategy holds cash.
+# Ranked by Sortino ratio after selecting 4 symbols and optimizing regression_window in 20..30:
+# 1. US.QQQ US.SPY US.FXI US.UUP, window=21, total=521.47%, annual=51.88%, max_dd=-28.28%, Sharpe=0.9285, Sortino=3.9316, Calmar=1.8342, excess_vs_spy=205.78%
+# 2. US.QQQ US.GLD US.SPY US.UUP, window=22, total=419.70%, annual=41.75%, max_dd=-25.40%, Sharpe=0.9051, Sortino=3.2264, Calmar=1.6440, excess_vs_spy=104.01%
+# 3. US.QQQ US.GLD US.SPY US.FXI, window=22, total=520.53%, annual=51.78%, max_dd=-27.78%, Sharpe=0.7683, Sortino=3.1438, Calmar=1.8643, excess_vs_spy=204.84%
+# Allocation note: US.QQQ/US.GLD/US.SPY/US.UUP is easier to interpret as equity/gold/equity-beta/cash
+# timing, while US.QQQ/US.SPY/US.FXI/US.UUP adds non-US equity risk and fits a more aggressive timing model.
 
 DEFAULT_MODE = "optimize-universe"
 DEFAULT_START = "2016-06-12"
@@ -199,14 +223,17 @@ DEFAULT_DATA_SOURCE = "project"
 DEFAULT_MAX_WORKERS = 4
 DEFAULT_OPTIMIZATION_METHOD = "bf"
 DEFAULT_OPTIMIZATION_TARGET = "sortino_ratio"
-DEFAULT_CANDIDATE_SYMBOLS = ["US.QQQ", "US.GLD", "US.SPY", "US.FXI", "US.UUP", "US.TLT"]
+DEFAULT_CANDIDATE_SYMBOLS = ["US.QQQ", "US.GLD", "US.SPY", "US.UUP", "US.FXI", "US.TLT"]
+# DEFAULT_CANDIDATE_SYMBOLS = ["SZ.159941", "SH.518880", "SZ.159949", "SH.510300", "SH.510880"]
 DEFAULT_BACKTEST_SYMBOLS = DEFAULT_CANDIDATE_SYMBOLS[:4]
 DEFAULT_UNIVERSE_SIZE = 4
 DEFAULT_BENCHMARK_SYMBOL = "US.SPY"
+DEFAULT_CASH_SYMBOLS = ["US.UUP"]
 DEFAULT_STRATEGY_SETTING = {
     "regression_window": 22,
     "allocation": 1.0,
     "min_score": float("-inf"),
+    "cash_symbols": DEFAULT_CASH_SYMBOLS,
 }
 DEFAULT_OPTIMIZATION_PARAMETERS = [
     ("regression_window", 20, 30, 1),
@@ -248,6 +275,22 @@ def export_universe_results(rows: list[dict[str, Any]], output_root: Path) -> Pa
     return path
 
 
+def write_universe_progress(rows: list[dict[str, Any]], path: Path) -> None:
+    if rows:
+        pd.DataFrame(rows).sort_values("target", ascending=False).to_csv(path, index=False)
+
+
+def format_elapsed(seconds: float) -> str:
+    total_seconds = max(int(seconds), 0)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{seconds:02d}s"
+    if minutes:
+        return f"{minutes}m{seconds:02d}s"
+    return f"{seconds}s"
+
+
 def parse_setting_text(setting_text: str) -> dict[str, Any]:
     try:
         safe_text = re.sub(r"(?<![\w.])-inf(?![\w.])", "-1e309", setting_text)
@@ -272,15 +315,28 @@ def run_universe_optimization(
     rows: list[dict[str, Any]] = []
     combos = list(combinations(candidates, DEFAULT_UNIVERSE_SIZE))
     combo_source = DEFAULT_DATA_SOURCE
+    started_at = perf_counter()
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    output_root.mkdir(parents=True, exist_ok=True)
+    progress_path = output_root / f"momentumrotationstrategy_universe_progress_{stamp}.csv"
+
+    print(
+        "Universe optimization started: "
+        f"candidates={len(candidates)}, choose={DEFAULT_UNIVERSE_SIZE}, "
+        f"combos={len(combos)}, target={DEFAULT_OPTIMIZATION_TARGET}, "
+        f"progress={progress_path}",
+        flush=True,
+    )
 
     if DEFAULT_DATA_SOURCE == "project":
-        print(f"Preparing history data for candidate universe: {' '.join(candidates)}")
+        print(f"Preparing history data for candidate universe: {' '.join(candidates)}", flush=True)
         prepare_history_func(make_backtest_config(args, candidates, config_cls))
         combo_source = "database"
 
     for index, combo in enumerate(combos, start=1):
         symbols = list(combo)
-        print(f"Universe {index}/{len(combos)}: {' '.join(symbols)}")
+        combo_started_at = perf_counter()
+        print(f"Universe {index}/{len(combos)} started: {' '.join(symbols)}", flush=True)
         config = make_backtest_config(args, symbols, config_cls, data_source=combo_source)
         results = run_optimization_func(
             MomentumRotationStrategy,
@@ -300,9 +356,30 @@ def run_universe_optimization(
             row[f"param_{key}"] = value
         row.update(best_statistics)
         rows.append(row)
+        write_universe_progress(rows, progress_path)
+        print(
+            f"Universe {index}/{len(combos)} done: "
+            f"target={best_target:.6f}, elapsed={format_elapsed(perf_counter() - combo_started_at)}, "
+            f"total_elapsed={format_elapsed(perf_counter() - started_at)}",
+            flush=True,
+        )
 
     path = export_universe_results(rows, output_root)
-    print(f"Universe optimization result: {path}")
+    print(
+        f"Universe optimization result: {path} "
+        f"(elapsed={format_elapsed(perf_counter() - started_at)}, progress={progress_path})",
+        flush=True,
+    )
+    try:
+        from backtest import print_result_rows
+    except ImportError:
+        print_result_rows = None
+    if print_result_rows:
+        print_result_rows(
+            sorted(rows, reverse=True, key=lambda row: row["target"]),
+            "Top 3 universe optimization results:",
+            limit=3,
+        )
     return rows
 
 
