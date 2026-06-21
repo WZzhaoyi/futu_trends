@@ -8,8 +8,7 @@ from ft_config import get_config
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 from data import get_kline_data
 from params_db import ParamsDB
-from signal_analysis import get_target_price, MACD, KD, RSI
-from tools import MA, EMA, calc_momentum, calc_returns_score, code_in_futu_group
+from signal_analysis import get_target_price, MACD, KD, RSI, default_stock_params  # 默认参数单一来源
 import datetime
 import configparser
 import time
@@ -69,19 +68,7 @@ def is_reverse(df: pd.DataFrame, code: str, config: configparser.ConfigParser) -
     # 如果数据库中没有找到参数，使用默认参数
     if data is None:
         print(f"No KD parameters found for {code}, using default parameters")
-        data = {
-            'best_params': {
-                'k_period': 15,
-                'd_period': 5,
-                'overbought': 50,
-                'oversold': 50
-            },
-            'meta_info': {  
-                'target_multiplier': 1.5,
-                'atr_period': 60
-            },
-            'performance': {}
-        }
+        data = default_stock_params('KD')
     
     params = data['best_params']
     meta = data['meta_info']
@@ -121,19 +108,7 @@ def is_continue(df:pd.DataFrame, code:str, config:configparser.ConfigParser)->st
     # 如果数据库中没有找到参数，使用默认参数
     if data is None:
         print(f"No MACD parameters found for {code}, using default parameters")
-        data = {
-            'best_params': {
-                'fast_period': 12,
-                'slow_period': 26,
-                'signal_period': 9,
-                'macd_extreme': 150
-            },
-            'meta_info': {  
-                'target_multiplier': 1.5,
-                'atr_period': 60
-            },
-            'performance': {}
-        }
+        data = default_stock_params('MACD')
     
     params = data['best_params']
     meta = data['meta_info']
@@ -199,18 +174,7 @@ def is_top_down(df:pd.DataFrame, code:str, config:configparser.ConfigParser) -> 
     # 如果数据库中没有找到参数，使用默认参数
     if data is None:
         print(f"No RSI parameters found for {code}, using default parameters")
-        data = {
-            'best_params': {
-                'rsi_period': 7,
-                'oversold': 30,
-                'overbought': 70
-            },
-            'meta_info': {  
-                'target_multiplier': 1.5,
-                'atr_period': 60
-            },
-            'performance': {}
-        }
+        data = default_stock_params('RSI')
     
     params = data['best_params']
     meta = data['meta_info']

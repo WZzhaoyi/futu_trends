@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 import sys
 import logging
+import configparser
 from pathlib import Path
 from typing import Dict, Any, Optional
 import pandas as pd
@@ -15,11 +16,15 @@ import pandas as pd
 # 添加项目根目录到路径（复用现有代码）
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 
-from ft_config import get_config
 from data import get_kline_data
-from signal_analysis import KD, MACD, RSI
 from tools import EMA, code_in_futu_group
 from params_db import ParamsDB
+# 指标/detect 计算口径与 CLI 共用单一来源（项目根的共享服务，无 FastAPI 依赖）
+from indicator_service import (
+    get_db_paths as _get_db_paths_svc,
+    read_detect as _read_detect_svc,
+    calculate_indicator as _calculate_indicator_svc,
+)
 
 # 配置日志
 logging.basicConfig(
@@ -39,20 +44,53 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-config = get_config()
+# 启动时显式加载校验后赋值（见 __main__）；导入期为 None，不读 config/argv。
+config: configparser.ConfigParser | None = None
+
+# 必需键 + 须为整数的键
+_REQUIRED_KEYS = ("FUTU_HOST", "FUTU_PORT", "DATA_SOURCE")
+_INT_KEYS = ("FUTU_PORT", "EMA_PERIOD")
+
+
+def load_and_validate_config(path: str | None) -> configparser.ConfigParser:
+    """加载并校验配置；任一不满足即报错退出。"""
+    if not path:
+        raise SystemExit("启动失败：必须通过 --config 指定配置文件")
+    cfg = configparser.ConfigParser()
+    if not cfg.read(path, encoding="utf-8"):
+        raise SystemExit(f"启动失败：配置文件不存在或不可读: {path}")
+    if not cfg.has_section("CONFIG"):
+        raise SystemExit(f"启动失败：配置缺少 [CONFIG] 段: {path}")
+    missing = [k for k in _REQUIRED_KEYS if not cfg.get("CONFIG", k, fallback="").strip()]
+    if missing:
+        raise SystemExit(f"启动失败：[CONFIG] 缺少必需键: {', '.join(missing)}")
+    for k in _INT_KEYS:
+        v = cfg.get("CONFIG", k, fallback="").strip()
+        if v:
+            try:
+                int(v)
+            except ValueError:
+                raise SystemExit(f"启动失败：[CONFIG] {k} 必须为整数，当前为 {v!r}")
+    return cfg
+
+
+@app.on_event("startup")
+async def _require_config_loaded():
+    """未加载 config 即拒绝启动。"""
+    if config is None:
+        raise RuntimeError("启动失败：config 未加载，请用 `python api.py --config <path>` 启动。")
+
 
 DEFAULT_MAX_COUNT = 1000
 DEFAULT_EMA_PERIOD = 240
 
 # ---- 共享数据函数 ----
 
+# 指标/detect 计算口径统一收敛到根级 indicator_service；以下为薄封装，行为不变。
+
 def _get_db_paths() -> Dict[str, Optional[str]]:
     """获取各指标的 ParamsDB 路径"""
-    return {
-        'MACD': config.get("CONFIG", "MACD_PARAMS_DB", fallback=None),
-        'KD': config.get("CONFIG", "KD_PARAMS_DB", fallback=None),
-        'RSI': config.get("CONFIG", "RSI_PARAMS_DB", fallback=None),
-    }
+    return _get_db_paths_svc(config)
 
 def _fetch_kline(code: str, max_count: int = DEFAULT_MAX_COUNT) -> pd.DataFrame:
     """获取 K 线数据，返回带 time 列的 DataFrame。无数据时抛 HTTPException"""
@@ -64,58 +102,11 @@ def _fetch_kline(code: str, max_count: int = DEFAULT_MAX_COUNT) -> pd.DataFrame:
 
 def _read_detect(code: str, db_paths: Dict[str, Optional[str]]) -> Dict[str, Any]:
     """从 ParamsDB 读取各指标的 best_params / meta_info / performance"""
-    result = {}
-    for indicator_type, db_path in db_paths.items():
-        if not db_path:
-            continue
-        try:
-            db = ParamsDB(db_path.split(',')[0])
-            data = db.get_stock_params(code)
-            if data and data.get('best_params'):
-                result[indicator_type] = {
-                    'best_params': data['best_params'],
-                    'meta_info': data['meta_info'],
-                    'performance': data['performance'],
-                }
-        except Exception as e:
-            logger.warning(f"Failed to get {indicator_type} params for {code}: {e}")
-    return result
-
-INDICATOR_CLASSES = {'MACD': MACD, 'KD': KD, 'RSI': RSI}
-INDICATOR_DEFAULTS = {
-    'MACD': (0, 0),
-    'KD': (20, 80),
-    'RSI': (30, 70),
-}
+    return _read_detect_svc(code, db_paths)
 
 def _calculate_indicator(indicator_type: str, df: pd.DataFrame, best_params: dict) -> Optional[Dict[str, Any]]:
     """根据类型和参数计算单个指标，返回前端所需格式"""
-    indicator = INDICATOR_CLASSES[indicator_type]()
-    default_oversold, default_overbought = INDICATOR_DEFAULTS[indicator_type]
-
-    if indicator_type == 'MACD':
-        vmacd, signal = indicator.indicator_calculate(df.copy(), best_params)
-        return {
-            'vmacd': vmacd.fillna(0).tolist(),
-            'signal': signal.fillna(0).tolist(),
-            'hist': (2*(vmacd - signal)).fillna(0).tolist(),
-        }
-    elif indicator_type == 'KD':
-        k, d = indicator.indicator_calculate(df.copy(), best_params)
-        return {
-            'k': k.fillna(0).tolist(),
-            'd': d.fillna(0).tolist(),
-            'oversold': best_params.get('oversold', default_oversold),
-            'overbought': best_params.get('overbought', default_overbought),
-        }
-    elif indicator_type == 'RSI':
-        values = indicator.indicator_calculate(df.copy(), best_params)
-        return {
-            'values': values.fillna(0).tolist(),
-            'oversold': best_params.get('oversold', default_oversold),
-            'overbought': best_params.get('overbought', default_overbought),
-        }
-    return None
+    return _calculate_indicator_svc(indicator_type, df, best_params)
 
 # ---- API 路由 ----
 
@@ -268,9 +259,12 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description='Futu Trends API Server')
-    parser.add_argument('--config', type=str, help='配置文件路径')
+    parser.add_argument('--config', type=str, required=True, help='配置文件路径（必填）')
     parser.add_argument('--port', type=int, default=8001, help='服务端口（默认8001，如果被占用会自动切换）')
     args = parser.parse_args()
+
+    # 显式加载校验配置（失败即退出）；设模块全局供各 handler 使用
+    config = load_and_validate_config(args.config)
 
     default_port = args.port
     try:
