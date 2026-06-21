@@ -206,9 +206,9 @@ class MACD(Indicator):
 
     def _future_confirmation(self, df, is_support):
         if is_support:
-            return ((df['close'].shift(-1) > df['close']) & (df['open'].shift(-1) <= df['close'].shift(-1)))
+            return ((df['close'].shift(-1) > df['close']) & (df['open']<= df['close']))
         else:
-            return ((df['close'].shift(-1) < df['close']) & (df['open'].shift(-1) >= df['close'].shift(-1)))
+            return ((df['close'].shift(-1) < df['close']) & (df['open'] >= df['close']))
 
 
 class RSI(Indicator):
