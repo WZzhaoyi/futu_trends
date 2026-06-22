@@ -15,6 +15,7 @@ import time
 from notification_engine import NotificationEngine
 from decimal import Decimal, ROUND_HALF_UP
 import pandas as pd
+from tools import EMA, MA, calc_momentum, calc_returns_score, code_in_futu_group
 
 PARAMS_CACHE_TTL_SECONDS = 6 * 60 * 60
 _params_cache = {}
