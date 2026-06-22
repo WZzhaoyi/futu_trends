@@ -46,6 +46,7 @@ import copy
 import json
 import math
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -88,6 +89,11 @@ _DROP_RATIO_WARN = 0.03
 
 # get_stock_filter 单页上限
 _PAGE = 200
+# get_stock_filter 频控：30 秒内至多约 10 次。翻页间节流 + 失败退避重试，
+# 避免大市场（如美股）翻多页时触发频控、直接抛错崩掉整轮选股。
+_FILTER_THROTTLE_SEC = 3.5   # 相邻翻页最小间隔
+_FILTER_MAX_TRIES = 4        # 单页含重试的最大尝试次数
+_FILTER_BACKOFF_SEC = 6.0    # 失败退避基数（按尝试次线性递增）
 # 段 2 取 K 线根数。需 >365 才让 yfinance 映射到 period='2y'(~490 根)，
 # 从而覆盖 200MA + 252 日(12月)RS；<=365 会退到 '1y'(~247 根)，差几根算不出 12 月 RS。
 _KLINE_COUNT = 400
@@ -157,6 +163,27 @@ def _build_l1_filters(market: str, p: ScreenParams) -> list:
     ]
 
 
+def _get_filter_page(ctx, market: str, filters: list, begin: int):
+    """
+    拉单页候选，带频控退避重试（无 try/except——futu 以 ret 码而非异常报错）。
+
+    频控/瞬时失败时退避后重试，仅连续耗尽尝试次数才抛。返回 (last_page, all_count, rows)。
+    """
+    data = None
+    for attempt in range(1, _FILTER_MAX_TRIES + 1):
+        ret, data = ctx.get_stock_filter(
+            market=MARKETS[market], filter_list=filters, begin=begin, num=_PAGE,
+        )
+        if ret == ft.RET_OK:
+            return data
+        if attempt < _FILTER_MAX_TRIES:
+            backoff = _FILTER_BACKOFF_SEC * attempt
+            print(f"[warn] get_stock_filter 第 {attempt} 次失败（疑似频控），"
+                  f"退避 {backoff:.0f}s 后重试: {data}", file=sys.stderr)
+            time.sleep(backoff)
+    raise RuntimeError(f"get_stock_filter 连续 {_FILTER_MAX_TRIES} 次失败: {data}")
+
+
 def run_l1(market: str, config, p: ScreenParams) -> list[dict]:
     """段 1：服务端首筛，翻页取全部候选。0 历史 K 线配额。"""
     if market not in MARKETS:
@@ -171,12 +198,7 @@ def run_l1(market: str, config, p: ScreenParams) -> list[dict]:
     try:
         begin = 0
         while True:
-            ret, data = ctx.get_stock_filter(
-                market=MARKETS[market], filter_list=filters, begin=begin, num=_PAGE,
-            )
-            if ret != ft.RET_OK:
-                raise RuntimeError(f"get_stock_filter 失败: {data}")
-            last_page, all_count, rows = data
+            last_page, all_count, rows = _get_filter_page(ctx, market, filters, begin)
             for s in rows:
                 # 简单字段是普通属性；财务字段在 __dict__ 里以 (field, quarter) 元组为键。
                 d = s.__dict__
@@ -193,6 +215,7 @@ def run_l1(market: str, config, p: ScreenParams) -> list[dict]:
             begin += len(rows)
             if last_page or not rows or begin >= all_count:
                 break
+            time.sleep(_FILTER_THROTTLE_SEC)  # 翻页间节流，主动避免触发频控
     finally:
         ctx.close()
     return candidates
@@ -302,7 +325,7 @@ def _sanitize(obj):
 
 
 def _ma_slope(ma: pd.Series, lookback: int = 21) -> float | None:
-    """MA200 当前 vs lookback 根前的百分比变化（>0 即上行）。"""
+    """均线（本模块为 EMA200）当前 vs lookback 根前的百分比变化（>0 即上行）。"""
     ma = ma.dropna()
     if len(ma) <= lookback or ma.iloc[-1 - lookback] == 0:
         return None
@@ -341,18 +364,22 @@ def _vcp_heuristic(df: pd.DataFrame, window: int = 8) -> dict:
     if n < window * 4:
         return {"heuristic": True, "ok": False, "note": "数据不足"}
 
-    # 滚动局部极值定位摆动点
-    is_peak = (high == high.rolling(window, center=True).max())
-    is_trough = (low == low.rolling(window, center=True).min())
-    peaks = list(high[is_peak].index)
-    troughs = list(low[is_trough].index)
+    # 全程用「位置整数索引」而非时间标签：若 K 线索引有重复时间戳，标签取值会返回 Series
+    # → `depth > 0` 触发真值歧义崩溃。转 numpy 后按位置定位摆动点，彻底规避。
+    high_v = high.to_numpy(dtype=float)
+    low_v = low.to_numpy(dtype=float)
+    vol_v = vol.to_numpy(dtype=float)
+    roll_max = high.rolling(window, center=True).max().to_numpy()
+    roll_min = low.rolling(window, center=True).min().to_numpy()
+    peak_pos = [i for i in range(n) if high_v[i] == roll_max[i]]      # NaN==x 恒 False，自动剔边界
+    trough_pos = [i for i in range(n) if low_v[i] == roll_min[i]]
 
     # 由相邻 peak→trough 计回调深度序列（取最近 ≤4 段）
     depths: list[float] = []
-    for pk in peaks[-5:]:
-        later = [t for t in troughs if t > pk]
-        if later:
-            depth = (high[pk] - low[later[0]]) / high[pk] * 100
+    for pi in peak_pos[-5:]:
+        later = [ti for ti in trough_pos if ti > pi]
+        if later and high_v[pi] > 0:
+            depth = (high_v[pi] - low_v[later[0]]) / high_v[pi] * 100
             if depth > 0:
                 depths.append(round(float(depth), 2))
     depths = depths[-4:]
@@ -360,8 +387,8 @@ def _vcp_heuristic(df: pd.DataFrame, window: int = 8) -> dict:
     depths_decreasing = (
         len(depths) >= 2 and all(a >= b for a, b in zip(depths, depths[1:]))
     )
-    recent_vol = vol.tail(window).mean()
-    base_vol = vol.tail(window * 4).head(window * 3).mean()
+    recent_vol = vol_v[-window:].mean()
+    base_vol = vol_v[-window * 4:-window].mean()  # 等价旧 tail(4w).head(3w)：基期量能均值
     vol_contracting = bool(base_vol and recent_vol < base_vol)
 
     return {
@@ -370,7 +397,7 @@ def _vcp_heuristic(df: pd.DataFrame, window: int = 8) -> dict:
         "contraction_depths_pct": depths,
         "depths_decreasing": bool(depths_decreasing),
         "volume_contracting": vol_contracting,
-        "pivot": round(float(high.tail(window * 2).max()), 4),
+        "pivot": round(float(high_v[-window * 2:].max()), 4),
     }
 
 
@@ -442,8 +469,10 @@ def refine_one(cand: dict, cfg, bench: pd.Series | None, p: ScreenParams) -> dic
         "bars": n,
         "bars_dropped": dropped,
         "trend_template_pass": template_pass,
-        "ma200_slope_pct": round(slope, 2) if slope is not None else None,
-        "ma200_uptrend": bool(slope is not None and slope > 0),
+        # 本模块趋势线全程用 EMA（L1 服务端筛选亦为 EMA），故如实命名 ema200_*，
+        # 避免与传统 200 日 SMA 混淆（消费方据此选择是否当 SMA 斜率解读）。
+        "ema200_slope_pct": round(slope, 2) if slope is not None else None,
+        "ema200_uptrend": bool(slope is not None and slope > 0),
         "dist_from_low52_pct": round(float((last - lo52) / lo52 * 100), 2) if lo52 else None,
         "dist_from_high52_pct": round(float((last - hi52) / hi52 * 100), 2) if hi52 else None,
         "rs_proxy": rs,

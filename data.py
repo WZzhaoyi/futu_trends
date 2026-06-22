@@ -684,7 +684,7 @@ def get_kline_data(code: str, config: configparser.ConfigParser, max_count: int 
     Returns:
         pd.DataFrame: K线数据，包含 open, high, low, close, volume
     """
-    ktype = config.get("CONFIG", "FUTU_PUSH_TYPE")
+    ktype = config.get("CONFIG", "FUTU_PUSH_TYPE", fallback="K_DAY")  # 缺省按日线，避免 NoOptionError
     cache_key = (code, ktype)
 
     market = code.split('.')[0].upper()

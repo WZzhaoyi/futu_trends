@@ -3,6 +3,7 @@
 Futu Trends API 后端服务
 提供股票列表、K线数据和技术指标计算接口
 """
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
@@ -33,7 +34,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Futu Trends API", version="1.0.0")
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """未加载 config 即拒绝启动（替代已废弃的 on_event("startup")）。"""
+    if config is None:
+        raise RuntimeError("启动失败：config 未加载，请用 `python api.py --config <path>` 启动。")
+    yield
+
+
+app = FastAPI(title="Futu Trends API", version="1.0.0", lifespan=_lifespan)
 
 # CORS 配置
 app.add_middleware(
@@ -72,13 +81,6 @@ def load_and_validate_config(path: str | None) -> configparser.ConfigParser:
             except ValueError:
                 raise SystemExit(f"启动失败：[CONFIG] {k} 必须为整数，当前为 {v!r}")
     return cfg
-
-
-@app.on_event("startup")
-async def _require_config_loaded():
-    """未加载 config 即拒绝启动。"""
-    if config is None:
-        raise RuntimeError("启动失败：config 未加载，请用 `python api.py --config <path>` 启动。")
 
 
 DEFAULT_MAX_COUNT = 1000

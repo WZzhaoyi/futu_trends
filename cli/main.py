@@ -187,6 +187,9 @@ def _signals_one(code: str, config, bench_cache: dict, db_paths: dict,
 
     # K 线（与 L2 同一内存缓存键，单次网络拉取复用）
     df = get_kline_data(code, rcfg, max_count=count)
+    if df is not None and not df.empty:
+        df = sc._clean_ohlcv(df)  # 与段2同源清洗：剔除 NaN/Inf/≤0 行，经典指标口径对齐 L2
+
     indicators: dict = {}
     if df is not None and not df.empty:
         indicators["ema"] = {"period": ema_period, "value": _last(EMA(df["close"], ema_period))}
@@ -227,7 +230,11 @@ def cmd_signals(args, config) -> dict:
     signals = []
     for i, code in enumerate(args.codes, 1):
         print(f"[signals {i}/{len(args.codes)}] {code}", file=sys.stderr)
-        signals.append(_signals_one(code, config, bench_cache, db_paths, ema_period, args.count))
+        # 单层逐只边界：任一只异常只记错并继续，不拖垮整批（与 sepa_screener.run_l2 同口径）
+        try:
+            signals.append(_signals_one(code, config, bench_cache, db_paths, ema_period, args.count))
+        except Exception as e:  # noqa: BLE001
+            signals.append({"code": code, "error": f"信号计算异常: {e}"})
     return {"count": len(signals), "signals": signals}
 
 

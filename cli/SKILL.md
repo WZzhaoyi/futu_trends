@@ -175,7 +175,7 @@ web [--port <PORT>]
 "l2": {
   "ok": true, "close": 440.2, "bars": 400, "bars_dropped": 0,
   "trend_template_pass": true,
-  "ma200_slope_pct": 6.3, "ma200_uptrend": true,
+  "ema200_slope_pct": 6.3, "ema200_uptrend": true,
   "dist_from_low52_pct": 41.8, "dist_from_high52_pct": -11.5,
   "rs_proxy": { "approx": true, "note": "...", "excess_3m": -15.7,
                 "excess_6m": -20.4, "excess_12m": 19.4, "low_confidence": false },
