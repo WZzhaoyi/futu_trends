@@ -24,11 +24,11 @@ futu_trends 统一功能导出 CLI（只读，面向终端 / 上层 agent，输�
   运行：python -m cli <command> …   或   python cli/main.py <command> …
 
 与 gui/backend/api.py 共用同一逻辑底座（data / signal_analysis / tools / params_db /
-sepa_screener / indicator_service），但不依赖其 HTTP/FastAPI 外壳。
+fundamental_analysis screeners / indicator_service），但不依赖其 HTTP/FastAPI 外壳。
 
 == market-sense 子命令（输出 JSON）==
   kline   读 OHLCV（data.get_kline_data，源由 config 决定，缓存走绝对路径）
-  screen  条件选股 L1+L1.5+L2（sepa_screener.screen；启动预检 OpenD）
+  screen  条件选股（策略脚本条件 + Futu OpenD L1 + snapshot；可选 yfinance L2）
   signals 单/多只 → 经典指标(EMA/MACD/KD/RSI，ParamsDB 最优参数，缺则回退默认)
           + detect(best_params/meta/performance) + L2(trend-template/200MA/RS/VCP)
 
@@ -44,14 +44,21 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import copy
 import json
 import logging
+import math
 import sys
 from pathlib import Path
 
-# --- 路径引导：根 + market_analysis（绕过其包 __init__）+ 本目录 ---
+# --- 路径引导：根 + fundamental_analysis + market_analysis + 本目录 ---
 _ROOT = Path(__file__).resolve().parents[1]
-for _p in (str(_ROOT), str(_ROOT / "market_analysis"), str(Path(__file__).resolve().parent)):
+for _p in (
+    str(_ROOT),
+    str(_ROOT / "fundamental_analysis"),
+    str(_ROOT / "market_analysis"),
+    str(Path(__file__).resolve().parent),
+):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
@@ -61,14 +68,28 @@ logging.getLogger("FTConsoleLog").setLevel(logging.WARNING)  # 防 InitConnect �
 
 from data import get_kline_data  # noqa: E402
 from tools import EMA  # noqa: E402
-import sepa_screener as sc  # noqa: E402  (直 import，绕过 market_analysis/__init__ 的无关加载)
+import futu_fundamental_screener as fs  # noqa: E402
+import deep_value_screener as deep_value_strategy  # noqa: E402
+import growth_value_screener as growth_value_strategy  # noqa: E402
 import indicator_service as isvc  # noqa: E402
+import quality_screener as quality_strategy  # noqa: E402
+import sepa_screener as sepa_strategy  # noqa: E402
 
 DEFAULT_COUNT = 400
 DEFAULT_EMA_PERIOD = 240
+_REFINE_SOURCE = "yfinance"
+_KLINE_COUNT = 400
+_DROP_RATIO_WARN = 0.03
 
 # 代码前缀 → screen/benchmark 用的市场键
 _MARKET_OF = {"US": "US", "HK": "HK", "SH": "A", "SZ": "A"}
+_BENCHMARK_YF = {"US": "^GSPC", "HK": "^HSI", "A": "000510.SS"}
+_SCREEN_STRATEGIES = {
+    "sepa": sepa_strategy,
+    "growth_value": growth_value_strategy,
+    "quality": quality_strategy,
+    "deep_value": deep_value_strategy,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +148,7 @@ def _last(values) -> float | None:
 
 def _emit(result: dict, out_path: str | None, pretty: bool) -> None:
     """统一出口：sanitize → 写文件 / 打印 stdout。"""
-    result = sc._sanitize(result)
+    result = fs.sanitize(result)
     text = json.dumps(result, ensure_ascii=False, indent=2 if pretty else None)
     if out_path:
         Path(out_path).write_text(text, encoding="utf-8")
@@ -168,7 +189,180 @@ def cmd_screen(args, config) -> dict:
         host = config.get("CONFIG", "FUTU_HOST", fallback="127.0.0.1")
         port = config.get("CONFIG", "FUTU_PORT", fallback="11111")
         sys.exit(f"OpenD 不可达（{host}:{port}）。screen 需要 futu OpenD 运行。")
-    return sc.screen(args.market, config, refine=not args.no_refine)
+    strategy = _SCREEN_STRATEGIES[args.strategy]
+    return fs.screen(
+        strategy, args.market, config,
+        snapshot=not args.no_snapshot,
+        limit=args.limit,
+        refine=args.refine,
+        refine_limit=args.refine_limit,
+        refine_sleep=args.refine_sleep,
+    )
+
+
+class _TrendParams:
+    ema_fast = 50
+    ema_mid = 150
+    ema_slow = 200
+    low52_min = 30.0
+    high52_min = -30.0
+
+
+def _refine_config(config, market: str):
+    cfg = copy.deepcopy(config)
+    cfg.set("CONFIG", "FUTU_PUSH_TYPE", "K_DAY")
+    if market == "A":
+        cfg.set("CONFIG", "DATA_SOURCE_SH", _REFINE_SOURCE)
+        cfg.set("CONFIG", "DATA_SOURCE_SZ", _REFINE_SOURCE)
+    else:
+        cfg.set("CONFIG", f"DATA_SOURCE_{market}", _REFINE_SOURCE)
+    return cfg
+
+
+def _clean_ohlcv(df):
+    import pandas as pd
+
+    df = df.copy()
+    for col in ("open", "high", "low", "close", "volume"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    mask = pd.Series(True, index=df.index)
+    for col in ("open", "high", "low", "close"):
+        mask &= (df[col] > 0) & (df[col] < float("inf"))
+    df = df[mask]
+    df["volume"] = df["volume"].fillna(0).clip(lower=0)
+    return df
+
+
+def _ma_slope(ma, lookback: int = 21) -> float | None:
+    ma = ma.dropna()
+    if len(ma) <= lookback or ma.iloc[-1 - lookback] == 0:
+        return None
+    return float((ma.iloc[-1] - ma.iloc[-1 - lookback]) / ma.iloc[-1 - lookback] * 100)
+
+
+def _period_return(close, bars: int) -> float | None:
+    if close is None or len(close) <= bars:
+        return None
+    latest, base = close.iloc[-1], close.iloc[-1 - bars]
+    if not math.isfinite(float(latest)) or not math.isfinite(float(base)) or base == 0:
+        return None
+    return float((latest / base - 1) * 100)
+
+
+def _rs_proxy(close, bench) -> dict:
+    out = {"approx": True, "note": "excess return vs single benchmark index"}
+    for name, bars in {"3m": 63, "6m": 126, "12m": 252}.items():
+        sret = _period_return(close, bars)
+        bret = _period_return(bench, bars) if bench is not None else None
+        out[f"excess_{name}"] = round(sret - bret, 2) if sret is not None and bret is not None else None
+    return out
+
+
+def _vcp_heuristic(df, window: int = 8) -> dict:
+    close, high, low, vol = df["close"], df["high"], df["low"], df["volume"]
+    n = len(close)
+    if n < window * 4:
+        return {"heuristic": True, "ok": False, "note": "数据不足"}
+
+    high_v = high.to_numpy(dtype=float)
+    low_v = low.to_numpy(dtype=float)
+    vol_v = vol.to_numpy(dtype=float)
+    roll_max = high.rolling(window, center=True).max().to_numpy()
+    roll_min = low.rolling(window, center=True).min().to_numpy()
+    peaks = [i for i in range(n) if high_v[i] == roll_max[i]]
+    troughs = [i for i in range(n) if low_v[i] == roll_min[i]]
+
+    depths = []
+    for peak in peaks[-5:]:
+        later = [trough for trough in troughs if trough > peak]
+        if later and high_v[peak] > 0:
+            depth = (high_v[peak] - low_v[later[0]]) / high_v[peak] * 100
+            if depth > 0:
+                depths.append(round(float(depth), 2))
+    depths = depths[-4:]
+
+    base_vol = vol_v[-window * 4:-window].mean()
+    recent_vol = vol_v[-window:].mean()
+    return {
+        "heuristic": True,
+        "num_contractions": len(depths),
+        "contraction_depths_pct": depths,
+        "depths_decreasing": bool(
+            len(depths) >= 2 and all(a >= b for a, b in zip(depths, depths[1:]))
+        ),
+        "volume_contracting": bool(base_vol and recent_vol < base_vol),
+        "pivot": round(float(high_v[-window * 2:].max()), 4),
+    }
+
+
+def _fetch_benchmark(market: str, config):
+    import pandas as pd
+    import yfinance as yf
+    from data import setup_global_proxy, _proxy_configured
+
+    if not _proxy_configured:
+        proxy = config.get("CONFIG", "PROXY", fallback=None)
+        if proxy:
+            setup_global_proxy(proxy)
+    try:
+        hist = yf.Ticker(_BENCHMARK_YF[market]).history(period="2y")
+        if hist.empty:
+            return None
+        series = hist["Close"].dropna().copy()
+        series.index = pd.to_datetime(series.index)
+        if series.index.tz is not None:
+            series.index = series.index.tz_localize(None)
+        return series
+    except Exception as exc:  # noqa: BLE001
+        print(f"[warn] 基准 {_BENCHMARK_YF[market]} 取数失败，RS 降级: {exc}",
+              file=sys.stderr)
+        return None
+
+
+def _refine_trend_one(code: str, market: str, cfg, bench) -> dict:
+    p = _TrendParams()
+    df = get_kline_data(code, cfg, max_count=_KLINE_COUNT)
+    if df is None or df.empty:
+        return {"ok": False, "note": "取数失败或无数据"}
+
+    n_raw = len(df)
+    df = _clean_ohlcv(df)
+    dropped = n_raw - len(df)
+    if len(df) < p.ema_slow:
+        return {"ok": False, "note": f"清洗后有效K线不足({len(df)}<{p.ema_slow})"}
+
+    close = df["close"]
+    ema_f = close.ewm(span=p.ema_fast, adjust=False).mean()
+    ema_m = close.ewm(span=p.ema_mid, adjust=False).mean()
+    ema_s = close.ewm(span=p.ema_slow, adjust=False).mean()
+    last = close.iloc[-1]
+    hi52, lo52 = close.tail(252).max(), close.tail(252).min()
+    slope = _ma_slope(ema_s)
+    template_pass = bool(
+        last > ema_f.iloc[-1] > ema_m.iloc[-1] > ema_s.iloc[-1]
+        and slope is not None and slope > 0
+        and lo52 and (last - lo52) / lo52 * 100 >= p.low52_min
+        and hi52 and (last - hi52) / hi52 * 100 >= p.high52_min
+    )
+
+    rs = _rs_proxy(close, bench)
+    if dropped and dropped / n_raw > _DROP_RATIO_WARN:
+        rs["low_confidence"] = True
+        rs["note"] += f"；删行 {dropped}/{n_raw} 较多，RS 可能漂移"
+
+    return {
+        "ok": True,
+        "close": round(float(last), 4),
+        "bars": len(df),
+        "bars_dropped": dropped,
+        "trend_template_pass": template_pass,
+        "ema200_slope_pct": round(slope, 2) if slope is not None else None,
+        "ema200_uptrend": bool(slope is not None and slope > 0),
+        "dist_from_low52_pct": round(float((last - lo52) / lo52 * 100), 2) if lo52 else None,
+        "dist_from_high52_pct": round(float((last - hi52) / hi52 * 100), 2) if hi52 else None,
+        "rs_proxy": rs,
+        "vcp": _vcp_heuristic(df),
+    }
 
 
 def _signals_one(code: str, config, bench_cache: dict, db_paths: dict,
@@ -180,15 +374,15 @@ def _signals_one(code: str, config, bench_cache: dict, db_paths: dict,
         out["error"] = "未知市场前缀"
         return out
 
-    rcfg = sc._refine_config(config, market)  # 固定 yfinance + 日 K
+    rcfg = _refine_config(config, market)  # 固定 yfinance + 日 K
     if market not in bench_cache:
-        bench_cache[market] = sc._fetch_benchmark(market, config)
+        bench_cache[market] = _fetch_benchmark(market, config)
     bench = bench_cache[market]
 
     # K 线（与 L2 同一内存缓存键，单次网络拉取复用）
     df = get_kline_data(code, rcfg, max_count=count)
     if df is not None and not df.empty:
-        df = sc._clean_ohlcv(df)  # 与段2同源清洗：剔除 NaN/Inf/≤0 行，经典指标口径对齐 L2
+        df = _clean_ohlcv(df)  # 与 L2 同源清洗：剔除 NaN/Inf/≤0 行
 
     indicators: dict = {}
     if df is not None and not df.empty:
@@ -219,7 +413,7 @@ def _signals_one(code: str, config, bench_cache: dict, db_paths: dict,
 
     out["indicators"] = indicators
     out["detect"] = isvc.read_detect(code, db_paths)
-    out["l2"] = sc.refine_one({"code": code, "market": market}, rcfg, bench, sc.ScreenParams())["l2"]
+    out["l2"] = _refine_trend_one(code, market, rcfg, bench)
     return out
 
 
@@ -230,7 +424,7 @@ def cmd_signals(args, config) -> dict:
     signals = []
     for i, code in enumerate(args.codes, 1):
         print(f"[signals {i}/{len(args.codes)}] {code}", file=sys.stderr)
-        # 单层逐只边界：任一只异常只记错并继续，不拖垮整批（与 sepa_screener.run_l2 同口径）
+        # 单只异常只记错并继续，不拖垮整批。
         try:
             signals.append(_signals_one(code, config, bench_cache, db_paths, ema_period, args.count))
         except Exception as e:  # noqa: BLE001
@@ -274,9 +468,17 @@ def _build_parser() -> argparse.ArgumentParser:
     pk.add_argument("--ktype", help="覆盖 K 线周期，如 K_DAY/K_60M（缺省用 config）")
     pk.set_defaults(func=cmd_kline)
 
-    ps = sub.add_parser("screen", parents=[common], help="条件选股 L1+L1.5+L2")
-    ps.add_argument("--market", required=True, choices=list(sc.MARKETS), help="US / HK / A")
-    ps.add_argument("--no-refine", action="store_true", help="只跑 L1+L1.5（0 配额，不进段2）")
+    ps = sub.add_parser("screen", parents=[common], help="条件选股")
+    ps.add_argument("--market", required=True, choices=list(fs.MARKETS), help="US / HK / A")
+    ps.add_argument("--strategy", default="sepa", choices=list(_SCREEN_STRATEGIES),
+                    help="筛选策略；默认 sepa")
+    ps.add_argument("--limit", type=int, help="按 snapshot_score 排序后的输出数量")
+    ps.add_argument("--no-snapshot", action="store_true", help="只跑 get_stock_filter")
+    ps.add_argument("--refine", action="store_true", help="对候选运行 yfinance L2 精算")
+    ps.add_argument("--refine-limit", type=int, default=fs.YFINANCE_REFINE_LIMIT,
+                    help=f"最多精算前多少只，不截断返回列表；默认 {fs.YFINANCE_REFINE_LIMIT}")
+    ps.add_argument("--refine-sleep", type=float, default=fs.YFINANCE_SLEEP_SEC,
+                    help=f"yfinance 单只间隔秒数；默认 {fs.YFINANCE_SLEEP_SEC}")
     ps.set_defaults(func=cmd_screen)
 
     pg = sub.add_parser("signals", parents=[common], help="单/多只指标信号 + detect + L2")

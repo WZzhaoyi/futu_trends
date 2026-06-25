@@ -2,13 +2,13 @@
 name: futu-trends-cli
 description: >
   futu_trends 统一功能导出 CLI 的调用契约。只读，输出严格 JSON 到 stdout。
-  当需要读取股票 K 线、做条件选股（趋势模板/SEPA）、或计算单只标的的技术指标与
+  当需要读取股票 K 线、做条件选股（SEPA/quality/growth_value/deep_value）、或计算单只标的的技术指标与
   趋势信号（MACD/KD/RSI/trend-template/RS/VCP）时调用。market-sense 为当前唯一功能域。
 ---
 
 # futu-trends-cli
 
-futu_trends 项目对外的统一命令入口。三个只读子命令 `kline` / `screen` / `signals`，
+futu_trends 项目对外的统一命令入口。只读子命令 `kline` / `screen` / `signals` / `web`，
 全部输出**严格 JSON（无 NaN/Inf）到 stdout**，进度与告警走 stderr。
 
 ## 调用方式
@@ -47,7 +47,7 @@ def call_cli(*args) -> dict:
     return json.loads(p.stdout)     # stdout 永远是单个严格 JSON（无 NaN/Inf/日志混入）
 
 sig = call_cli("signals", "--code", "US.AAPL")
-scr = call_cli("screen", "--market", "US")
+scr = call_cli("screen", "--market", "US", "--strategy", "sepa")
 ```
 
 > ENV_PYTHON / REPO / ABS_CONFIG 由调用方从配置或环境变量注入，不要写死本地路径。
@@ -73,8 +73,8 @@ scr = call_cli("screen", "--market", "US")
 | `EMA_PERIOD` | `signals` 的 EMA 周期（默认 240） | 否 |
 | `MACD_PARAMS_DB` / `KD_PARAMS_DB` / `RSI_PARAMS_DB` | ParamsDB 路径，供 `signals` 取最优参数 + detect | 否 |
 
-> `screen` 段 2 与 `signals` 一律走 **yfinance**（免 futu 历史 K 线配额），不需 OpenD；
-> 仅 `screen` 段 1/1.5 需要 OpenD（服务端选股 + 快照，均 0 历史 K 线配额）。
+> `screen` 默认只跑 OpenD 服务端选股 + snapshot 富集；传 `--refine` 后，L2 走 **yfinance**。
+> `signals` 的趋势 L2 走 **yfinance**。`screen` 的 L1/snapshot 需要 OpenD。
 
 调用方自备一份精简 config（只需 `[CONFIG]` 段 + 下列键，其余项一概不用写）。
 占位 `<...>` 由部署方按本地环境填写：
@@ -128,21 +128,30 @@ kline --code US.AAPL --count 400 [--ktype K_DAY]
 ```
 失败：`{"code": "...", "bars": [], "error": "无数据或取数失败"}`
 
-### 2) `screen` — 条件选股（L1 服务端首筛 + L1.5 快照排序 + L2 本地精算）
+### 2) `screen` — 条件选股（策略条件 + L1 服务端首筛 + snapshot 排序 + 可选 L2）
 ```bash
-screen --market US|HK|A [--no-refine]
+screen --market US|HK|A [--strategy sepa|growth_value|quality|deep_value] [--limit N] [--refine]
 ```
-- `--no-refine`：只出 L1+L1.5（0 配额，含成交额排序，不进段 2）。
+- `--strategy`：默认 `sepa`；也可选 `growth_value`、`quality`、`deep_value`。
+- `--limit`：按 `snapshot_score` 排序后只返回前 N 只。
+- `--no-snapshot`：只跑 `get_stock_filter`，不做 snapshot 富集/排序。
+- `--refine`：对候选运行 yfinance L2 精算。
+- `--refine-limit`：最多精算前多少只，默认 30；不截断最终返回列表。
+- `--refine-sleep`：yfinance 单只间隔秒数，默认 1.2。
 ```json
-{ "market": "HK", "l1_count": 26, "quota_used": 0, "l2_refined": 26,
+{ "market": "HK", "strategy": "sepa", "l1_count": 26,
+  "snapshot_enriched": true, "l2_refined": 0, "returned": 26,
   "candidates": [
     { "code": "HK.00981", "name": "中芯国际", "market": "HK",
-      "market_val": 1.5e11, "dist_from_low52": 35.3, "dist_from_high52": -21.2,
-      "eps_growth": 42.8, "rev_growth": 63.1,
-      "turnover": 1.55e10, "turnover_rate": 3.38, "volume_ratio": 2.24,
-      "l2": { /* 见下，--no-refine 时无此字段 */ } }, ... ] }
+      "market_val": 1.5e11, "eps_growth_rate": 42.8,
+      "sum_of_business_growth": 63.1,
+      "snapshot": { "turnover": 1.55e10, "turnover_rate": 3.38, "volume_ratio": 2.24 },
+      "snapshot_metrics": { "turnover": 1.55e10, "snapshot_score": 1.55e10 },
+      "l2": { /* 见下，只有 --refine 时有此字段 */ } }, ... ] }
 ```
-候选按 `turnover`（成交额）**降序**。`quota_used` 恒为 0（L1/L1.5 不计历史 K 线配额，L2 走 yfinance）。
+候选按 `snapshot_score` **降序**。`sepa` 的 `snapshot_score` 是成交额；基本面策略的
+`snapshot_score` 是各策略脚本定义的估值/质量/流动性综合分。
+`--market A` 会合并沪深两市服务端筛选结果。
 
 ### 3) `signals` — 单/多只指标信号 + detect + L2
 ```bash
@@ -169,7 +178,13 @@ web [--port <PORT>]
 子进程前台启动 gui/backend/api.py 的页面 + `/api/*` 接口，运行至中断（非 stdout-JSON）。
 面向人工/浏览器，agent 自动化一般不调用此命令。缺 `--port` 时端口自动选（8001 起，打印 `API_PORT=`）。
 
-## L2 信号块（`screen` 候选与 `signals` 共用）
+## L2 信号块
+
+`signals` 的 L2 是趋势模板/RS/VCP 信号；`screen --refine` 的 L2 则由策略决定：
+`deep_value` 输出现金/负债精算，`growth_value` / `quality` 默认输出 yfinance 质量与
+Piotroski-like 精算。
+
+### `signals` L2 趋势信号
 
 ```json
 "l2": {
@@ -183,7 +198,23 @@ web [--port <PORT>]
            "contraction_depths_pct": [12.5,11.5,11.3,8.5],
            "depths_decreasing": true, "volume_contracting": true, "pivot": 484.8 } }
 ```
-数据不足/取数失败：`"l2": {"ok": false, "note": "清洗后有效K线不足(...)"}`
+数据不足/取数失败：`"l2": {"ok": false, "note": "清洗后有效K线不足(...)"}`。
+
+### `screen --refine` L2 财报精算示例
+
+```json
+"l2": {
+  "ok": true,
+  "yf_code": "1765.HK",
+  "cash_and_equivalents": 2770782000.0,
+  "total_liabilities": 12415062000.0,
+  "net_cash": -9644280000.0,
+  "cash_to_market_cap": 2.51,
+  "condition_cash_minus_liabilities_gt_market_cap": false
+}
+```
+
+财务表为空/字段缺失：`"l2": {"ok": false, "note": "income_stmt or balance_sheet is empty"}`。
 
 **口径约束（策略侧不得当真值）**：
 - `rs_proxy` 标 `approx: true`——是 vs 单一基准指数的超额收益，非 IBD 百分位；
@@ -194,6 +225,6 @@ web [--port <PORT>]
 
 ## 不变量（契约保证）
 1. stdout 永远是单个严格 JSON 对象（无日志混入、无 NaN/Inf）。
-2. `kline`/`signals` 不需要 OpenD；`screen` 需要，OpenD 不可达时 stderr 报错 + 退出码 1。
+2. `kline`/`signals` 不需要 OpenD；`screen` 的 L1/snapshot 需要，OpenD 不可达时 stderr 报错 + 退出码 1。
 3. 只读：不下单、不改自选、不写交易。
 4. `--config` 传绝对路径即 CWD 无关；缓存写入 `CACHE_DIR`（绝对路径）。
