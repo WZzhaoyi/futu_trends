@@ -26,6 +26,7 @@ from socket import gaierror
 import time
 import os
 import json
+from urllib.parse import quote
 from requests_html import HTMLSession
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -36,6 +37,52 @@ from futu_group import sync_futu_group
 from .webhook import WebhookNotifier, HookResult
 
 logger = logging.getLogger(__name__)
+
+
+def _column_letter_to_index(column_letter):
+    column_index = 0
+    for char in column_letter:
+        column_index = column_index * 26 + (ord(char) - ord('A') + 1)
+    return column_index - 1
+
+
+def _column_index_to_letter(column_index):
+    letters = []
+    column_index += 1
+    while column_index:
+        column_index, remainder = divmod(column_index - 1, 26)
+        letters.append(chr(ord('A') + remainder))
+    return ''.join(reversed(letters))
+
+
+def _calendar_sheet_position(cell_origin):
+    match = re.match(r'^([A-Z]+)(\d+)$', cell_origin)
+    if not match:
+        raise ValueError("Invalid cell origin format, expected like 'B2'")
+
+    start_col_letter, start_row = match.groups()
+    start_row = int(start_row)
+    today = date.today()
+    sheet_name = today.strftime('%y-%m')
+
+    start_col = _column_letter_to_index(start_col_letter)
+    first_day_of_month = datetime(today.year, today.month, 1)
+    first_weekday = first_day_of_month.weekday() # （0=周一，6=周日）
+    day, weekday = today.day, today.weekday()
+    week = (day + first_weekday) // 7
+    col_offset = (weekday + 1) % 7
+    target_col = _column_index_to_letter(start_col + col_offset)
+    target_row = start_row + week + 1
+    header_end_col = _column_index_to_letter(start_col + 6)
+
+    return {
+        "sheet_name": sheet_name,
+        "start_col_letter": start_col_letter,
+        "start_row": start_row,
+        "header_end_col": header_end_col,
+        "target_col": target_col,
+        "target_row": target_row,
+    }
 
 
 def _valid_target_prices(recent_high, recent_low):
@@ -81,6 +128,15 @@ class NotificationEngine:
         self.google_sheet_id = config.get("CONFIG", "GOOGLE_SHEET_ID", fallback="")
         self.google_api_json = config.get("CONFIG", "GOOGLE_API_JSON", fallback="")
         self.google_sheet_cell_origin = config.get("CONFIG", "GOOGLE_SHEET_CELL_ORIGIN", fallback="B2")
+
+        # Feishu Sheet configuration
+        self.feishu_app_id = config.get("CONFIG", "FEISHU_APP_ID", fallback="")
+        self.feishu_app_secret = config.get("CONFIG", "FEISHU_APP_SECRET", fallback="")
+        self.feishu_static_tenant_access_token = config.get("CONFIG", "FEISHU_TENANT_ACCESS_TOKEN", fallback="")
+        self.feishu_spreadsheet_token = config.get("CONFIG", "FEISHU_SPREADSHEET_TOKEN", fallback="")
+        self.feishu_sheet_cell_origin = config.get("CONFIG", "FEISHU_SHEET_CELL_ORIGIN", fallback=self.google_sheet_cell_origin)
+        self._feishu_tenant_access_token = ""
+        self._feishu_token_expires_at = 0
 
         # Webhook configuration
         self._webhook = WebhookNotifier(config)
@@ -240,6 +296,151 @@ class NotificationEngine:
                 time.sleep(1)
         return None
 
+    def _safe_feishu_request(self, method, url, *, headers=None, **kwargs):
+        """执行飞书 OpenAPI 请求，带重试和业务错误检查"""
+        headers = headers or {}
+        for attempt in range(3):
+            try:
+                response = self.SESSION.request(
+                    method,
+                    url,
+                    headers=headers,
+                    proxies=self.PROXIES,
+                    timeout=30,
+                    **kwargs,
+                )
+                response.raise_for_status()
+                data = response.json()
+                if data.get("code", 0) != 0:
+                    raise RuntimeError(f"{data.get('code')}: {data.get('msg')}")
+                return data
+            except Exception as e:
+                if attempt == 2:
+                    raise e
+                time.sleep(1)
+        return None
+
+    def _get_feishu_tenant_access_token(self):
+        if self.feishu_static_tenant_access_token:
+            return self.feishu_static_tenant_access_token
+
+        if not all([self.feishu_app_id, self.feishu_app_secret]):
+            raise ValueError("Feishu app_id/app_secret 未配置")
+
+        now = time.time()
+        if self._feishu_tenant_access_token and now < self._feishu_token_expires_at:
+            return self._feishu_tenant_access_token
+
+        data = self._safe_feishu_request(
+            "POST",
+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            json={
+                "app_id": self.feishu_app_id,
+                "app_secret": self.feishu_app_secret,
+            },
+        )
+        self._feishu_tenant_access_token = data.get("tenant_access_token", "")
+        expire = int(data.get("expire", 7200))
+        self._feishu_token_expires_at = now + max(expire - 300, 60)
+        return self._feishu_tenant_access_token
+
+    def _feishu_headers(self):
+        return {
+            "Authorization": f"Bearer {self._get_feishu_tenant_access_token()}",
+            "Content-Type": "application/json; charset=utf-8",
+        }
+
+    def _get_feishu_sheets(self):
+        data = self._safe_feishu_request(
+            "GET",
+            f"https://open.feishu.cn/open-apis/sheets/v3/spreadsheets/{self.feishu_spreadsheet_token}/sheets/query",
+            headers=self._feishu_headers(),
+        )
+        return data.get("data", {}).get("sheets", [])
+
+    def _create_feishu_sheet(self, title):
+        data = self._safe_feishu_request(
+            "POST",
+            f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/{self.feishu_spreadsheet_token}/sheets_batch_update",
+            headers=self._feishu_headers(),
+            json={
+                "requests": [
+                    {
+                        "addSheet": {
+                            "properties": {
+                                "title": title,
+                            }
+                        }
+                    }
+                ]
+            },
+        )
+
+        for reply in data.get("data", {}).get("replies", []):
+            properties = reply.get("addSheet", {}).get("properties", {})
+            if properties.get("title") == title and properties.get("sheetId"):
+                return properties["sheetId"]
+        raise RuntimeError(f"Feishu sheet 创建成功但未返回 sheetId: {title}")
+
+    def _write_feishu_values(self, cell_range, values):
+        self._safe_feishu_request(
+            "PUT",
+            f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/{self.feishu_spreadsheet_token}/values",
+            headers=self._feishu_headers(),
+            json={
+                "valueRange": {
+                    "range": cell_range,
+                    "values": values,
+                }
+            },
+        )
+
+    def _read_feishu_value(self, cell_range):
+        encoded_range = quote(cell_range, safe="")
+        data = self._safe_feishu_request(
+            "GET",
+            f"https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/{self.feishu_spreadsheet_token}/values/{encoded_range}",
+            headers=self._feishu_headers(),
+            params={
+                "valueRenderOption": "ToString",
+                "dateTimeRenderOption": "FormattedString",
+            },
+        )
+        values = data.get("data", {}).get("valueRange", {}).get("values", [])
+        if not values or not values[0]:
+            return ""
+        return str(values[0][0])
+
+    def send_feishu_sheet_message(self, message):
+        """更新飞书电子表格"""
+        if not all([self.feishu_spreadsheet_token, self.feishu_sheet_cell_origin]):
+            logger.warning('飞书电子表格配置不完整，跳过发送')
+            return
+
+        try:
+            position = _calendar_sheet_position(self.feishu_sheet_cell_origin)
+            sheet_name = position["sheet_name"]
+
+            sheets = self._get_feishu_sheets()
+            sheet_id = next((sheet.get("sheet_id") for sheet in sheets if sheet.get("title") == sheet_name), "")
+            if not sheet_id:
+                sheet_id = self._create_feishu_sheet(sheet_name)
+                header_range = (
+                    f'{sheet_id}!{position["start_col_letter"]}{position["start_row"]}:'
+                    f'{position["header_end_col"]}{position["start_row"]}'
+                )
+                self._write_feishu_values(header_range, [['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']])
+
+            target_cell = f'{sheet_id}!{position["target_col"]}{position["target_row"]}:{position["target_col"]}{position["target_row"]}'
+            existing_content = self._read_feishu_value(target_cell)
+            updated_content = f"{existing_content}\n\n{message}" if existing_content else message
+            self._write_feishu_values(target_cell, [[updated_content]])
+            logger.info('Feishu Sheet Updated: %s at %s (%s)', self.feishu_spreadsheet_token, target_cell, sheet_name)
+
+        except Exception as e:
+            logger.error('飞书电子表格操作失败: %s', e)
+
     def send_google_sheet_message(self, message):
         """更新Google Sheet"""
         if not all([self.google_sheet_id, os.path.exists(self.google_api_json), self.google_sheet_cell_origin]):
@@ -270,25 +471,12 @@ class NotificationEngine:
             http = AuthorizedHttp(creds, http_client)
             service = build('sheets', 'v4', http=http)
 
-            # 解析网格原点和日期
-            match = re.match(r'([A-Z]+)(\d+)', self.google_sheet_cell_origin)
-            if not match:
-                raise ValueError("Invalid grid_origin format, expected like 'B2'")
-
-            start_col_letter, start_row = match.groups()
-            start_row = int(start_row)
-            today = date.today()
-            cell_sheet_name = today.strftime('%y-%m')
-
-            # 计算目标单元格位置
-            start_col = ord(start_col_letter[0]) - ord('A')
-            first_day_of_month = datetime(today.year, today.month, 1)
-            first_weekday = first_day_of_month.weekday() # （0=周一，6=周日）
-            day, weekday = today.day, today.weekday()
-            week = (day + first_weekday) // 7
-            col_offset = (weekday + 1) % 7
-            target_col = chr(ord('A') + start_col + col_offset)
-            target_row = start_row + week + 1
+            position = _calendar_sheet_position(self.google_sheet_cell_origin)
+            start_col_letter = position["start_col_letter"]
+            start_row = position["start_row"]
+            cell_sheet_name = position["sheet_name"]
+            target_col = position["target_col"]
+            target_row = position["target_row"]
             target_cell = f'{cell_sheet_name}!{target_col}{target_row}'
 
             # 确保工作表存在
@@ -302,7 +490,7 @@ class NotificationEngine:
                 )
 
                 # 设置表头
-                header_range = f'{cell_sheet_name}!{start_col_letter}{start_row}:{chr(ord(start_col_letter)+6)}{start_row}'
+                header_range = f'{cell_sheet_name}!{start_col_letter}{start_row}:{position["header_end_col"]}{start_row}'
                 self._safe_execute(
                     service.spreadsheets().values().update,
                     spreadsheetId=self.google_sheet_id,

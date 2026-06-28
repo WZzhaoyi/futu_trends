@@ -418,3 +418,5 @@ if __name__ == "__main__":
         filter_msg = '{} {} {}:\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group if group else '', push_type, '\n'.join(filter_df['msg']))
         # google sheet
         notification.send_google_sheet_message(filter_msg)
+        # feishu sheet
+        notification.send_feishu_sheet_message(filter_msg)
