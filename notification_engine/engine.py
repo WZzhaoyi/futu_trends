@@ -94,6 +94,16 @@ def _valid_target_prices(recent_high, recent_low):
     return recent_high > 0 and recent_low > 0 and recent_high != recent_low
 
 
+def _feishu_cell_value_to_text(values):
+    if not values or not values[0]:
+        return ""
+
+    value = values[0][0]
+    if value is None:
+        return ""
+    return str(value)
+
+
 class NotificationEngine:
 
     def __init__(self, config:configparser.ConfigParser):
@@ -408,9 +418,7 @@ class NotificationEngine:
             },
         )
         values = data.get("data", {}).get("valueRange", {}).get("values", [])
-        if not values or not values[0]:
-            return ""
-        return str(values[0][0])
+        return _feishu_cell_value_to_text(values)
 
     def send_feishu_sheet_message(self, message):
         """更新飞书电子表格"""
