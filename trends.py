@@ -8,23 +8,35 @@ from ft_config import get_config
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 from data import get_kline_data
 from params_db import ParamsDB
-from signal_analysis import get_target_price, MACD, KD, RSI, default_stock_params  # 默认参数单一来源
+from signal_analysis import get_target_price, MACD, KD, RSI, SupportResistance, default_stock_params  # 默认参数单一来源
 import datetime
 import configparser
 import time
 from notification_engine import NotificationEngine
 from decimal import Decimal, ROUND_HALF_UP
 import pandas as pd
-from tools import EMA, MA, calc_momentum, calc_returns_score, code_in_futu_group
+from tools import MA, calc_momentum, calc_returns_score, code_in_futu_group
 
 PARAMS_CACHE_TTL_SECONDS = 6 * 60 * 60
 _params_cache = {}
+
+SR_BULLISH_SIGNALS = {'breakout resistance', 'support hold'}
+SR_BEARISH_SIGNALS = {'breakdown support', 'resistance reject'}
+SR_SIGNAL_LABELS = {
+    'breakout resistance': 'breakout',
+    'breakdown support': 'breakdown',
+    'support hold': 'hold',
+    'resistance reject': 'reject',
+}
 
 
 def _get_cached_stock_params(db_path: str | None, code: str):
     if db_path is None:
         return None
 
+    db_path = db_path.split(',')[0].strip()
+    if not db_path:
+        return None
     cache_key = (os.path.abspath(db_path), code)
     now = time.time()
     cached = _params_cache.get(cache_key)
@@ -43,6 +55,24 @@ def round_decimal(value, places=2):
     if isinstance(value, float):
         value = str(value)  # 将 float 转换为字符串以避免精度损失
     return Decimal(value).quantize(Decimal(f'0.{"0" * places}'), rounding=ROUND_HALF_UP)
+
+
+def _is_sr_bullish_signal(sr_signal: str, reversal: str) -> bool:
+    if sr_signal in SR_BULLISH_SIGNALS:
+        return True
+    if sr_signal in SR_BEARISH_SIGNALS:
+        return False
+    return reversal == 'support reversal'
+
+
+def _format_sr_level(last_row: pd.Series, side: str) -> str:
+    level = last_row.get(f'{side}_level')
+    if pd.isna(level):
+        return ''
+
+    strength = last_row.get(f'{side}_strength', 0)
+    strength_msg = f' x{float(strength):.2f}' if pd.notna(strength) and float(strength) >= 1 else ''
+    return f' {round_decimal(float(level))}{strength_msg}'
 
 def inside_MA(close, last_low, last_high): # 计算MA5,10,15中的最小值和最大值 对比是否区间重叠
     last_index = close.size - 1
@@ -139,32 +169,36 @@ def is_continue(df:pd.DataFrame, code:str, config:configparser.ConfigParser)->st
         msg += u'📉'
     return None if msg == '' else msg
 
-def is_breakout(df:pd.DataFrame, code:str, config:configparser.ConfigParser)->str|None:# K线突破/跌破均线
+def is_breakout(df:pd.DataFrame, code:str, config:configparser.ConfigParser)->str|None:# 支撑阻力突破/跌破/触位确认
     assert len(df) >= 90
-    N = 240
-    # 从数据库读取参数 默认N=240
-    db_path = config.get("CONFIG", "EMA_PARAMS_DB", fallback=None)
-    data = _get_cached_stock_params(db_path, code)
-    if data is not None:
-        N = data['best_params']['ema_period']
 
-    close = df['close']
-    close_ema = EMA(close, N)
-    last_close = round_decimal(close.iloc[-1])
-    last_ema = round_decimal(close_ema[-1])
-    prev_close = round_decimal(close.iloc[-2])
-    prev_ema = round_decimal(close_ema[-2])
-    prev_prev_ema = round_decimal(close_ema[-3])
-    msg = ''
-    if last_close > last_ema and prev_close <= prev_ema:
-        msg = f'breakthrough ema{N}📈'
-    elif last_close < last_ema and prev_close >= prev_ema:
-        msg = f'breakdown ema{N}📉'
-    elif prev_prev_ema < prev_ema and prev_ema > last_ema:
-        msg = f'decline ema{N}📉'
-    elif prev_prev_ema > prev_ema and prev_ema < last_ema:
-        msg = f'rise ema{N}📈'
-    return None if msg == '' else msg
+    db_path = config.get("CONFIG", "SR_PARAMS_DB", fallback=None)
+    data = _get_cached_stock_params(db_path, code)
+    if data is None:
+        print(f"No SR parameters found for {code}, using default parameters")
+        data = default_stock_params('SR')
+
+    params = data['best_params']
+    if not params:
+        print(f"No SR parameters found for {code}")
+        return None
+
+    # check 模式启用量能确认（SR 的确认只用当根量能，实盘可用），与研究口径一致
+    result = SupportResistance().calculate(df, params, mode='check')
+    last_row = result.iloc[-1]
+    sr_signal = last_row.get('sr_signal', 'none')
+    if sr_signal != 'none' and isinstance(sr_signal, str):
+        is_bullish = _is_sr_bullish_signal(sr_signal, last_row.get('reversal', 'none'))
+        side = 'resistance' if 'resistance' in sr_signal else 'support'
+        label = SR_SIGNAL_LABELS.get(sr_signal, sr_signal)
+        return f'SR {label}{_format_sr_level(last_row, side)}' + (u'📈' if is_bullish else u'📉')
+
+    messages = []
+    if bool(last_row.get('near_support', False)) and float(last_row.get('support_strength', 0) or 0) >= 1:
+        messages.append(f"SR near{_format_sr_level(last_row, 'support')}📈")
+    if bool(last_row.get('near_resistance', False)) and float(last_row.get('resistance_strength', 0) or 0) >= 1:
+        messages.append(f"SR near{_format_sr_level(last_row, 'resistance')}📉")
+    return ' | '.join(messages) if messages else None
 
 def is_top_down(df:pd.DataFrame, code:str, config:configparser.ConfigParser) -> str|None:# 顶部和底部
     assert len(df) >= 90
@@ -272,8 +306,8 @@ def check_trends(code_in_group: pd.DataFrame, config: configparser.ConfigParser)
 
             msg = f'{name}'
             for i in trend_type:
-                if i.lower() == 'ema':
-                    bo = is_breakout(df,futu_code,config) # 突破/跌破EMA均线
+                if i.lower() == 'sr':
+                    bo = is_breakout(df,futu_code,config) # 支撑阻力突破/跌破/触位确认
                     if bo is not None:
                         msg += f' | {bo}'
                 elif i.lower() == 'kd':

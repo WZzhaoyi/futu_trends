@@ -3,7 +3,15 @@ from multiprocessing import Pool, cpu_count
 import numpy as np
 from tqdm import tqdm
 from .tool import *
-from .indicators import RSI, Indicator, KD, MACD
+from .indicators import RSI, Indicator, KD, MACD, SupportResistance
+
+DEFAULT_OPTIMIZATION_RUNS = {
+    'KD': 20,
+    'MACD': 20,
+    'RSI': 20,
+    'SR': 5,
+}
+
 
 class Optimization:
     def __init__(self, df, indicator:Indicator, look_ahead, target_multiplier, atr_period, signal_count_target):
@@ -15,20 +23,19 @@ class Optimization:
         self.indicator = indicator
 
     def __call__(self, params):
-        df_with_signals = self.indicator.calculate(self.df.copy(), params, mode='train')
-        result = self.indicator.calculate_win_rate(df_with_signals, look_ahead=self.look_ahead, 
-                                  target_multiplier=self.target_multiplier, atr_period=self.atr_period)
+        df_with_signals = self.indicator.calculate(self.df, params, mode='train')
+        result = self.indicator.calculate_objective_result(df_with_signals)
         
         score = self.indicator.calculate_score(result, self.signal_count_target)
         
         return -score  # 负值用于最小化
 
-def technical_analysis(df, name, indicator_type='KD', evals=500, look_ahead=0):
+def technical_analysis(df, name, indicator_type='KD', evals=500, look_ahead=0, optimization_runs=None):
     """
     指标分析
     """
     # 选择指标
-    indicators:dict[str, Indicator] = {'KD': KD(), 'MACD': MACD(), 'RSI': RSI()}
+    indicators:dict[str, Indicator] = {'KD': KD(), 'MACD': MACD(), 'RSI': RSI(), 'SR': SupportResistance()}
     indicator = indicators.get(indicator_type)
     if not indicator:
         raise ValueError(f"不支持的指标类型: {indicator_type}")
@@ -56,15 +63,20 @@ def technical_analysis(df, name, indicator_type='KD', evals=500, look_ahead=0):
 
     # 运行优化
     scores, best_params = [], []
-    n_optimizations = 20
+    n_optimizations = optimization_runs if optimization_runs is not None else DEFAULT_OPTIMIZATION_RUNS.get(indicator_type, 20)
+    n_optimizations = max(1, int(n_optimizations))
+    print(f"Optimization runs: {n_optimizations}, evals per run: {evals}")
     optimization_args = [
         (i, space, optimization, evals, 100, 0.001, np.random.randint(0, 1000000))
         for i in range(n_optimizations)
     ]
 
-    n_processes = max(1, cpu_count() - 1)
-    with Pool(processes=n_processes) as pool:
-        results = list(tqdm(pool.imap(run_bayes_optimization, optimization_args), total=n_optimizations))
+    if n_optimizations == 1:
+        results = [run_bayes_optimization(optimization_args[0])]
+    else:
+        n_processes = max(1, cpu_count() - 1)
+        with Pool(processes=n_processes) as pool:
+            results = list(tqdm(pool.imap(run_bayes_optimization, optimization_args), total=n_optimizations))
 
     scores, best_params = zip(*results)
     best_idx = np.argmax(scores)

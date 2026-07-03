@@ -226,6 +226,53 @@ def precompute_win_rate_columns(df, look_ahead, target_multiplier, atr_period):
     df['recent_low'] = df['low'].rolling(window=3, min_periods=1).min()
     return df
 
+
+def calculate_objective_win_rate(df, check_high_low=True):
+    """训练目标函数使用的轻量胜率计算。
+
+    依赖 precompute_win_rate_columns 已经生成的派生列；不构造 detailed_df、
+    z-score 或 signal breakdown，避免优化阶段的重复开销。
+    """
+    support_mask = df['reversal'].to_numpy() == 'support reversal'
+    resistance_mask = df['reversal'].to_numpy() == 'resistance reversal'
+    strong_mask = df['is_strong'].to_numpy() == 1
+
+    future_high = df['future_high'].to_numpy()
+    future_low = df['future_low'].to_numpy()
+    support_target = df['support_target'].to_numpy()
+    resistance_target = df['resistance_target'].to_numpy()
+
+    if check_high_low:
+        recent_high = df['recent_high'].to_numpy()
+        recent_low = df['recent_low'].to_numpy()
+        support_win = support_mask & (future_high >= support_target) & (recent_low <= future_low)
+        resistance_win = resistance_mask & (future_low <= resistance_target) & (recent_high >= future_high)
+    else:
+        support_win = support_mask & (future_high >= support_target)
+        resistance_win = resistance_mask & (future_low <= resistance_target)
+
+    strong_support_mask = support_mask & strong_mask
+    strong_resistance_mask = resistance_mask & strong_mask
+
+    support_count = int(support_mask.sum())
+    resistance_count = int(resistance_mask.sum())
+    strong_support_count = int(strong_support_mask.sum())
+    strong_resistance_count = int(strong_resistance_mask.sum())
+
+    return {
+        'support_win_rate': float(support_win[support_mask].mean()) if support_count else 0,
+        'support_signals_count': support_count,
+        'resistance_win_rate': float(resistance_win[resistance_mask].mean()) if resistance_count else 0,
+        'resistance_signals_count': resistance_count,
+        'strong_support_win_rate': float(support_win[strong_support_mask].mean()) if strong_support_count else 0,
+        'strong_support_signals_count': strong_support_count,
+        'strong_resistance_win_rate': float(resistance_win[strong_resistance_mask].mean()) if strong_resistance_count else 0,
+        'strong_resistance_signals_count': strong_resistance_count,
+        'support_recall': strong_support_count / support_count if support_count else 0,
+        'resistance_recall': strong_resistance_count / resistance_count if resistance_count else 0,
+    }
+
+
 def calculate_win_rate(df, look_ahead=10, target_multiplier=1.1, atr_period=20, check_high_low=True):
     df = df.copy()
     precompute_win_rate_columns(df, look_ahead, target_multiplier, atr_period)
@@ -261,6 +308,23 @@ def calculate_win_rate(df, look_ahead=10, target_multiplier=1.1, atr_period=20, 
     
     support_recall = len(strong_support_signals) / len(support_signals) if len(support_signals) > 0 else 0
     resistance_recall = len(strong_resistance_signals) / len(resistance_signals) if len(resistance_signals) > 0 else 0
+
+    signal_breakdown = {}
+    if 'sr_signal' in df.columns:
+        signal_win_columns = {
+            'breakout resistance': 'support_win',
+            'support hold': 'support_win',
+            'breakdown support': 'resistance_win',
+            'resistance reject': 'resistance_win',
+        }
+        for signal, win_col in signal_win_columns.items():
+            signal_df = df[df['sr_signal'] == signal]
+            signal_breakdown[signal] = {
+                'win_rate': signal_df[win_col].mean() if len(signal_df) > 0 else 0,
+                'signals_count': len(signal_df),
+                'wins': int(signal_df[win_col].sum()) if len(signal_df) > 0 else 0,
+                'z_score': trading_system_z_score(signal_df[win_col].tolist()),
+            }
     
     return {
         'support_win_rate': support_win_rate,
@@ -275,6 +339,7 @@ def calculate_win_rate(df, look_ahead=10, target_multiplier=1.1, atr_period=20, 
         'resistance_recall': resistance_recall,
         'support_z_score': trading_system_z_score(df[df['reversal'] == 'support reversal']['support_win'].tolist()),
         'resistance_z_score': trading_system_z_score(df[df['reversal'] == 'resistance reversal']['resistance_win'].tolist()),
+        'signal_breakdown': signal_breakdown,
         'detailed_df': df
     }
 

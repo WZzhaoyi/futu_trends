@@ -71,7 +71,7 @@ scr = call_cli("screen", "--market", "US", "--strategy", "sepa")
 | `PROXY` | yfinance/基准指数取数代理 | 视网络 |
 | `CACHE_DIR` | K 线文件缓存目录（默认 `<REPO>/data`，自动转绝对路径） | 否 |
 | `EMA_PERIOD` | `signals` 的 EMA 周期（默认 240） | 否 |
-| `MACD_PARAMS_DB` / `KD_PARAMS_DB` / `RSI_PARAMS_DB` | ParamsDB 路径，供 `signals` 取最优参数 + detect | 否 |
+| `MACD_PARAMS_DB` / `KD_PARAMS_DB` / `RSI_PARAMS_DB` / `SR_PARAMS_DB` | ParamsDB 路径，供 `signals` 取最优参数 + detect | 否 |
 
 > `screen` 默认只跑 OpenD 服务端选股 + snapshot 富集；传 `--refine` 后，L2 走 **yfinance**。
 > `signals` 的趋势 L2 走 **yfinance**。`screen` 的 L1/snapshot 需要 OpenD。
@@ -100,9 +100,10 @@ FUTU_PUSH_TYPE=K_DAY
 
 **(c) 让 `signals` 用优化过的最优参数（可选；缺省/缺记录则回退统一默认参数）**
 ```ini
-MACD_PARAMS_DB=<DB_URI>        ; 三者均可选，如 sqlite:///<ABS_DB_PATH>
+MACD_PARAMS_DB=<DB_URI>        ; 四者均可选，如 sqlite:///<ABS_DB_PATH>
 KD_PARAMS_DB=<DB_URI>
 RSI_PARAMS_DB=<DB_URI>
+SR_PARAMS_DB=<DB_URI>
 ```
 
 - `[CONFIG]` 段头必须存在（configparser 要求）。

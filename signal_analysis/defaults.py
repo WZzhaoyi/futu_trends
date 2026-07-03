@@ -32,6 +32,14 @@ DEFAULT_PARAMS = {
     "MACD": {"fast_period": 12, "slow_period": 26, "signal_period": 9, "macd_extreme": 150},
     "KD": {"k_period": 15, "d_period": 5, "overbought": 50, "oversold": 50},
     "RSI": {"rsi_period": 7, "oversold": 30, "overbought": 70},
+    "SR": {
+        "lookback": 80,
+        "pivot_window": 3,
+        "min_touches": 2,
+        "tolerance_atr": 0.35,
+        "breakout_buffer_atr": 0.2,
+        "volume_ratio": 1.0,
+    },
 }
 
 # 形态确认默认 meta（Indicator.calculate(mode='check') 用；只算指标序列时用不到）

@@ -3,7 +3,7 @@ import os
 
 from matplotlib import pyplot as plt
 
-from signal_analysis import technical_analysis
+from signal_analysis import DEFAULT_OPTIMIZATION_RUNS, technical_analysis
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from configparser import ConfigParser
@@ -41,6 +41,10 @@ def run_analysis(code_list:pd.DataFrame, indicator_type:str, config:ConfigParser
     look_ahead = int(look_ahead) if look_ahead else 0
     ktype = config.get("CONFIG", "FUTU_PUSH_TYPE")
     timestamp = datetime.now().strftime('%Y%m%d')
+    optimization_runs_by_indicator = {
+        indicator: config.getint("CONFIG", f"{indicator}_OPTIMIZATION_RUNS", fallback=default_runs)
+        for indicator, default_runs in DEFAULT_OPTIMIZATION_RUNS.items()
+    }
 
     for idx, code in enumerate(code_list['code'].values):
         print(f"\n---- Analyzing {idx+1}/{len(code_list)} {name_list[idx]} {code} {ktype}----\n")
@@ -57,7 +61,14 @@ def run_analysis(code_list:pd.DataFrame, indicator_type:str, config:ConfigParser
                 result = json.load(f)
         else:
             print(f"训练新结果: {result_file_name}")
-            result = technical_analysis(df, code, indicator_type, evals=500, look_ahead=look_ahead)
+            result = technical_analysis(
+                df,
+                code,
+                indicator_type,
+                evals=500,
+                look_ahead=look_ahead,
+                optimization_runs=optimization_runs_by_indicator.get(indicator_type),
+            )
 
             # 保存详细信号数据
             singal_file_name = os.path.join(output_dir, f'signals_{code.replace(".", "_")}_{timestamp}_{ktype}.csv')
@@ -130,12 +141,14 @@ if __name__ == '__main__':
         indicator_dict = {
             'kd': 'KD',
             'macd': 'MACD',
-            'rsi': 'RSI'
+            'rsi': 'RSI',
+            'sr': 'SR',
         }
         params_db_dict = {
             'kd': config.get("CONFIG", "KD_PARAMS_DB", fallback=None),
             'macd': config.get("CONFIG", "MACD_PARAMS_DB", fallback=None),
-            'rsi': config.get("CONFIG", "RSI_PARAMS_DB", fallback=None)
+            'rsi': config.get("CONFIG", "RSI_PARAMS_DB", fallback=None),
+            'sr': config.get("CONFIG", "SR_PARAMS_DB", fallback=None),
         }
         if trend_type not in indicator_dict:
             raise ValueError(f"Invalid trend type: {trend_type}")
@@ -153,6 +166,9 @@ if __name__ == '__main__':
             # 逐个code查询是否存在参数 如果存在则剔除pd_code_list中的该行
             for code in pd_code_list['code'].values:
                 data = db.get_stock_params(code)
+                if indicator_type == 'SR' and data is not None and 'lookback' not in (data.get('best_params') or {}):
+                    print(f"code {code} has legacy non-SR parameters in {trend_type} database, training SR")
+                    continue
                 if data is not None and data['best_params']:
                     pd_code_list = pd_code_list[pd_code_list['code'] != code]
                     print(f"code {code} already has parameters in {trend_type} database, skipping training")

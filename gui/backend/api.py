@@ -190,7 +190,7 @@ async def get_indicators(code: str):
             if not db_path:
                 continue
             try:
-                db = ParamsDB(db_path)
+                db = ParamsDB(db_path.split(',')[0])
                 params = db.get_stock_params(code)
                 if not params or not params.get('best_params'):
                     logger.warning(f"{indicator_type} parameters not found: {code}")

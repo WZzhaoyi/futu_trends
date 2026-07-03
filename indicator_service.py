@@ -33,7 +33,7 @@ _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from signal_analysis import KD, MACD, RSI  # noqa: E402
+from signal_analysis import KD, MACD, RSI, SupportResistance  # noqa: E402
 from params_db import ParamsDB  # noqa: E402
 from signal_analysis.defaults import (  # noqa: E402,F401  默认参数单一来源，re-export 供调用方复用
     DEFAULT_PARAMS, DEFAULT_META, default_stock_params,
@@ -41,10 +41,12 @@ from signal_analysis.defaults import (  # noqa: E402,F401  默认参数单一来
 
 logger = logging.getLogger(__name__)
 
-INDICATOR_CLASSES = {"MACD": MACD, "KD": KD, "RSI": RSI}
+INDICATOR_CLASSES = {"MACD": MACD, "KD": KD, "RSI": RSI, "SR": SupportResistance}
+SR_BULLISH_SIGNALS = {"breakout resistance", "support hold"}
+SR_BEARISH_SIGNALS = {"breakdown support", "resistance reject"}
 
 # 超买/超卖默认水平
-INDICATOR_DEFAULTS = {"MACD": (0, 0), "KD": (20, 80), "RSI": (30, 70)}
+INDICATOR_DEFAULTS = {"MACD": (0, 0), "KD": (20, 80), "RSI": (30, 70), "SR": (0, 0)}
 
 
 def get_db_paths(config) -> Dict[str, Optional[str]]:
@@ -53,6 +55,7 @@ def get_db_paths(config) -> Dict[str, Optional[str]]:
         "MACD": config.get("CONFIG", "MACD_PARAMS_DB", fallback=None),
         "KD": config.get("CONFIG", "KD_PARAMS_DB", fallback=None),
         "RSI": config.get("CONFIG", "RSI_PARAMS_DB", fallback=None),
+        "SR": config.get("CONFIG", "SR_PARAMS_DB", fallback=None),
     }
 
 
@@ -102,5 +105,15 @@ def calculate_indicator(indicator_type: str, df: pd.DataFrame, params: dict) -> 
             "values": values.fillna(0).tolist(),
             "oversold": params.get("oversold", default_oversold),
             "overbought": params.get("overbought", default_overbought),
+        }
+    if indicator_type == "SR":
+        result = indicator.calculate(df.copy(), params, mode="train")
+        sr_signal = result["sr_signal"]
+        return {
+            "support": result["support_level"].fillna(0).tolist(),
+            "resistance": result["resistance_level"].fillna(0).tolist(),
+            "signal": sr_signal.fillna("none").tolist(),
+            "bullish": sr_signal.isin(SR_BULLISH_SIGNALS).astype(int).tolist(),
+            "bearish": sr_signal.isin(SR_BEARISH_SIGNALS).astype(int).tolist(),
         }
     return None
