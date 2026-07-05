@@ -51,14 +51,7 @@ def score_snapshot(candidate, snap):
     dividend = num(snap.get("dividend_ratio_ttm")) or 0
     liquidity = min(math.log10(turnover + 1) * 8, 80) if turnover else 0
     score = book_discount * 25 + earnings_yield * 2 + dividend + liquidity * 0.25
-    return {
-        "snapshot_roe": round(roe, 4),
-        "earnings_yield": round(earnings_yield, 4),
-        "book_discount_score": round(book_discount, 4),
-        "dividend_yield_ttm": round(dividend, 4),
-        "liquidity_score": round(liquidity, 4),
-        "snapshot_score": round(score, 3),
-    }
+    return {"snapshot_roe": round(roe, 4), "snapshot_score": round(score, 3)}
 
 
 def refine_yfinance(candidate, yf_ticker):
@@ -84,10 +77,7 @@ def refine_yfinance(candidate, yf_ticker):
         balance,
         ("Stockholders Equity", "Common Stock Equity", "Total Equity Gross Minority Interest"),
     )
-    market_cap = (
-        num(candidate.get("snapshot", {}).get("total_market_val"))
-        or num(candidate.get("market_val"))
-    )
+    market_cap = num(candidate.get("total_market_val")) or num(candidate.get("market_val"))
     net_cash = None
     if cash is not None and total_liabilities is not None:
         net_cash = cash - total_liabilities

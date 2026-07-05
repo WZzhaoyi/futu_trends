@@ -50,15 +50,8 @@ def build_filters(market: str, ft):
 
 
 def score_snapshot(candidate, snap):
-    turnover = num(snap.get("turnover")) or 0
-    turnover_rate = num(snap.get("turnover_rate"))
-    volume_ratio = num(snap.get("volume_ratio"))
-    return {
-        "turnover": turnover,
-        "turnover_rate": turnover_rate,
-        "volume_ratio": volume_ratio,
-        "snapshot_score": turnover,
-    }
+    # 按成交额排序；turnover 等字段已由 runner 平铺进 candidate
+    return {"snapshot_score": num(snap.get("turnover")) or 0}
 
 
 if __name__ == "__main__":

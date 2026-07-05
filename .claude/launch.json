@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "api",
+      "runtimeExecutable": "/Users/wzzhaoyi/miniconda3/envs/futu_trends/bin/python",
+      "runtimeArgs": ["gui/backend/api.py", "--config", "env/signal_api.ini", "--port", "8001"],
+      "port": 8001
+    }
+  ]
+}

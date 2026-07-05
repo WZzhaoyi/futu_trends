@@ -5,46 +5,17 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Detect Results</title>
 <script src="https://unpkg.com/lightweight-charts@5.1.0/dist/lightweight-charts.standalone.production.js"></script>
+<link rel="stylesheet" href="/static/theme.css">
 <style>
-* { margin: 0; padding: 0; box-sizing: border-box; }
-html, body { height: 100%; overflow: hidden; }
-body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, monospace; display: flex; flex-direction: column; transition: background .2s, color .2s; }
-
-[data-theme="dark"] {
-  --bg: #1a1a2e; --fg: #e0e0e0; --muted: #888;
-  --card-bg: #16213e; --border: #0f3460; --tag-bg: #0f3460;
-  --btn-bg: #0f3460; --btn-hover: #1a5276;
-  --chart-bg: #1a1a2e; --chart-text: #888; --chart-grid: #0f3460;
-  --ref-line: rgba(255,255,255,0.15);
-  --vol-up: rgba(255,82,82,0.3); --vol-dn: rgba(0,168,67,0.3);
-  --heading: #53c7f0;
-}
-[data-theme="light"] {
-  --bg: #f5f5f5; --fg: #222; --muted: #666;
-  --card-bg: #fff; --border: #d0d0d0; --tag-bg: #e8e8e8;
-  --btn-bg: #e0e0e0; --btn-hover: #ccc;
-  --chart-bg: #ffffff; --chart-text: #555; --chart-grid: #e0e0e0;
-  --ref-line: rgba(0,0,0,0.12);
-  --vol-up: rgba(255,82,82,0.25); --vol-dn: rgba(0,168,67,0.25);
-  --heading: #1565c0;
-}
-
-body { background: var(--bg); color: var(--fg); }
-.search { display: flex; gap: 10px; padding: 10px 16px; align-items: center; flex-shrink: 0; }
-.search input { background: var(--card-bg); border: 1px solid var(--border); color: var(--fg); padding: 6px 12px; border-radius: 6px; font-size: 13px; width: 200px; }
-.search button { background: var(--btn-bg); color: var(--fg); border: none; padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
-.search button:hover { background: var(--btn-hover); }
-#status { color: var(--muted); font-size: 12px; }
-#theme-btn { font-size: 15px; line-height: 1; padding: 4px 8px; margin-left: auto; }
+.toolbar input { width: 200px; }
 .indicators { display: flex; flex-wrap: wrap; gap: 10px; padding: 0 16px 10px; flex-shrink: 0; }
 .indicator-card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; flex: 1; min-width: 300px; }
 .indicator-card h3 { color: var(--heading); margin-bottom: 6px; font-size: 14px; }
 .params { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; }
 .param-tag { background: var(--tag-bg); padding: 2px 6px; border-radius: 3px; font-size: 11px; }
 .meta-row { font-size: 11px; color: var(--muted); margin-bottom: 6px; }
-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-th { text-align: left; padding: 3px 6px; border-bottom: 1px solid var(--border); color: var(--muted); font-weight: normal; }
-td { padding: 3px 6px; border-bottom: 1px solid var(--border); }
+.indicator-card table { font-size: 12px; }
+.indicator-card th, .indicator-card td { padding: 3px 6px; }
 .wr-high { color: #4ecdc4; }
 .wr-mid { color: #f0c953; }
 .wr-low { color: #e07070; }
@@ -54,7 +25,7 @@ td { padding: 3px 6px; border-bottom: 1px solid var(--border); }
 </style>
 </head>
 <body>
-<div class="search">
+<div class="toolbar">
   <input id="code" type="text" placeholder="US.QQQ" autofocus>
   <button onclick="fetchData()">Query</button>
   <span id="status"></span>
@@ -63,26 +34,13 @@ td { padding: 3px 6px; border-bottom: 1px solid var(--border); }
 <div id="result" class="indicators"></div>
 <div id="chart-container"></div>
 
+<script src="/static/theme.js"></script>
 <script>
 const { createChart, ColorType, LineStyle } = LightweightCharts;
 const input = document.getElementById('code');
 input.addEventListener('keydown', e => { if (e.key === 'Enter') fetchData(); });
 
 let currentChart = null;
-
-// --- Theme ---
-const THEME_KEY = 'detect-theme'; // localStorage key
-const themeBtn = document.getElementById('theme-btn');
-// 'auto' | 'dark' | 'light'
-let themePref = localStorage.getItem(THEME_KEY) || 'auto';
-
-function getSystemTheme() {
-  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
-}
-
-function resolvedTheme() {
-  return themePref === 'auto' ? getSystemTheme() : themePref;
-}
 
 function getChartColors() {
   const dark = resolvedTheme() === 'dark';
@@ -104,13 +62,8 @@ function getChartColors() {
 
 let C = getChartColors();
 
-function applyTheme() {
-  const t = resolvedTheme();
-  document.documentElement.setAttribute('data-theme', t);
-  const icons = { auto: '\u25D1', light: '\u2600', dark: '\u263E' };
-  themeBtn.textContent = icons[themePref];
-  themeBtn.title = `Theme: ${themePref}`;
-
+// \u4E3B\u9898\u5207\u6362\u540E\u540C\u6B65\u56FE\u8868\u914D\u8272\uFF08theme.js \u7684\u94A9\u5B50\uFF09
+window.onThemeChange = () => {
   C = getChartColors();
   if (currentChart) {
     currentChart.applyOptions({
@@ -118,20 +71,7 @@ function applyTheme() {
       grid: { vertLines: { color: C.grid }, horzLines: { color: C.grid } },
     });
   }
-}
-
-function cycleTheme() {
-  const order = ['auto', 'dark', 'light'];
-  themePref = order[(order.indexOf(themePref) + 1) % 3];
-  localStorage.setItem(THEME_KEY, themePref);
-  applyTheme();
-}
-
-window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
-  if (themePref === 'auto') applyTheme();
-});
-
-applyTheme();
+};
 
 // URL 路径中的 code 自动填入并查询
 const pathCode = window.location.pathname.replace(/^\/detect\/?/, '');

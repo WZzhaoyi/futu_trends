@@ -29,18 +29,24 @@ MARKETS = ("US", "HK", "A")
 FILTER_MARKETS = {
     "US": (ft.Market.US,),
     "HK": (ft.Market.HK,),
-    "A": (ft.Market.SH, ft.Market.SZ),
+    # get_stock_filter 的 SH 即整个 A 股（含沪深），再查 SZ 会全量重复
+    "A": (ft.Market.SH,),
 }
+# OTC(粉单)无行情权限，get_market_snapshot 会整批报错，需在 L1 后剔除
+US_ALLOWED_EXCHANGES = {"US_NYSE", "US_NASDAQ", "US_AMEX"}
 PAGE_SIZE = 200
 SNAPSHOT_BATCH = 400
+# futu 接口一般限制 1 分钟 30 次调用，节流间隔保持 >= 2s
 FILTER_THROTTLE_SEC = 3.5
+SNAPSHOT_THROTTLE_SEC = 2.5
 FILTER_MAX_TRIES = 4
 FILTER_BACKOFF_SEC = 6.0
 YFINANCE_REFINE_LIMIT = 30
 YFINANCE_SLEEP_SEC = 1.2
 
 SNAPSHOT_FIELDS = (
-    "last_price", "turnover", "turnover_rate", "volume_ratio",
+    "last_price", "open_price", "high_price", "low_price", "prev_close_price",
+    "turnover", "turnover_rate", "volume_ratio",
     "total_market_val", "net_asset", "net_profit", "earning_per_share",
     "net_asset_per_share", "pe_ratio", "pb_ratio", "pe_ttm_ratio",
     "dividend_ratio_ttm", "highest52weeks_price", "lowest52weeks_price",
@@ -151,26 +157,43 @@ def row_value(row, name: str):
     return None
 
 
-def _filter_page(ctx, futu_market, filters: list[Any], begin: int):
+def _retry_call(desc: str, call, tries: int = FILTER_MAX_TRIES,
+                backoff: float = FILTER_BACKOFF_SEC):
+    """对 (ret, data) 形式的 OpenD 调用做指数退避重试（超时/限频多为瞬时故障）。"""
     data = None
-    for attempt in range(1, FILTER_MAX_TRIES + 1):
-        ret, data = ctx.get_stock_filter(
-            market=futu_market, filter_list=filters, begin=begin, num=PAGE_SIZE,
-        )
+    for attempt in range(1, tries + 1):
+        ret, data = call()
         if ret == ft.RET_OK:
             return data
-        if attempt < FILTER_MAX_TRIES:
-            backoff = FILTER_BACKOFF_SEC * attempt
-            print(f"[warn] get_stock_filter failed, retry in {backoff:.0f}s: {data}",
-                  file=sys.stderr)
-            time.sleep(backoff)
-    raise RuntimeError(f"get_stock_filter failed: {data}")
+        if attempt < tries:
+            wait = backoff * attempt
+            print(f"[warn] {desc} failed, retry in {wait:.0f}s: {data}", file=sys.stderr)
+            time.sleep(wait)
+    raise RuntimeError(f"{desc} failed: {data}")
+
+
+def _filter_page(ctx, futu_market, filters: list[Any], begin: int):
+    return _retry_call("get_stock_filter", lambda: ctx.get_stock_filter(
+        market=futu_market, filter_list=filters, begin=begin, num=PAGE_SIZE,
+    ))
 
 
 def _candidate_from_filter_row(row, market: str) -> dict[str, Any]:
     out = {"code": row.stock_code, "name": row.stock_name, "market": market}
     out.update({field: row_value(row, field) for field in FILTER_FIELDS})
     return out
+
+
+def _drop_us_otc(ctx, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # 不做"失败保留全部"兜底：混入 OTC 会让后续 get_market_snapshot 整批报错
+    data = _retry_call("get_stock_basicinfo", lambda: ctx.get_stock_basicinfo(
+        ft.Market.US, ft.SecurityType.STOCK))
+    exchange = dict(zip(data["code"], data["exchange_type"]))
+    kept = [c for c in candidates if exchange.get(c["code"]) in US_ALLOWED_EXCHANGES]
+    if len(kept) < len(candidates):
+        print(f"[info] dropped {len(candidates) - len(kept)} US OTC candidates",
+              file=sys.stderr)
+    return kept
 
 
 def run_l1(strategy, market: str, config) -> list[dict[str, Any]]:
@@ -180,13 +203,16 @@ def run_l1(strategy, market: str, config) -> list[dict[str, Any]]:
 
     ctx = ft.OpenQuoteContext(host=host, port=port)
     try:
-        out = []
+        out, seen = [], set()
         futu_markets = FILTER_MARKETS[market]
         for market_idx, futu_market in enumerate(futu_markets):
             begin = 0
             while True:
                 last_page, all_count, rows = _filter_page(ctx, futu_market, filters, begin)
                 for row in rows:
+                    if row.stock_code in seen:
+                        continue
+                    seen.add(row.stock_code)
                     if hasattr(strategy, "candidate_from_filter_row"):
                         out.append(strategy.candidate_from_filter_row(row, market))
                     else:
@@ -197,6 +223,8 @@ def run_l1(strategy, market: str, config) -> list[dict[str, Any]]:
                 time.sleep(FILTER_THROTTLE_SEC)
             if market_idx < len(futu_markets) - 1:
                 time.sleep(FILTER_THROTTLE_SEC)
+        if market == "US":
+            out = _drop_us_otc(ctx, out)
         return out
     finally:
         ctx.close()
@@ -220,25 +248,39 @@ def enrich_snapshot(candidates: list[dict[str, Any]], strategy, config) -> list[
     ctx = ft.OpenQuoteContext(host=host, port=port)
     try:
         for i in range(0, len(codes), SNAPSHOT_BATCH):
-            ret, data = ctx.get_market_snapshot(codes[i:i + SNAPSHOT_BATCH])
-            if ret != ft.RET_OK:
-                raise RuntimeError(f"get_market_snapshot failed: {data}")
+            if i:
+                time.sleep(SNAPSHOT_THROTTLE_SEC)
+            batch = codes[i:i + SNAPSHOT_BATCH]
+            data = _retry_call("get_market_snapshot",
+                               lambda b=batch: ctx.get_market_snapshot(b))
             for row in data.to_dict("records"):
                 snapshots[row["code"]] = row
     finally:
         ctx.close()
 
     scorer = getattr(strategy, "score_snapshot", default_snapshot_score)
+    order: dict[str, float] = {}
+    kept = []
     for candidate in candidates:
         snap = snapshots.get(candidate["code"], {})
-        candidate["snapshot"] = {k: snap.get(k) for k in SNAPSHOT_FIELDS}
-        candidate["snapshot_metrics"] = scorer(candidate, snap)
+        if snap.get("suspension"):
+            continue  # 停牌股不可交易，剔除
+        candidate.update({k: snap.get(k) for k in SNAPSHOT_FIELDS})
+        last, prev = num(snap.get("last_price")), num(snap.get("prev_close_price"))
+        candidate["change_pct"] = (
+            round((last - prev) / prev * 100, 2) if last is not None and prev else None
+        )
+        metrics = dict(scorer(candidate, snap))
+        # snapshot_score 仅用于排序，不落盘
+        order[candidate["code"]] = metrics.pop("snapshot_score", None) or -1
+        candidate.update(metrics)
+        kept.append(candidate)
 
-    candidates.sort(
-        key=lambda x: x.get("snapshot_metrics", {}).get("snapshot_score") or -1,
-        reverse=True,
-    )
-    return candidates
+    if len(kept) < len(candidates):
+        print(f"[info] dropped {len(candidates) - len(kept)} suspended candidates",
+              file=sys.stderr)
+    kept.sort(key=lambda c: order[c["code"]], reverse=True)
+    return kept
 
 
 def futu_to_yfinance_code(code: str) -> str:
@@ -407,6 +449,55 @@ def run_yfinance_refine(candidates: list[dict[str, Any]], strategy, config,
     return candidates
 
 
+# ---- 结果存取协议（生产端与 gui/backend 共用，路径/格式的唯一定义处）----
+
+OUT_ROOT = "output/screener"
+_RESULT_GLOB = "*_*.json"
+
+
+def result_path(root, date: str, strategy: str, market: str) -> Path:
+    """协议路径：<root>/<YYYYMMDD>/<strategy>_<market>.json"""
+    return Path(root) / date / f"{strategy}_{market}.json"
+
+
+def write_result(path: Path, result: dict, date: str) -> None:
+    """补 date/generated_at 后原子写入，避免 web 端读到半个文件。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    result = dict(result, date=date,
+                  generated_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def resolve_date(root, on_or_before: str | None = None) -> str | None:
+    """返回 <= on_or_before（默认今天）的最近一个有结果的日期。"""
+    limit = on_or_before or time.strftime("%Y%m%d")
+    root = Path(root)
+    if not root.is_dir():
+        return None
+    dates = [d.name for d in root.iterdir()
+             if d.is_dir() and len(d.name) == 8 and d.name.isdigit()
+             and d.name <= limit and any(d.glob(_RESULT_GLOB))]
+    return max(dates) if dates else None
+
+
+def list_results(root, date: str) -> list[dict]:
+    """某日期下全部结果的概要。"""
+    out = []
+    for f in sorted(Path(root, date).glob(_RESULT_GLOB)):
+        strategy, _, market = f.stem.rpartition("_")
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        out.append({"strategy": strategy, "market": market,
+                    "generated_at": data.get("generated_at"),
+                    "l1_count": data.get("l1_count"),
+                    "returned": data.get("returned")})
+    return out
+
+
 def sanitize(obj):
     if hasattr(obj, "item"):
         return sanitize(obj.item())
@@ -465,6 +556,8 @@ def parser(strategy) -> argparse.ArgumentParser:
     ap.add_argument("--refine-sleep", type=float, default=YFINANCE_SLEEP_SEC,
                     help=f"yfinance 单只间隔秒数；默认 {YFINANCE_SLEEP_SEC}")
     ap.add_argument("--out", help="输出 JSON 文件")
+    ap.add_argument("--out-root", help=f"按协议路径输出：<root>/<date>/<strategy>_<market>.json，如 {OUT_ROOT}")
+    ap.add_argument("--date", help="配合 --out-root 的结果日期 YYYYMMDD，默认今天")
     return ap
 
 
@@ -481,6 +574,13 @@ def main(strategy):
         limit=args.limit, refine=args.refine, refine_limit=args.refine_limit,
         refine_sleep=args.refine_sleep,
     )
+    if args.out_root:
+        date = args.date or time.strftime("%Y%m%d")
+        path = result_path(args.out_root, date, strategy.NAME, args.market)
+        write_result(path, result, date)
+        print(f"已写入 {path}（L1={result['l1_count']}, 返回={result['returned']}）",
+              file=sys.stderr)
+        return
     text = json.dumps(result, ensure_ascii=False, indent=2)
     if args.out:
         Path(args.out).write_text(text, encoding="utf-8")

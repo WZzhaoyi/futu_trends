@@ -51,14 +51,7 @@ def score_snapshot(candidate, snap):
     dividend = num(snap.get("dividend_ratio_ttm")) or 0
     liquidity = min(math.log10(turnover + 1) * 8, 80) if turnover else 0
     score = roe + earnings_yield * 1.5 + book_discount * 8 + dividend * 0.5 + liquidity * 0.2
-    return {
-        "snapshot_roe": round(roe, 4),
-        "earnings_yield": round(earnings_yield, 4),
-        "book_discount_score": round(book_discount, 4),
-        "dividend_yield_ttm": round(dividend, 4),
-        "liquidity_score": round(liquidity, 4),
-        "snapshot_score": round(score, 3),
-    }
+    return {"snapshot_roe": round(roe, 4), "snapshot_score": round(score, 3)}
 
 
 if __name__ == "__main__":

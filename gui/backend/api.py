@@ -7,6 +7,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
+import json
+import re
 import sys
 import logging
 import configparser
@@ -15,11 +18,19 @@ from typing import Dict, Any, Optional
 import pandas as pd
 
 # 添加项目根目录到路径（复用现有代码）
-sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.append(str(PROJECT_ROOT))
 
 from data import get_kline_data
 from tools import EMA, code_in_futu_group
 from params_db import ParamsDB
+# 选股结果的路径/格式协议与生产端共用单一来源
+from fundamental_analysis.futu_fundamental_screener import (
+    OUT_ROOT as SCREENER_OUT_ROOT,
+    list_results as screener_list_results,
+    resolve_date as screener_resolve_date,
+    result_path as screener_result_path,
+)
 # 指标/detect 计算口径与 CLI 共用单一来源（项目根的共享服务，无 FastAPI 依赖）
 from indicator_service import (
     get_db_paths as _get_db_paths_svc,
@@ -53,8 +64,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 共享静态资源（theme.css / theme.js）
+app.mount("/static", StaticFiles(directory=str(Path(__file__).parent / "static")), name="static")
+
 # 启动时显式加载校验后赋值（见 __main__）；导入期为 None，不读 config/argv。
 config: configparser.ConfigParser | None = None
+
+SCREENER_ROOT = PROJECT_ROOT / SCREENER_OUT_ROOT
 
 # 必需键 + 须为整数的键
 _REQUIRED_KEYS = ("FUTU_HOST", "FUTU_PORT", "DATA_SOURCE")
@@ -222,22 +238,57 @@ async def get_detect_result(code: str):
         raise HTTPException(status_code=404, detail=f"No detect results found for {code}")
     return JSONResponse(content={'code': code, 'indicators': detect})
 
+# ---- 条件选股结果（只读 cron 产出的静态 JSON，与选股任务解耦）----
+
+def _screener_date(date: Optional[str]) -> Optional[str]:
+    """带 date 时校验并精确使用；缺省回退到最近有结果的日期"""
+    if date:
+        if not re.fullmatch(r'\d{8}', date):
+            raise HTTPException(status_code=400, detail="date must be YYYYMMDD")
+        return date
+    return screener_resolve_date(SCREENER_ROOT)
+
+@app.get("/api/screener/list")
+async def screener_list(date: Optional[str] = None):
+    """某日的选股结果概要；缺省日期时回退到最近一次结果"""
+    resolved = _screener_date(date)
+    results = screener_list_results(SCREENER_ROOT, resolved) if resolved else []
+    if date and not results:
+        raise HTTPException(status_code=404, detail=f"No screener results for {date}")
+    return JSONResponse(content={'date': resolved if results else None, 'results': results})
+
+@app.get("/api/screener/{strategy}/{market}")
+async def screener_result(strategy: str, market: str, date: Optional[str] = None):
+    """单份选股结果原文"""
+    if not re.fullmatch(r'[a-z0-9_]+', strategy) or not re.fullmatch(r'[A-Z]+', market):
+        raise HTTPException(status_code=400, detail="invalid strategy or market")
+    resolved = _screener_date(date)
+    path = screener_result_path(SCREENER_ROOT, resolved, strategy, market) if resolved else None
+    if not path or not path.is_file():
+        raise HTTPException(status_code=404,
+                            detail=f"No screener result: {strategy}/{market} @ {date or 'latest'}")
+    return JSONResponse(content=json.loads(path.read_text(encoding='utf-8')))
+
 # ---- 页面路由 ----
+
+def _serve_page(name: str) -> HTMLResponse:
+    html_path = Path(__file__).parent / name
+    if not html_path.exists():
+        raise HTTPException(status_code=404, detail=f"{name} not found")
+    return HTMLResponse(content=html_path.read_text(encoding='utf-8'))
 
 @app.get("/detect/{code:path}")
 @app.get("/detect")
 async def detect_page(code: str = ""):
-    html_path = Path(__file__).parent / "detect.html"
-    if not html_path.exists():
-        raise HTTPException(status_code=404, detail="detect.html not found")
-    return HTMLResponse(content=html_path.read_text(encoding='utf-8'))
+    return _serve_page("detect.html")
 
 @app.get("/stocks")
 async def stocks_page():
-    html_path = Path(__file__).parent / "stocks.html"
-    if not html_path.exists():
-        raise HTTPException(status_code=404, detail="stocks.html not found")
-    return HTMLResponse(content=html_path.read_text(encoding='utf-8'))
+    return _serve_page("stocks.html")
+
+@app.get("/screener")
+async def screener_page():
+    return _serve_page("screener.html")
 
 @app.get("/")
 async def root():
