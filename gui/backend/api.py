@@ -21,7 +21,7 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.append(str(PROJECT_ROOT))
 
-from data import get_kline_data
+from data import get_kline_data, opend_alive
 from tools import EMA, code_in_futu_group
 from params_db import ParamsDB
 # 选股结果的路径/格式协议与生产端共用单一来源
@@ -55,11 +55,11 @@ async def _lifespan(app: FastAPI):
 
 app = FastAPI(title="Futu Trends API", version="1.0.0", lifespan=_lifespan)
 
-# CORS 配置
+# CORS 配置。服务只绑 127.0.0.1，外部流量经反向代理接入；
+# 宽松 origin 即可，但不能与 allow_credentials 共存（浏览器会拒绝该组合）。
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -129,7 +129,7 @@ def _calculate_indicator(indicator_type: str, df: pd.DataFrame, best_params: dic
 # ---- API 路由 ----
 
 @app.get("/api/stocks/list")
-async def get_stock_list():
+def get_stock_list():
     """获取股票列表"""
     try:
         stocks = []
@@ -137,6 +137,11 @@ async def get_stock_list():
         groups_str = config.get("CONFIG", "FUTU_GROUP", fallback='')
         host = config.get("CONFIG", "FUTU_HOST", fallback='127.0.0.1')
         port = config.getint("CONFIG", "FUTU_PORT", fallback=11111)
+
+        if groups_str and host and port and not opend_alive(host, port):
+            # OpenD 不可达时跳过分组拉取（OpenQuoteContext 会无限重连挂死），降级为仅 FUTU_CODE_LIST
+            logger.warning(f"Futu OpenD 不可达（{host}:{port}），跳过 FUTU_GROUP 拉取")
+            groups_str = ''
 
         if groups_str and host and port:
             seen_codes = set()
@@ -167,7 +172,7 @@ async def get_stock_list():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/kline/{code}")
-async def get_kline(code: str, max_count: int = DEFAULT_MAX_COUNT):
+def get_kline(code: str, max_count: int = DEFAULT_MAX_COUNT):
     """获取 K 线数据"""
     try:
         df = _fetch_kline(code, max_count)
@@ -181,7 +186,7 @@ async def get_kline(code: str, max_count: int = DEFAULT_MAX_COUNT):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/indicators/{code}")
-async def get_indicators(code: str):
+def get_indicators(code: str):
     """
     聚合接口：K 线 + 技术指标 + detect 结果
 
@@ -231,7 +236,7 @@ async def get_indicators(code: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/detect/{code}")
-async def get_detect_result(code: str):
+def get_detect_result(code: str):
     """获取标的的 detect 结果（各指标的 best_params + performance）"""
     detect = _read_detect(code, _get_db_paths())
     if not detect:
@@ -249,7 +254,7 @@ def _screener_date(date: Optional[str]) -> Optional[str]:
     return screener_resolve_date(SCREENER_ROOT)
 
 @app.get("/api/screener/list")
-async def screener_list(date: Optional[str] = None):
+def screener_list(date: Optional[str] = None):
     """某日的选股结果概要；缺省日期时回退到最近一次结果"""
     resolved = _screener_date(date)
     results = screener_list_results(SCREENER_ROOT, resolved) if resolved else []
@@ -258,7 +263,7 @@ async def screener_list(date: Optional[str] = None):
     return JSONResponse(content={'date': resolved if results else None, 'results': results})
 
 @app.get("/api/screener/{strategy}/{market}")
-async def screener_result(strategy: str, market: str, date: Optional[str] = None):
+def screener_result(strategy: str, market: str, date: Optional[str] = None):
     """单份选股结果原文"""
     if not re.fullmatch(r'[a-z0-9_]+', strategy) or not re.fullmatch(r'[A-Z]+', market):
         raise HTTPException(status_code=400, detail="invalid strategy or market")
@@ -279,33 +284,33 @@ def _serve_page(name: str) -> HTMLResponse:
 
 @app.get("/detect/{code:path}")
 @app.get("/detect")
-async def detect_page(code: str = ""):
+def detect_page(code: str = ""):
     return _serve_page("detect.html")
 
 @app.get("/stocks")
-async def stocks_page():
+def stocks_page():
     return _serve_page("stocks.html")
 
 @app.get("/screener")
-async def screener_page():
+def screener_page():
     return _serve_page("screener.html")
 
 @app.get("/")
-async def root():
+def root():
     return {"status": "ok", "message": "Futu Trends API is running"}
 
 # ---- 启动 ----
 
-def find_available_port(start_port: int = 8001, max_attempts: int = 100) -> int:
+def ensure_port_available(port: int) -> None:
+    """端口被占用即报错退出（不自动漂移，保证部署后端口可预期）。"""
     import socket
-    for port in range(start_port, start_port + max_attempts):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        # 与 uvicorn 的 bind 语义一致，避免 TIME_WAIT 残留导致误报
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.bind(('127.0.0.1', port))
-                return port
+            s.bind(('127.0.0.1', port))
         except OSError:
-            continue
-    raise RuntimeError(f"无法找到可用端口，已尝试 {max_attempts} 个端口")
+            raise SystemExit(f"启动失败：端口 {port} 已被占用，请用 --port 指定其他端口")
 
 if __name__ == "__main__":
     import uvicorn
@@ -313,22 +318,13 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description='Futu Trends API Server')
     parser.add_argument('--config', type=str, required=True, help='配置文件路径（必填）')
-    parser.add_argument('--port', type=int, default=8001, help='服务端口（默认8001，如果被占用会自动切换）')
+    parser.add_argument('--port', type=int, default=8001, help='服务端口（默认8001；被占用时报错退出）')
     args = parser.parse_args()
 
     # 显式加载校验配置（失败即退出）；设模块全局供各 handler 使用
     config = load_and_validate_config(args.config)
+    ensure_port_available(args.port)
 
-    default_port = args.port
-    try:
-        actual_port = find_available_port(default_port)
-        if actual_port != default_port:
-            logger.warning(f"端口 {default_port} 被占用，自动切换到端口 {actual_port}")
-        else:
-            logger.info(f"使用端口 {actual_port}")
-
-        print(f"API_PORT={actual_port}", flush=True)
-        uvicorn.run(app, host="127.0.0.1", port=actual_port)
-    except Exception as e:
-        logger.error(f"启动服务失败: {e}", exc_info=True)
-        raise
+    logger.info(f"使用端口 {args.port}")
+    print(f"API_PORT={args.port}", flush=True)
+    uvicorn.run(app, host="127.0.0.1", port=args.port)

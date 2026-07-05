@@ -24,11 +24,13 @@ import numpy as np
 from datetime import datetime, timedelta
 from tools import to_yfinance_code, futu_code_to_longbridge_code, futu_code_to_ib_contract
 import math
+import sys
 import threading
 import os
 import json
 import re
 import requests
+import socket
 import glob as glob_module
 
 # 美股代码列表缓存
@@ -48,6 +50,35 @@ _ibkr_lock = threading.Lock()
 # 全局代理配置
 _proxy_configured = False
 _original_requests = {}  # 保存 requests 原始方法
+
+# ---- OpenD 可达性心跳 ----
+# 结果按 (host, port) 带 TTL 缓存：有流量时最多每 _OPEND_TTL_OK 秒一次轻量 TCP
+# 探测，避免每个请求都新建连接；不可达用短 TTL，OpenD 恢复后能快速感知。
+_OPEND_TTL_OK = 30
+_OPEND_TTL_DOWN = 5
+_opend_state: dict = {}  # (host, port) → (probe_ts, alive)
+
+
+def opend_alive(host: str, port: int, timeout: float = 2.0) -> bool:
+    """OpenD 可达性探测（TCP connect，结果按 TTL 缓存）。
+
+    不能用 OpenQuoteContext 探测——端口不通时 futu 会后台无限重连
+    （不抛异常）导致挂死；TCP 连通即认为 OpenD 在监听。
+    """
+    key = (host, port)
+    now = time_module.monotonic()
+    cached = _opend_state.get(key)
+    if cached:
+        ts, alive = cached
+        if now - ts < (_OPEND_TTL_OK if alive else _OPEND_TTL_DOWN):
+            return alive
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            alive = True
+    except OSError:
+        alive = False
+    _opend_state[key] = (now, alive)
+    return alive
 
 # ---- 市场状态缓存 ----
 
@@ -73,7 +104,7 @@ def _is_trading(code, host, port):
         return True  # 未知市场无法查询交易状态，按盘中短缓存处理
 
     now = int(time_module.time())
-    if not _state_cache or now - _state_ts >= _STATE_TTL:
+    if (not _state_cache or now - _state_ts >= _STATE_TTL) and opend_alive(host, port):
         ctx = ft.OpenQuoteContext(host=host, port=port)
         try:
             ret, data = ctx.get_global_state()
@@ -296,7 +327,11 @@ def fetch_futu_data(code: str, ktype: str, max_count: int, config: configparser.
     with _futu_lock:
         host = config.get("CONFIG", "FUTU_HOST")
         port = int(config.get("CONFIG", "FUTU_PORT"))
-        
+
+        if not opend_alive(host, port):
+            print(f"Futu OpenD 不可达（{host}:{port}），跳过取数: {code}", file=sys.stderr)
+            return None
+
         # 确定实际请求的K线类型和数量
         _ktype = ktype
         request_count = max_count

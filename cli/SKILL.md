@@ -174,10 +174,11 @@ signals --code US.AAPL [--code US.NVDA ...] [--count 400]
 
 ### 4) `web` — 启动 Web UI（**非 JSON，不属 agent 调用契约**）
 ```bash
-web [--port <PORT>]
+web [--port <PORT>] [--forever]
 ```
 子进程前台启动 gui/backend/api.py 的页面 + `/api/*` 接口，运行至中断（非 stdout-JSON）。
-面向人工/浏览器，agent 自动化一般不调用此命令。缺 `--port` 时端口自动选（8001 起，打印 `API_PORT=`）。
+面向人工/浏览器，agent 自动化一般不调用此命令。端口默认 8001，被占用时报错退出
+（`--port` 指定其他端口；启动打印 `API_PORT=`）；`--forever` 崩溃自动重启（正常退出/Ctrl-C 不重启）。
 
 ## L2 信号块
 

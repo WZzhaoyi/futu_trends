@@ -3,6 +3,8 @@ import sqlite3
 import json
 import logging
 import argparse
+import threading
+from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass
@@ -15,6 +17,21 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# MongoClient 进程级复用：pymongo 客户端线程安全、自带连接池与后台监控线程，
+# 同一 URI 全进程只建一个；每次 ParamsDB(...) 都新建 client 会泄漏连接池。
+_mongo_clients: Dict[str, MongoClient] = {}
+_mongo_clients_lock = threading.Lock()
+
+
+def _shared_mongo_client(uri: str, **options) -> MongoClient:
+    with _mongo_clients_lock:
+        client = _mongo_clients.get(uri)
+        if client is None:
+            client = MongoClient(uri, **options)
+            _mongo_clients[uri] = client
+        return client
+
 
 @dataclass
 class StockParams:
@@ -54,7 +71,7 @@ class ParamsDB:
                 'readPreference': 'secondaryPreferred',  # 优先从节点，提高可用性
             }
             
-            self.mongo_client = MongoClient(self.db_uri, **mongo_options)
+            self.mongo_client = _shared_mongo_client(self.db_uri, **mongo_options)
             
             # 从URI中提取数据库名称
             db_name = self.db_uri.split('/')[-1]
@@ -78,7 +95,7 @@ class ParamsDB:
             source_file TEXT NOT NULL
         );
         """
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.executescript(sql_create_tables)
             logger.info(f"SQLite database initialized at {self.db_path}")
 
@@ -150,7 +167,7 @@ class ParamsDB:
         
         if self.db_uri.startswith('sqlite:///'):
             # SQLite更新
-            with sqlite3.connect(self.db_path) as conn:
+            with closing(sqlite3.connect(self.db_path)) as conn, conn:
                 # 检查是否需要更新
                 current_record = conn.execute("""
                     SELECT last_updated 
@@ -232,7 +249,7 @@ class ParamsDB:
                 return None
         elif self.db_uri.startswith('sqlite:///'):
             try:
-                with sqlite3.connect(self.db_path) as conn:
+                with closing(sqlite3.connect(self.db_path)) as conn, conn:
                     result = conn.execute("""
                         SELECT best_params, meta_info, performance
                         FROM stock_params 
@@ -274,7 +291,7 @@ class ParamsDB:
                     data[doc['stock_code']] = doc
             else:
                 # SQLite备份
-                with sqlite3.connect(self.db_path) as conn:
+                with closing(sqlite3.connect(self.db_path)) as conn, conn:
                     cursor = conn.execute("SELECT * FROM stock_params")
                     for row in cursor:
                         stock_code = row[0]  # stock_code是主键

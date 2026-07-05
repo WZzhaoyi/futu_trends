@@ -214,10 +214,10 @@ def map_futu_to_yfinance_params(ktype:ft.KLType=None, start:datetime=None, end:d
 
 def code_in_futu_group(group_name:str, host='127.0.0.1', port=11111):
     quote_ctx = ft.OpenQuoteContext(host=host, port=port)
-
-    ret, data = quote_ctx.get_user_security(group_name)
-
-    quote_ctx.close()
+    try:
+        ret, data = quote_ctx.get_user_security(group_name)
+    finally:
+        quote_ctx.close()
 
     if ret == ft.RET_OK and type(data) == pd.DataFrame:
         return data

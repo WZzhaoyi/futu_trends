@@ -33,7 +33,8 @@ fundamental_analysis screeners / indicator_service），但不依赖其 HTTP/Fas
           + detect(best_params/meta/performance) + L2(trend-template/200MA/RS/VCP)
 
 == gui 子命令 ==
-  web     子进程启动 gui/backend/api.py 的 Web 服务（页面 + /api/* 接口，端口自动选）
+  web     子进程启动 gui/backend/api.py 的 Web 服务（页面 + /api/* 接口，默认 8001，
+          占用报错；--forever 崩溃自动重启）
 
 约定：JSON 类子命令输出严格 JSON 到 stdout、进度/告警到 stderr；web 例外（前台运行服务）。
 发布：现以仓库内脚本交付，已做到 CWD 无关（缓存绝对路径）+ OpenD 预检，
@@ -66,7 +67,7 @@ import futu as ft  # noqa: E402
 
 logging.getLogger("FTConsoleLog").setLevel(logging.WARNING)  # 防 InitConnect 日志污染 stdout
 
-from data import get_kline_data  # noqa: E402
+from data import get_kline_data, opend_alive  # noqa: E402
 from tools import EMA  # noqa: E402
 import futu_fundamental_screener as fs  # noqa: E402
 import deep_value_screener as deep_value_strategy  # noqa: E402
@@ -118,20 +119,10 @@ def _cache_dir(config) -> str:
 
 
 def _check_opend(config, timeout: float = 2.0) -> bool:
-    """
-    OpenD 可达性预检：TCP 探测端口（带超时）。
-
-    不能用 OpenQuoteContext —— 端口不通时 futu 会后台无限重连（不抛异常）导致挂死。
-    TCP connect 成功即认为 OpenD 在监听；真正协议异常留给后续实际调用报错。
-    """
-    import socket
+    """OpenD 可达性预检；探测逻辑与缓存见 data.opend_alive（带 TTL 的 TCP 心跳）。"""
     host = config.get("CONFIG", "FUTU_HOST", fallback="127.0.0.1")
     port = int(config.get("CONFIG", "FUTU_PORT", fallback=11111))
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
+    return opend_alive(host, port, timeout)
 
 
 def _last(values) -> float | None:
@@ -434,8 +425,11 @@ def cmd_signals(args, config) -> dict:
 
 def cmd_web(args, config) -> None:
     """启动 gui/backend/api.py 的 Web 服务（页面 + /api/* 接口），前台运行至中断。
-    缺 --port 时由 api.py 自动选（8001 起，占用递增）。"""
+    端口默认 8001，被占用时报错退出（--port 指定其他端口）。
+    --forever 为纯 Python 跨平台守护：异常退出自动重启（指数退避），
+    正常退出/Ctrl-C 不重启；启动即失败视为配置错误，直接退出不循环。"""
     import subprocess
+    import time
     api_py = _ROOT / "gui" / "backend" / "api.py"
     if not api_py.exists():
         sys.exit(f"未找到 Web 服务脚本: {api_py}")
@@ -443,7 +437,28 @@ def cmd_web(args, config) -> None:
     if args.port:
         cmd += ["--port", str(args.port)]
     print(f"启动 Web 服务（Ctrl-C 停止）: {' '.join(cmd)}", file=sys.stderr)
-    sys.exit(subprocess.run(cmd).returncode)
+    if not args.forever:
+        sys.exit(subprocess.run(cmd).returncode)
+
+    backoff, first = 1, True
+    while True:
+        start = time.monotonic()
+        try:
+            rc = subprocess.run(cmd).returncode
+        except KeyboardInterrupt:
+            sys.exit(130)
+        ran = time.monotonic() - start
+        if rc == 0:
+            sys.exit(0)
+        # api.py 冷启动（重依赖导入）约 4-5s，失败判定窗口须留足余量
+        if first and ran < 15:
+            sys.exit(rc)  # 启动即失败多为端口/配置问题，重启无意义
+        first = False
+        # 存活超过 60s 视为曾健康，退避归位；连续快速崩溃则指数退避封顶 60s
+        backoff = 1 if ran >= 60 else min(backoff * 2, 60)
+        print(f"Web 服务异常退出（rc={rc}，存活 {ran:.0f}s），{backoff}s 后重启",
+              file=sys.stderr)
+        time.sleep(backoff)
 
 
 # ---------------------------------------------------------------------------
@@ -488,7 +503,9 @@ def _build_parser() -> argparse.ArgumentParser:
     pg.set_defaults(func=cmd_signals)
 
     pw = sub.add_parser("web", parents=[common], help="启动 Web UI（页面 + /api/* 接口）")
-    pw.add_argument("--port", type=int, help="Web 服务端口（缺省由 api 自动选，8001 起）")
+    pw.add_argument("--port", type=int, help="Web 服务端口（默认 8001；被占用时报错退出）")
+    pw.add_argument("--forever", action="store_true",
+                    help="崩溃自动重启（跨平台简易守护；正常退出/Ctrl-C 不重启）")
     pw.set_defaults(func=cmd_web)
     return ap
 
