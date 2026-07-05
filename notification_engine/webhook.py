@@ -72,6 +72,10 @@ class WebhookNotifier:
         if config.has_section("WEBHOOK_HEADERS"):
             self._headers.update(config.items("WEBHOOK_HEADERS"))
         self._payload = dict(config.items("WEBHOOK_PAYLOAD")) if config.has_section("WEBHOOK_PAYLOAD") else {}
+        # 单独为通知走代理：data.setup_global_proxy 已不再设全局 env 代理，
+        # 与 engine 里 telegram/feishu 一致，按 config 的 PROXY 逐请求指定。
+        proxy = config.get("CONFIG", "PROXY", fallback="").strip()
+        self._proxies = {"http": proxy, "https": proxy} if proxy else None
 
     def send(self, content: str) -> HookResult:
         """将 content 附加到 [WEBHOOK_PAYLOAD] 并发送"""
@@ -84,7 +88,8 @@ class WebhookNotifier:
 
         logger.info("发送通知 → url=%s | 内容长度=%d", self._url, len(content))
         try:
-            resp = requests.post(self._url, headers=self._headers, json=payload, timeout=timeout)
+            resp = requests.post(self._url, headers=self._headers, json=payload,
+                                  timeout=timeout, proxies=self._proxies)
             logger.debug("响应状态: %d", resp.status_code)
 
             content_type = resp.headers.get("Content-Type", "")
