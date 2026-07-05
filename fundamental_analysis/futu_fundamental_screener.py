@@ -343,11 +343,36 @@ def _setup_yfinance(config):
     proxy = config.get("CONFIG", "PROXY", fallback=None)
     if not proxy:
         return
+    if "://" not in proxy:
+        proxy = f"http://{proxy}"
+
+    # yfinance 1.x 走 curl_cffi，其 session 不读 HTTP(S)_PROXY 环境变量，
+    # 也不受 requests monkey-patch 影响 —— 唯一可靠入口是 yf.config.network.proxy。
+    # 因此这里以它为准，并校验是否真正生效，避免"配了代理却直连泄漏"。
+    applied = False
     try:
         import yfinance as yf
-        yf.set_config(proxy=proxy)
+        net = getattr(getattr(yf, "config", None), "network", None)
+        if net is not None:
+            net.proxy = proxy
+            applied = getattr(net, "proxy", None) == proxy
     except Exception as exc:  # noqa: BLE001
-        print(f"[warn] yfinance proxy setup failed: {exc}", file=sys.stderr)
+        print(f"[warn] yfinance proxy config failed: {exc}", file=sys.stderr)
+    if not applied:
+        print("[warn] yfinance 代理未生效（缺少 yf.config.network），L2 可能直连绕过代理",
+              file=sys.stderr)
+
+    # 仍设置全局 env/requests 代理：覆盖 requests-based 的取数路径（其它模块/子进程）。
+    # 注意：这一步对 yfinance(curl_cffi) 无效，仅作旁路补充，不能替代上面的原生配置。
+    try:
+        try:
+            from data import setup_global_proxy
+        except ImportError:
+            sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+            from data import setup_global_proxy
+        setup_global_proxy(proxy)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[warn] setup_global_proxy failed: {exc}", file=sys.stderr)
 
 
 def generic_yfinance_refine(candidate: dict[str, Any], yf_ticker) -> dict[str, Any]:
@@ -526,17 +551,27 @@ def screen(strategy, market: str, config, snapshot: bool = True,
     if limit is not None:
         candidates = candidates[:limit]
     l2_refined = 0
+    l2_filtered = False
     if refine:
         refine_count = len(candidates) if refine_limit is None else min(refine_limit, len(candidates))
         if refine_count:
             run_yfinance_refine(candidates[:refine_count], strategy, config, refine_sleep)
         l2_refined = refine_count
+        # 定义了 l2_passes 的策略在 --refine 时直接按其门槛过滤；未定义则仅注释不过滤。
+        passes = getattr(strategy, "l2_passes", None)
+        if passes is not None:
+            if l2_refined < len(candidates):
+                print(f"[warn] L2 过滤：仅精算了前 {l2_refined}/{len(candidates)} 只，"
+                      f"未精算的将被剔除；如需全量请调大 --refine-limit", file=sys.stderr)
+            candidates = [c for c in candidates if passes(c)]
+            l2_filtered = True
     return sanitize({
         "market": market,
         "strategy": strategy.NAME,
         "l1_count": l1_count,
         "snapshot_enriched": bool(snapshot),
         "l2_refined": l2_refined,
+        "l2_filtered": l2_filtered,
         "returned": len(candidates),
         "candidates": candidates,
     })

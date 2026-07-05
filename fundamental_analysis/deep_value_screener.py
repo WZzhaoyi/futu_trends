@@ -25,8 +25,8 @@ PE_MIN = 0.01
 PE_MAX = 13.0
 PB_MAX = 1.0
 CASH_MIN = 0.0
-DEBT_ASSET_MAX = 85.0
-CURRENT_RATIO_MIN = 0.0
+DEBT_ASSET_MAX = 50.0
+CURRENT_RATIO_MIN = 1.5
 
 
 def build_filters(market: str, ft):
@@ -60,6 +60,17 @@ def refine_yfinance(candidate, yf_ticker):
     if income is None or income.empty or balance is None or balance.empty:
         return {"ok": False, "note": "income_stmt or balance_sheet is empty"}
 
+    # 美股中概/ADR：报表币种(如 CNY/EUR)与交易币种(USD)不一致时，
+    # 富途市值(USD)与 yfinance 报表口径的 NCAV 不可比，需剔除。仅在"已知不一致"时剔除。
+    try:
+        info = getattr(yf_ticker, "info", None) or {}
+    except Exception:  # noqa: BLE001
+        info = {}
+    financial_currency = info.get("financialCurrency")
+    trade_currency = info.get("currency")
+    currency_ok = not (financial_currency and trade_currency
+                       and financial_currency != trade_currency)
+
     net_income = _statement_value(income, ("Net Income", "Net Income Common Stockholders"))
     cash = _statement_value(
         balance,
@@ -69,6 +80,7 @@ def refine_yfinance(candidate, yf_ticker):
         balance,
         ("Total Liabilities Net Minority Interest", "Total Liabilities"),
     )
+    current_assets = _statement_value(balance, ("Current Assets",))
     interest_debt = _statement_value(
         balance,
         ("Total Debt", "Long Term Debt", "Long Term Debt And Capital Lease Obligation"),
@@ -81,20 +93,38 @@ def refine_yfinance(candidate, yf_ticker):
     net_cash = None
     if cash is not None and total_liabilities is not None:
         net_cash = cash - total_liabilities
+    ncav = None
+    if current_assets is not None and total_liabilities is not None:
+        ncav = current_assets - total_liabilities
 
     return {
         "ok": True,
         "yf_code": futu_to_yfinance_code(candidate["code"]),
         "net_income": net_income,
         "cash_and_equivalents": cash,
+        "current_assets": current_assets,
         "total_liabilities": total_liabilities,
         "interest_bearing_debt": interest_debt,
         "shareholders_equity": equity,
         "market_cap": market_cap,
         "net_cash": net_cash,
+        "ncav": ncav,
+        "ncav_to_market_cap": ratio(ncav, market_cap),
         "cash_to_market_cap": ratio(cash, market_cap),
         "cash_to_liabilities": ratio(cash, total_liabilities),
         "debt_to_equity": ratio(total_liabilities, equity),
+        "financial_currency": financial_currency,
+        "trade_currency": trade_currency,
+        # 报表币种与交易币种一致才可做 NCAV 比较（剔除美股中概/ADR）
+        "condition_currency_ok": currency_ok,
+        # Graham 烟蒂：市值 < NCAV（流动资产 − 总负债）；币种不一致直接判否
+        "condition_market_cap_lt_ncav": bool(
+            currency_ok and ncav is not None and market_cap is not None and market_cap < ncav
+        ),
+        # 经典买点：市值 < 2/3 NCAV
+        "condition_market_cap_lt_two_thirds_ncav": bool(
+            currency_ok and ncav is not None and market_cap is not None and market_cap < ncav * 2 / 3
+        ),
         "condition_cash_minus_liabilities_gt_market_cap": bool(
             net_cash is not None and market_cap is not None and net_cash > market_cap
         ),
@@ -103,6 +133,16 @@ def refine_yfinance(candidate, yf_ticker):
             and total_liabilities is not None and cash - interest_debt > total_liabilities
         ),
     }
+
+
+def l2_passes(candidate) -> bool:
+    """--refine L2 门槛：剔除美股中概/ADR（币种不一致），仅保留命中 Graham 烟蒂（市值 < NCAV）的候选。"""
+    l2 = candidate.get("l2") or {}
+    return bool(
+        l2.get("ok")
+        and l2.get("condition_currency_ok")
+        and l2.get("condition_market_cap_lt_ncav")
+    )
 
 
 if __name__ == "__main__":

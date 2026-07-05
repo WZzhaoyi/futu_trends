@@ -136,7 +136,11 @@ screen --market US|HK|A [--strategy sepa|growth_value|quality|deep_value] [--lim
 - `--strategy`：默认 `sepa`；也可选 `growth_value`、`quality`、`deep_value`。
 - `--limit`：按 `snapshot_score` 排序后只返回前 N 只。
 - `--no-snapshot`：只跑 `get_stock_filter`，不做 snapshot 富集/排序。
-- `--refine`：对候选运行 yfinance L2 精算。
+- `--refine`：对候选运行 yfinance L2 精算；**定义了 L2 门槛的策略会在此步直接按门槛过滤**：
+  - `quality` / `growth_value`：Piotroski 式质量分 ≥ 4；
+  - `deep_value`：剔除报表币种≠交易币种的美股中概/ADR，并仅保留 `市值 < NCAV`(流动资产−总负债) 的 Graham 烟蒂；
+  - `sepa`：无 L2 门槛，仅注释不过滤。
+  仅精算前 `--refine-limit` 只，未精算的会被剔除（打 warning），需要全量请调大该值。
 - `--refine-limit`：最多精算前多少只，默认 30；不截断最终返回列表。
 - `--refine-sleep`：yfinance 单只间隔秒数，默认 1.2。
 ```json
@@ -153,6 +157,23 @@ screen --market US|HK|A [--strategy sepa|growth_value|quality|deep_value] [--lim
 候选按 `snapshot_score` **降序**。`sepa` 的 `snapshot_score` 是成交额；基本面策略的
 `snapshot_score` 是各策略脚本定义的估值/质量/流动性综合分。
 `--market A` 会合并沪深两市服务端筛选结果。
+
+#### 策略条件速览（L1 服务端筛选；财务字段均为年报口径）
+
+- **sepa** — Minervini 趋势模板：价 > EMA50 > EMA150 > EMA200（日K）；
+  距52周低点 ≥ +30%、距52周高点 ≥ -30%；市值 ≥ 150亿；
+  EPS 增速 ≥ 20%、营收增速 ≥ 15%。排序=成交额。
+- **growth_value** — 成长价值：市值下限按市场 US ≥ $20亿 / HK ≥ HK$50亿 / A ≥ ¥50亿；PE_TTM ∈ (0, 35]、PB ∈ (0, 5]；
+  ROE ≥ 8%；营收增速 ≥ 0、净利增速 ≥ 0；经营现金流 TTM ≥ 0；资产负债率 ≤ 60%。
+  排序=ROE+盈利收益率+账面折价+股息+流动性加权。
+- **quality** — 质量：市值下限按市场 US ≥ $20亿 / HK ≥ HK$50亿 / A ≥ ¥50亿；ROE ≥ 8%、ROA_TTM ≥ 1%；净利润 ≥ 0；
+  经营现金流 TTM ≥ 0；毛利率 ≥ 0；资产负债率 ≤ 60%。
+  排序=ROE 主导的质量/收益/流动性加权。
+- **deep_value** — 深度价值/烟蒂：市值 ≥ 10亿；PE_TTM ∈ (0, 13]、PB ∈ (0, 1]；
+  净利润 ≥ 0；资产负债率 ≤ 50%；流动比率 ≥ 1.5。排序=账面折价主导；
+  `--refine` 精算 NCAV=流动资产−总负债、净现金等，并剔除中概/ADR、只留 `市值 < NCAV`。
+
+阈值常量定义在 `fundamental_analysis/<strategy>_screener.py` 头部，调整只改常量。
 
 ### 3) `signals` — 单/多只指标信号 + detect + L2
 ```bash
