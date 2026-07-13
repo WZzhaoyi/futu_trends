@@ -43,6 +43,9 @@ class EventEngine:
 
     def stop(self):
         self._active = False
+        for thread in (self._thread, self._timer):
+            if thread.is_alive():
+                thread.join(timeout=2)
 
     def register(self, event_type: str, handler: Callable):
         self._handlers[event_type].append(handler)

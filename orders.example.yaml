@@ -11,18 +11,37 @@
 #   - data_gateway: FUTU
 #   - order_gateway: SIM 或 QMT
 # - 支持条件组嵌套，logical_operator/operator 支持 AND、OR。
-# - 支持叶子条件比较符: >、<、>=、<=、==、!=、contains。
+# - 叶子条件比较符按变量类型区分（对齐 IBKR 条件单语义，连续值无相等概念）:
+#   数值字段与 datetime 只支持 >、<、>=、<=；
+#   signal.* 与字符串字段只支持 ==、!=、contains。
 # - 支持 TickData 字段作为变量，例如 datetime、last_price、open_price、high_price、
 #   low_price、pre_close、volume、bid_price_1、ask_price_1 等。
+#   limit_up/limit_down 不可用: 富途行情无真实涨跌停价（仅有最小价差 price_spread），
+#   涨跌停边界请用具体价格数值表达。
 # - 支持 signal.* 虚拟变量，复用 trends.py 与 get_kline_data 缓存:
 #   signal.breakout 的值就是 trends.py 指标函数返回的信号字符串，可用 contains 做关键词匹配。
 #   可用信号: breakout、reverse、continue、top_down、balance。
+#   signal 在后台线程计算并缓存30秒，不阻塞行情处理；缓存未就绪时按空字符串参与比较。
+# - 条件触发为一次性（对齐 IBKR 条件单语义）: 触发即退休并写入 ORDER_STATE_FILE，
+#   动作失败（下单被拒、网关未连接等）只通知、不自动重试，需人工处理。
+# - 条件变量名、信号名在启动时校验；data_gateway 必须是能提供行情的网关（FUTU），
+#   行情订阅失败会导致启动报错，不会出现"已武装但收不到行情"的状态。
 # - datetime 比较值格式必须为: YYYY-MM-DD HH:MM:SS +0800。
 # - SIM 是极简订单源: 不看交易时段、不看价格档位，收到订单立即模拟全部成交。
 # - QMT 当前只作为订单源使用；免费版行情能力不作为条件单依赖。
 # - 订单状态会写入 ORDER_EVENT_LOG，并通过通知链路推送状态变化和成交回报。
+#   只跟踪本引擎提交的订单（雪花纯数字 remark 识别）；同账户的人工/其他系统订单完全过滤。
 # - cancel.conditions 与下单 conditions 复用同一套条件语法；条件满足时尝试撤销该配置提交的未终态订单。
+#   撤单提交失败或订单迟迟未进终态时，每10秒重试一次，最多3次后放弃并通知人工处理
+#   （收市废单、已成交、柜台拒绝撤单等场景不会无限重试）。
+# - datetime 变量的时区：港股/A股为北京时间，美股为美东时间（与 OpenD 行情推送一致），
+#   比较值需自带对应时区偏移，例如美股写 -0400（夏令时）/-0500（冬令时）。
 # - 配置采用严格校验：重复 id、trigger_once 等未实现字段都会导致启动失败。
+#   symbol 必须加引号（否则 YAML 会解析成数字）；limit 下单必须带 price；
+#   datetime 比较值格式在启动时校验；启用订单引用的网关必须已注册。
+# - 触发状态持久化到 ORDER_STATE_FILE：已触发的条件单重启后不再装载，防止重复下单；
+#   修改该条件单的任何配置内容（哈希变化）会自动重新激活。
+# - tick 的 last_price <= 0 时（集合竞价前、坏数据）不评估任何条件，防止止损类条件误触发。
 #
 # 当前不支持:
 # - 条件持续时长，例如“价格保持 5 秒”。

@@ -1,4 +1,5 @@
 import threading
+import time
 from datetime import datetime
 from copy import copy
 from typing import Dict
@@ -105,6 +106,13 @@ QMT_PRODUCT_MAP = {
 }
 
 CHINA_TZ = ZoneInfo("Asia/Shanghai")
+# 实测OpenD: 美股行情的data_date/data_time为美东时间，港股/A股为北京时间
+US_EASTERN_TZ = ZoneInfo("America/New_York")
+
+# 雪花ID纪元(2025-01-01 UTC)，缩短订单ID位数；ID=毫秒时间戳<<12 | 序号，纯数字、跨重启不碰撞
+SNOWFLAKE_EPOCH_MS = 1735689600000
+SNOWFLAKE_SEQ_BITS = 12
+SNOWFLAKE_SEQ_MASK = (1 << SNOWFLAKE_SEQ_BITS) - 1
 
 def convert_symbol_vt2futu(symbol: str, exchange: Exchange) -> str:
     """将合约名称转换为富途格式"""
@@ -132,7 +140,7 @@ def convert_symbol_vt2qmt(symbol: str, exchange: Exchange, market: str) -> str:
 
 def convert_symbol_qmt2vt(code: str, market: str = None) -> tuple:
     """将QMT合约名称转换为内部格式"""
-    symbol, suffix = code.rsplit('.')
+    symbol, suffix = code.rsplit('.', 1)
 
     # 如果market参数未提供，从代码后缀自动推断
     if market is None:
@@ -211,26 +219,29 @@ class FutuGateway(BaseGateway):
         except Exception as e:
             self.write_log(f"富途行情Gateway连接失败: {e}")
 
-    def subscribe(self, req: SubscribeRequest):
-        """订阅行情"""
+    def subscribe(self, req: SubscribeRequest) -> bool:
+        """订阅行情，成功返回True"""
         if not self.quote_ctx:
             self.write_log(f"富途行情Gateway未连接，无法订阅: {req.symbol} {req.exchange}")
-            return
+            return False
 
         if req.exchange not in self.exchanges:
             self.write_log(f"futu不支持订阅行情: {req.symbol} {req.exchange}")
-            return
+            return False
 
         futu_symbol = convert_symbol_vt2futu(req.symbol, req.exchange)
 
         try:
             code, data = self.quote_ctx.subscribe(futu_symbol, "QUOTE", True)
-            if code:
-                self.write_log(f"订阅行情失败：{data}")
-            else:
-                self.write_log(f"订阅行情成功: {futu_symbol}")
         except Exception as e:
             self.write_log(f"订阅行情异常: {futu_symbol} {e}")
+            return False
+
+        if code:
+            self.write_log(f"订阅行情失败：{data}")
+            return False
+        self.write_log(f"订阅行情成功: {futu_symbol}")
+        return True
 
     def get_tick(self, code: str) -> TickData:
         """获取或创建Tick数据"""
@@ -259,10 +270,11 @@ class FutuGateway(BaseGateway):
             if '.' in time_str:
                 time_str = time_str.split('.')[0]
             dt = datetime.strptime(f"{date} {time_str}", "%Y%m%d %H:%M:%S")
-            dt = dt.replace(tzinfo=CHINA_TZ)
 
             # 获取或创建Tick数据
             tick = self.get_tick(symbol)
+            tz = US_EASTERN_TZ if tick.exchange == Exchange.SMART else CHINA_TZ
+            dt = dt.replace(tzinfo=tz)
             tick.datetime = dt
             tick.open_price = row["open_price"]
             tick.high_price = row["high_price"]
@@ -270,12 +282,8 @@ class FutuGateway(BaseGateway):
             tick.pre_close = row["prev_close_price"]
             tick.last_price = row["last_price"]
             tick.volume = row["volume"]
-
-            # 设置涨跌停价格
-            if "price_spread" in row:
-                spread = row["price_spread"]
-                tick.limit_up = tick.last_price + spread * 10
-                tick.limit_down = tick.last_price - spread * 10
+            # 注意: 富途行情无真实涨跌停字段（仅有price_spread最小价差），
+            # limit_up/limit_down保持默认0，不做估算，条件校验层已禁用这两个变量
 
             # 推送Tick数据
             self.on_tick(copy(tick))
@@ -317,9 +325,10 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
         self.limit_ups = {}
         self.limit_downs = {}
         self.count = -1
-        self._order_seq = 0
         self._order_lock = threading.Lock()
-        self.session_id = int(datetime.now().strftime('%H%M%S'))
+        self._last_id_ms = 0
+        self._id_seq = 0
+        self.session_id = int(time.time())
         self.inited = False
         self.account_id = None
 
@@ -336,6 +345,7 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
             account = setting['account_id']
             path = setting['path']
             self.account_id = account
+            self.session_id = int(setting.get('session_id', self.session_id))
 
             self.trader = XtQuantTrader(path=path, session=self.session_id)
             self.trader.register_callback(self)
@@ -385,9 +395,10 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
                 raise ValueError(f"未找到适合交易所{exchange}的账号")
         return account
 
-    def subscribe(self, req: SubscribeRequest):
-        """订阅行情"""
-        self.write_log(f"QMT免费版仅用于订单，跳过行情订阅: {req.symbol} {req.exchange}")
+    def subscribe(self, req: SubscribeRequest) -> bool:
+        """QMT免费版无行情能力，不能作为条件单行情源"""
+        self.write_log(f"QMT免费版不提供行情，订阅失败: {req.symbol} {req.exchange}")
+        return False
 
     def send_order(self, req: OrderRequest):
         """发送订单"""
@@ -509,20 +520,18 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
         if not self.inited:
             return
 
-        if self.count == -1:
-            self.query_trade()
         self.count += 1
 
         if self.count % 5 == 0:
             self.query_order()
+            self.query_trade()
 
         if self.count % 7 == 0:
             self.query_account()
             self.query_position()
 
-        if self.count < 21:
-            return
-        self.count = 0
+        if self.count >= 35:
+            self.count = 0
 
     def _get_contracts(self):
         """获取合约信息"""
@@ -578,10 +587,19 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
         self.write_log(f'获取合约信息完成，共{len(self.contracts)}个合约')
 
     def _get_order_id(self):
-        """生成订单ID"""
+        """生成雪花订单ID：毫秒时间戳<<12 | 序号。
+        纯数字字符串（兼容柜台remark字符限制），跨日/跨重启不碰撞，时钟回拨时保持单调。"""
         with self._order_lock:
-            self._order_seq += 1
-            return f'{self.session_id}#{self._order_seq}'
+            now_ms = int(time.time() * 1000)
+            if now_ms <= self._last_id_ms:
+                self._id_seq += 1
+                if self._id_seq > SNOWFLAKE_SEQ_MASK:
+                    self._last_id_ms += 1
+                    self._id_seq = 0
+            else:
+                self._last_id_ms = now_ms
+                self._id_seq = 0
+            return str(((self._last_id_ms - SNOWFLAKE_EPOCH_MS) << SNOWFLAKE_SEQ_BITS) | self._id_seq)
 
     def _on_tick(self, datas):
         """行情推送回调"""
@@ -666,14 +684,17 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
                 self.write_log(f"处理持仓信息失败: {e}")
 
     def _on_orders(self, order_list: list[XtOrder]):
-        """订单信息回调"""
+        """订单信息回调。只处理本引擎提交的订单（雪花remark为纯数字），
+        人工/其他系统订单完全过滤，不进事件流。"""
         for order in order_list:
             try:
+                orderid = str(order.order_remark or "")
+                if not orderid.isdigit():
+                    continue
                 symbol, exchange = convert_symbol_qmt2vt(order.stock_code)
                 raw_status = getattr(order, "order_status", None)
                 status = QMT_ORDER_STATUS.get(raw_status, Status.UNKNOWN)
                 status_msg = QMT_ORDER_STATUS_TEXT.get(raw_status, f"未知状态:{raw_status}")
-                orderid = order.order_remark or str(order.order_id)
                 vn_order = OrderData(
                     orderid=orderid,
                     symbol=symbol,
@@ -698,29 +719,43 @@ class QmtGateway(BaseGateway, XtQuantTraderCallback):
                 self.write_log(f"处理订单信息失败: {e}")
 
     def _on_trades(self, trade_list: list[XtTrade]):
-        """成交信息回调"""
+        """成交信息回调（实时推送与轮询共用，按tradeid去重）。
+        只处理本引擎订单的成交（雪花remark为纯数字），人工订单成交完全过滤。"""
         for trade in trade_list:
             try:
-                symbol, exchange = convert_symbol_qmt2vt(trade.stock_code)
-                if not trade.order_remark:
+                remark = str(trade.order_remark or "")
+                if not remark.isdigit():
                     continue
+                trade_key = str(trade.traded_id)
+                if trade_key in self.trades:
+                    continue
+                symbol, exchange = convert_symbol_qmt2vt(trade.stock_code)
 
                 trade_data = TradeData(
                     gateway_name=self.gateway_name,
                     symbol=symbol,
                     exchange=exchange,
-                    orderid=trade.order_remark,
+                    orderid=remark,
                     tradeid=trade.traded_id,
                     price=trade.traded_price,
                     datetime=timestamp_to_datetime(trade.traded_time),
                     volume=trade.traded_volume,
                     direction=QMT_TO_VN_TRADE_TYPE.get(trade.order_type, Direction.LONG)
                 )
+                self.trades[trade_key] = trade_data
                 self.on_trade(trade_data)
             except Exception as e:
                 self.write_log(f"处理成交信息失败: {e}")
 
     # XtQuantTraderCallback 回调方法
+    def on_stock_order(self, order: XtOrder):
+        """委托状态实时推送"""
+        self._on_orders([order])
+
+    def on_stock_trade(self, trade: XtTrade):
+        """成交实时推送"""
+        self._on_trades([trade])
+
     def on_order_stock_async_response(self, response: XtOrderResponse):
         """异步下单响应"""
         self.write_log(f'下单响应: {response.order_remark} - {response.error_msg or "成功"}')
@@ -776,8 +811,10 @@ class SimGateway(BaseGateway):
     def connect(self, setting: dict):
         self.write_log("SIM订单Gateway已启用，订单将立即模拟成交")
 
-    def subscribe(self, req: SubscribeRequest):
-        self.write_log(f"SIM不提供行情，跳过订阅: {req.symbol} {req.exchange}")
+    def subscribe(self, req: SubscribeRequest) -> bool:
+        """SIM只做订单模拟，不能作为条件单行情源"""
+        self.write_log(f"SIM不提供行情，订阅失败: {req.symbol} {req.exchange}")
+        return False
 
     def send_order(self, req: OrderRequest) -> str:
         self.order_seq += 1

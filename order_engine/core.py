@@ -22,7 +22,8 @@ class BaseGateway:
     def connect(self, setting: dict):
         raise NotImplementedError
 
-    def subscribe(self, req: SubscribeRequest):
+    def subscribe(self, req: SubscribeRequest) -> bool:
+        """订阅行情，成功返回True。不提供行情的网关返回False。"""
         raise NotImplementedError
 
     def send_order(self, req: OrderRequest) -> str:
@@ -85,27 +86,37 @@ class MainEngine:
         self._gateways[gateway_name] = gateway
         return gateway
 
+    def get_gateway_names(self) -> set:
+        return set(self._gateways)
+
+    def _write_log(self, msg: str):
+        self.event_engine.put(Event(type=EVENT_LOG, data=LogData(msg=msg, gateway_name="MAIN")))
+
     def connect(self, setting: dict, gateway_name: str):
         gateway = self._gateways.get(gateway_name)
         if gateway:
             gateway.connect(setting)
 
-    def subscribe(self, req: SubscribeRequest, gateway_name: str):
+    def subscribe(self, req: SubscribeRequest, gateway_name: str) -> bool:
         gateway = self._gateways.get(gateway_name)
-        if gateway:
-            gateway.subscribe(req)
+        if not gateway:
+            self._write_log(f"订阅失败，未注册网关: {gateway_name} ({req.symbol}.{req.exchange.value})")
+            return False
+        return bool(gateway.subscribe(req))
 
     def send_order(self, req: OrderRequest, gateway_name: str) -> str:
         gateway = self._gateways.get(gateway_name)
-        if gateway:
-            return gateway.send_order(req)
-        return ""
+        if not gateway:
+            self._write_log(f"下单失败，未注册网关: {gateway_name} ({req.symbol}.{req.exchange.value})")
+            return ""
+        return gateway.send_order(req)
 
     def cancel_order(self, req: CancelRequest, gateway_name: str):
         gateway = self._gateways.get(gateway_name)
-        if gateway:
-            return gateway.cancel_order(req)
-        return None
+        if not gateway:
+            self._write_log(f"撤单失败，未注册网关: {gateway_name} ({req.orderid})")
+            return None
+        return gateway.cancel_order(req)
 
     def add_engine(self, engine_class: Type[BaseEngine]) -> BaseEngine:
         engine = engine_class(self, self.event_engine)
@@ -113,6 +124,7 @@ class MainEngine:
         return engine
 
     def close(self):
-        self.event_engine.stop()
+        # 先关网关停止事件产生，再停事件引擎，尽量消费完在途事件
         for gateway in self._gateways.values():
             gateway.close()
+        self.event_engine.stop()
