@@ -150,6 +150,7 @@ cython_debug/
 data/
 output/
 log/
+logs/
 sync/
 config.ini
 

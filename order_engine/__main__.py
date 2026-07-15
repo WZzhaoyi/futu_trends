@@ -1,4 +1,4 @@
-"""条件单系统入口脚本"""
+"""条件单系统前台入口，支持 ``python -m order_engine --config <path>``。"""
 import os
 import queue
 import time
