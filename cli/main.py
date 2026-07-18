@@ -32,11 +32,12 @@ fundamental_analysis screeners / indicator_service），但不依赖其 HTTP/Fas
   signals 单/多只 → 经典指标(EMA/MACD/KD/RSI，ParamsDB 最优参数，缺则回退默认)
           + detect(best_params/meta/performance) + L2(trend-template/200MA/RS/VCP)
 
-== gui 子命令 ==
+== 运维子命令 ==
   web     子进程启动 gui/backend/api.py 的 Web 服务（页面 + /api/* 接口，默认 8001，
           占用报错；--forever 崩溃自动重启）
+  pm2     管理 order-engine / signal-api 的 PM2 进程（非 JSON）
 
-约定：JSON 类子命令输出严格 JSON 到 stdout、进度/告警到 stderr；web 例外（前台运行服务）。
+约定：JSON 类子命令输出严格 JSON 到 stdout、进度/告警到 stderr；web/pm2 例外。
 发布：现以仓库内脚本交付，已做到 CWD 无关（缓存绝对路径）+ OpenD 预检，
       可零改动加 pyproject console_scripts（如 ft = "cli.main:main"）。
 """
@@ -62,6 +63,11 @@ for _p in (
 ):
     if _p not in sys.path:
         sys.path.insert(0, _p)
+
+# PM2 管理只依赖标准库；在加载 futu/pandas 等行情依赖前快速分派。
+if __name__ == "__main__" and sys.argv[1:2] == ["pm2"]:
+    from pm2_service import main as _pm2_main
+    raise SystemExit(_pm2_main(sys.argv[2:]))
 
 import futu as ft  # noqa: E402
 
@@ -461,6 +467,12 @@ def cmd_web(args, config) -> None:
         time.sleep(backoff)
 
 
+def cmd_pm2(args) -> None:
+    """程序化调用 main() 时的 PM2 分派；常规脚本入口会在导入行情依赖前分派。"""
+    from cli.pm2_service import main as pm2_main
+    raise SystemExit(pm2_main(args.pm2_args))
+
+
 # ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
@@ -474,7 +486,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # 全局选项只挂子命令（放在子命令之后）；顶层不带 common，避免与 required --config 双定义冲突
     ap = argparse.ArgumentParser(prog="futu-trends",
-                                 description="futu_trends 统一功能导出 CLI（当前：market-sense）")
+                                 description="futu_trends 统一功能与本地进程管理 CLI")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     pk = sub.add_parser("kline", parents=[common], help="读 OHLCV")
@@ -507,11 +519,19 @@ def _build_parser() -> argparse.ArgumentParser:
     pw.add_argument("--forever", action="store_true",
                     help="崩溃自动重启（跨平台简易守护；正常退出/Ctrl-C 不重启）")
     pw.set_defaults(func=cmd_web)
+
+    ppm2 = sub.add_parser("pm2", help="管理 order-engine / signal-api 的 PM2 进程")
+    ppm2.add_argument("pm2_args", nargs=argparse.REMAINDER,
+                      help="order-engine|signal-api|save 及其参数")
+    ppm2.set_defaults(func=cmd_pm2, skip_config=True)
     return ap
 
 
 def main():
     args = _build_parser().parse_args()
+    if getattr(args, "skip_config", False):
+        args.func(args)
+        return
     config = _load_config(args.config)
     result = args.func(args, config)
     _emit(result, args.out, args.pretty)

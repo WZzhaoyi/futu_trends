@@ -1,15 +1,16 @@
 ---
 name: futu-trends-cli
 description: >
-  futu_trends 统一功能导出 CLI 的调用契约。只读，输出严格 JSON 到 stdout。
+  futu_trends 统一功能导出与本地进程管理 CLI 的调用契约。行情命令只读并输出严格 JSON 到 stdout。
   当需要读取股票 K 线、做条件选股（SEPA/quality/growth_value/deep_value）、或计算单只标的的技术指标与
-  趋势信号（MACD/KD/RSI/trend-template/RS/VCP）时调用。market-sense 为当前唯一功能域。
+  趋势信号（MACD/KD/RSI/trend-template/RS/VCP），以及管理 order-engine / signal-api PM2 进程时调用。
 ---
 
 # futu-trends-cli
 
-futu_trends 项目对外的统一命令入口。只读子命令 `kline` / `screen` / `signals` / `web`，
-全部输出**严格 JSON（无 NaN/Inf）到 stdout**，进度与告警走 stderr。
+futu_trends 项目对外的统一命令入口。`kline` / `screen` / `signals` 为只读 JSON 命令；
+`web` 为前台服务命令；`pm2` 为本地进程状态管理命令。只有 JSON 命令承诺
+**严格 JSON（无 NaN/Inf）到 stdout**，进度与告警走 stderr。
 
 ## 调用方式
 
@@ -20,13 +21,26 @@ futu_trends 项目对外的统一命令入口。只读子命令 `kline` / `scree
 <ENV_PYTHON> -m cli <command> [args] --config <ABS_CONFIG>
 ```
 
+PM2 管理命令的配置参数属于具体服务子命令：
+
+```bash
+<PYTHON> <REPO>/cli/main.py pm2 order-engine <ACTION> --config <ABS_CONFIG>
+<PYTHON> <REPO>/cli/main.py pm2 signal-api <ACTION> --config <ABS_CONFIG> [--port 8001]
+<PYTHON> <REPO>/cli/main.py pm2 save
+```
+
+`pm2` 分派只使用 Python 标准库，不要求调用它的 Python 环境安装 futu/pandas/scipy；
+被管理进程的解释器由 ecosystem 决定，可通过 `ORDER_ENGINE_PYTHON=/path/to/python` 或
+`SIGNAL_API_PYTHON=/path/to/python` 覆盖。
+
 占位符（由部署方按本地环境替换，**不要硬编码进代码**）：
 - `<ENV_PYTHON>`：装好依赖的 python 解释器绝对路径（含 futu / pandas / yfinance 的环境）。
 - `<REPO>`：futu_trends 仓库根绝对路径。
 - `<ABS_CONFIG>`：调用方自备的配置文件绝对路径（见下）。**必填、无默认**，缺失即报错；
   **须置于子命令之后**（如 `screen --market US --config <ABS_CONFIG>`）。始终传绝对路径，CLI 已 CWD 无关。
 - `--out <file>`：写入文件而非 stdout；`--pretty`：缩进美化。
-- **退出码**：成功 `0`；缺 `--config` `2`；配置不可读/缺 `[CONFIG]` 段 `1`；OpenD 不可达（仅 `screen`）`1`。
+- **退出码**：成功 `0`；缺 `--config` `2`；配置不可读/缺 `[CONFIG]` 段 `1`；OpenD 不可达（仅 `screen`）`1`；
+  `pm2` 本地参数/配置错误 `2`，PM2 执行失败 `1`，其他情况透传 PM2 退出码。
 
 > 子进程务必用**脚本绝对路径**形态（`main.py` 自引导 sys.path，任意 CWD 可跑）；
 > `-m cli` 在非仓库目录会报 `No module named cli`，不适合无环境约束的子进程调用。
@@ -52,12 +66,15 @@ scr = call_cli("screen", "--market", "US", "--strategy", "sepa")
 
 > ENV_PYTHON / REPO / ABS_CONFIG 由调用方从配置或环境变量注入，不要写死本地路径。
 
-### 子 agent 白名单
+### 子 agent 权限边界
 
-只放行这一条只读命令即可（CLI 不下单、不改自选、不写交易，攻击面极小）：
+行情子命令只读，不下单、不改自选、不写交易。`pm2 start/restart/stop/delete/save` 会改变本地进程状态，
+不应与只读行情调用共用无条件白名单；`logs/status` 虽只读，也可能暴露运行日志和部署路径。
 
 ```
-<ENV_PYTHON> <REPO>/cli/main.py *
+<ENV_PYTHON> <REPO>/cli/main.py kline *
+<ENV_PYTHON> <REPO>/cli/main.py screen *
+<ENV_PYTHON> <REPO>/cli/main.py signals *
 ```
 
 ## 配置（config.ini，`[CONFIG]` 段）
@@ -110,7 +127,8 @@ SR_PARAMS_DB=<DB_URI>
 - `PROXY` 仅在取 yahoo 数据需代理时填（US `^GSPC` / A 股 `000510.SS` / 各标的 yfinance 均经它）。
 
 **校验与 fail-fast（不回退默认、不静默带病启动）**：
-- 所有子命令：缺 `--config`、文件不可读、或缺 `[CONFIG]` 段 → 立即报错退出（非 0）。
+- `kline`/`screen`/`signals`/`web`：缺 `--config`、文件不可读、或缺 `[CONFIG]` 段 → 立即报错退出（非 0）。
+- `pm2 order-engine` / `pm2 signal-api`：缺 `--config` 或文件不存在 → 立即退出；`pm2 save` 不需要配置。
 - `web` 额外要求（由 api.py 校验）：`[CONFIG]` 必含 `FUTU_HOST`/`FUTU_PORT`/`DATA_SOURCE`，
   且 `FUTU_PORT`/`EMA_PERIOD`（若提供）须为整数，否则拒绝启动。
 
@@ -201,6 +219,33 @@ web [--port <PORT>] [--forever]
 面向人工/浏览器，agent 自动化一般不调用此命令。端口默认 8001，被占用时报错退出
 （`--port` 指定其他端口；启动打印 `API_PORT=`）；`--forever` 崩溃自动重启（正常退出/Ctrl-C 不重启）。
 
+### 5) `pm2` — 管理长期运行进程（**非 JSON，会改变本地进程状态**）
+
+```bash
+pm2 order-engine start|restart|stop|delete|logs|status --config <ABS_CONFIG>
+pm2 signal-api start|restart|stop|delete|logs|status --config <ABS_CONFIG> [--port <PORT>]
+pm2 save
+```
+
+- 两类服务都必须显式传 `--config`，无默认配置；文件不存在时退出码为 `2`。
+- `signal-api` 端口默认 `8001`，配置绝对路径与端口共同确定 PM2 实例名。
+- `order-engine` 由配置绝对路径确定 PM2 实例名。
+- `ORDER_ENGINE_PYTHON` / `SIGNAL_API_PYTHON` 可分别指定解释器；不假定 Conda 环境。
+- `start` 使用 ecosystem 文件并传 `--update-env`；`restart` 更新环境；日志默认显示最后 100 行。
+- PM2 只做进程级 liveness：`api.py` 退出后重启。`/` 不参与自动探活，OpenD/MongoDB/Longbridge
+  等运行期依赖也不作为重启条件，避免依赖故障引发重启风暴。
+- `save` 保存当前 PM2 进程列表，供 PM2 startup/resurrect 使用。
+
+示例：
+
+```bash
+<PYTHON> <REPO>/cli/main.py pm2 order-engine start --config <ABS_ORDER_CONFIG>
+SIGNAL_API_PYTHON=<API_PYTHON> <PYTHON> <REPO>/cli/main.py pm2 signal-api start \
+  --config <ABS_SIGNAL_CONFIG> --port 8001
+<PYTHON> <REPO>/cli/main.py pm2 signal-api status --config <ABS_SIGNAL_CONFIG> --port 8001
+<PYTHON> <REPO>/cli/main.py pm2 save
+```
+
 ## L2 信号块
 
 `signals` 的 L2 是趋势模板/RS/VCP 信号；`screen --refine` 的 L2 则由策略决定：
@@ -247,7 +292,8 @@ Piotroski-like 精算。
   收盘价>EMA50>EMA150>EMA200 且 MA200 上行且在 52 周高低带内。
 
 ## 不变量（契约保证）
-1. stdout 永远是单个严格 JSON 对象（无日志混入、无 NaN/Inf）。
+1. `kline`/`screen`/`signals` 的 stdout 永远是单个严格 JSON 对象（无日志混入、无 NaN/Inf）。
 2. `kline`/`signals` 不需要 OpenD；`screen` 的 L1/snapshot 需要，OpenD 不可达时 stderr 报错 + 退出码 1。
-3. 只读：不下单、不改自选、不写交易。
+3. 行情命令只读：不下单、不改自选、不写交易；`pm2` 仅管理本机进程，不执行交易业务。
 4. `--config` 传绝对路径即 CWD 无关；缓存写入 `CACHE_DIR`（绝对路径）。
+5. `pm2` 不输出 JSON，stdout/stderr 直接透传 PM2，退出码也按上述规则透传。

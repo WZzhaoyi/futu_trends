@@ -15,4 +15,4 @@
 #  Written by Joey <wzzhaoyi@outlook.com>, 2026
 #  Copyright (c)  Joey - All Rights Reserved
 
-"""market-sense 统一 CLI 工具集：行情读取 / 条件选股 / 指标信号。"""
+"""统一 CLI：行情读取、条件选股、指标信号与本地 PM2 进程管理。"""

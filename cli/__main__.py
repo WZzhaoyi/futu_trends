@@ -17,7 +17,11 @@
 
 """使 `python -m cli <command> …` 可直接运行统一 CLI。"""
 
-from .main import main
+import sys
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["pm2"]:
+        from .pm2_service import main as pm2_main
+        raise SystemExit(pm2_main(sys.argv[2:]))
+    from .main import main
     main()
