@@ -1,4 +1,4 @@
-"""PM2 process management for the order engine and Signal API.
+"""PM2 process management for long-running project services.
 
 This module intentionally uses only the Python standard library so process
 management remains available even when market-data dependencies are absent.
@@ -51,6 +51,13 @@ def _config_slug(path: Path) -> str:
     return slug or "config"
 
 
+def _resolved_runtime_dir(raw_path: str) -> Path:
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        raise PM2ConfigError("csi-flow --runtime-dir 必须使用绝对路径")
+    return Path(os.path.abspath(path))
+
+
 def _identity_path(path: Path, platform: str) -> str:
     identity = str(path)
     return identity.lower() if platform == "win32" else identity
@@ -61,6 +68,10 @@ def build_service_spec(
     config: str,
     *,
     port: int = 8001,
+    runtime_dir: str | None = None,
+    symbol: str = "SH.000902",
+    initial_position: str = "flat",
+    entry_date: str | None = None,
     platform: str = sys.platform,
 ) -> ServiceSpec:
     """Resolve one PM2 instance exactly as its ecosystem file does."""
@@ -91,6 +102,44 @@ def build_service_spec(
                 "SIGNAL_API_CONFIG": str(config_path),
                 "SIGNAL_API_PORT": str(port),
             },
+        )
+
+    if service == "csi-flow":
+        if not runtime_dir:
+            raise PM2ConfigError("csi-flow 必须指定 --runtime-dir")
+        runtime_path = _resolved_runtime_dir(runtime_dir)
+        if initial_position not in {"flat", "long"}:
+            raise PM2ConfigError("initial-position 只能是 flat 或 long")
+        if initial_position == "long" and not entry_date:
+            raise PM2ConfigError(
+                "initial-position=long 必须同时指定 --entry-date"
+            )
+        digest_input = "\0".join(
+            (
+                identity,
+                _identity_path(runtime_path, platform),
+                symbol.upper(),
+            )
+        )
+        digest = hashlib.sha256(digest_input.encode()).hexdigest()[:8]
+        environment = {
+            "CSI_FLOW_CONFIG": str(config_path),
+            "CSI_FLOW_RUNTIME_DIR": str(runtime_path),
+            "CSI_FLOW_SYMBOL": symbol.upper(),
+            "CSI_FLOW_INITIAL_POSITION": initial_position,
+        }
+        if entry_date:
+            environment["CSI_FLOW_ENTRY_DATE"] = entry_date
+        return ServiceSpec(
+            service=service,
+            config_path=config_path,
+            instance_name=f"futu-csi-flow-{digest}",
+            ecosystem_path=(
+                PROJECT_ROOT
+                / "market_analysis"
+                / "ecosystem.csi-flow.config.js"
+            ),
+            environment=environment,
         )
 
     raise PM2ConfigError(f"不支持的 PM2 服务: {service}")
@@ -152,7 +201,7 @@ def run_pm2(args: Sequence[str], extra_env: Mapping[str, str] | None = None) -> 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="futu-trends pm2",
-        description="管理 order-engine 与 signal-api 的 PM2 进程",
+        description="管理 order-engine、signal-api 与 csi-flow 的 PM2 进程",
     )
     targets = parser.add_subparsers(dest="target", required=True)
 
@@ -165,6 +214,29 @@ def _build_parser() -> argparse.ArgumentParser:
         child.add_argument("--config", required=True, help="配置文件路径（必填，无默认）")
         if service == "signal-api":
             child.add_argument("--port", type=int, default=8001, help="API 端口（默认 8001）")
+
+    csi_flow = targets.add_parser(
+        "csi-flow",
+        help="管理中证流通 M1 长期信号服务",
+    )
+    csi_flow.add_argument("action", choices=MANAGED_ACTIONS)
+    csi_flow.add_argument(
+        "--config",
+        required=True,
+        help="项目配置文件绝对或项目相对路径",
+    )
+    csi_flow.add_argument(
+        "--runtime-dir",
+        required=True,
+        help="live 运行目录绝对路径",
+    )
+    csi_flow.add_argument("--symbol", default="SH.000902")
+    csi_flow.add_argument(
+        "--initial-position",
+        choices=("flat", "long"),
+        default="flat",
+    )
+    csi_flow.add_argument("--entry-date")
 
     targets.add_parser("save", help="保存当前 PM2 进程列表")
     return parser
@@ -179,6 +251,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.target,
             args.config,
             port=getattr(args, "port", 8001),
+            runtime_dir=getattr(args, "runtime_dir", None),
+            symbol=getattr(args, "symbol", "SH.000902"),
+            initial_position=getattr(args, "initial_position", "flat"),
+            entry_date=getattr(args, "entry_date", None),
         )
         pm2_args = build_pm2_args(args.action, spec)
     except PM2ConfigError as exc:

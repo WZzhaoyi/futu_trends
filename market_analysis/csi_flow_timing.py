@@ -26,10 +26,11 @@ import statistics
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Iterator, Optional
 
 try:
     import numpy as np
@@ -51,6 +52,8 @@ MIN_ROUND_TRIPS = 4
 MIN_EXPOSURE = 0.10
 MAX_EXPOSURE = 0.90
 MAX_CALIBRATION_EDGE_GAP_DAYS = 15
+LIVE_MAINTENANCE_INTERVAL_SECONDS = 60
+MARKET_TIMEZONE = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 ENTRY_TIMES = {"10:30", "14:00"}
 EXIT_TIMES = {"10:00", "10:30", "14:00"}
@@ -74,6 +77,7 @@ GRID_POINTS = (
     * len(EXIT_Z30_GRID)
     * len(EXIT_Z60_GRID)
 )
+
 
 @dataclass(frozen=True)
 class Bar:
@@ -148,8 +152,123 @@ class Evaluation:
     sells: int
 
 
+@dataclass(frozen=True)
+class LiveRuntimePaths:
+    root: Path
+    bars_file: Path
+    thresholds_dir: Path
+    state_file: Path
+    lock_file: Path
+
+    @classmethod
+    def from_argument(cls, raw_path: str) -> "LiveRuntimePaths":
+        root = Path(raw_path).expanduser()
+        if not root.is_absolute():
+            raise ValueError("--runtime-dir 必须使用绝对路径")
+        root = Path(os.path.abspath(root))
+        return cls(
+            root=root,
+            bars_file=root / "calibration_bars.json",
+            thresholds_dir=root / "thresholds",
+            state_file=root / "state.json",
+            lock_file=root / "live.lock",
+        )
+
+    def prepare(self) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.thresholds_dir.mkdir(parents=True, exist_ok=True)
+
+
+class RuntimeFileLock:
+    """Hold one OS-released lock for the lifetime of a live instance."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.handle: Any = None
+
+    def __enter__(self) -> "RuntimeFileLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.handle = self.path.open("a+b")
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                self.handle.seek(0, os.SEEK_END)
+                if self.handle.tell() == 0:
+                    self.handle.write(b"\0")
+                    self.handle.flush()
+                self.handle.seek(0)
+                msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(
+                    self.handle.fileno(),
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+        except (OSError, BlockingIOError) as exc:
+            self.handle.close()
+            self.handle = None
+            raise RuntimeError(
+                f"已有 live 实例占用运行目录: {self.path.parent}"
+            ) from exc
+        return self
+
+    def __exit__(self, _exc_type: Any, _exc: Any, _tb: Any) -> None:
+        if self.handle is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                self.handle.seek(0)
+                msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self.handle.close()
+            self.handle = None
+
+
 def eprint(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
+
+
+@contextmanager
+def managed_futu_context(
+    factory: Callable[..., Any],
+    *,
+    host: str,
+    port: int,
+) -> Iterator[Any]:
+    """Close one Futu context on every Python exit path without masking errors."""
+    context = factory(host=host, port=port)
+    try:
+        yield context
+    finally:
+        try:
+            context.close()
+        except Exception as exc:
+            eprint(f"警告: 关闭 Futu context 失败: {exc}")
+
+
+@contextmanager
+def graceful_stop_event() -> Iterator[threading.Event]:
+    """Convert SIGINT/SIGTERM into a cooperative stop so contexts can close."""
+    stopped = threading.Event()
+
+    def stop_handler(_signum: int, _frame: Any) -> None:
+        stopped.set()
+
+    old_sigint = signal.signal(signal.SIGINT, stop_handler)
+    old_sigterm = signal.signal(signal.SIGTERM, stop_handler)
+    try:
+        yield stopped
+    finally:
+        signal.signal(signal.SIGINT, old_sigint)
+        signal.signal(signal.SIGTERM, old_sigterm)
 
 
 def sha256_file(path: Path) -> str:
@@ -957,8 +1076,7 @@ class ThresholdProvider:
             return self.schedule[month]
         if not self.allow_freeze:
             raise ValueError(
-                f"缺少 {month} 阈值；应在月初重新校准，或显式使用 "
-                "--allow-threshold-freeze"
+                f"缺少 {month} 阈值；应先完成当月校准"
             )
         eligible = [key for key in self.schedule if key <= month]
         if not eligible:
@@ -987,8 +1105,8 @@ def load_live_threshold_provider(
     raw = read_records(path)
     if not isinstance(raw, dict) or not isinstance(raw.get("threshold"), dict):
         raise ValueError(
-            "live 的 --thresholds-file 必须是 calibrate 发布的月度JSON，"
-            "不能直接使用研究回测阈值表"
+            "live 阈值必须是 calibrate 发布的月度JSON，"
+            "不能使用研究回测阈值表"
         )
     if raw.get("schema_version") != PUBLISH_SCHEMA_VERSION:
         raise ValueError(
@@ -1133,7 +1251,7 @@ class ThresholdDirectoryProvider:
             return self.load_month(month).for_date(value)
         if not self.allow_freeze:
             raise ValueError(
-                f"缺少 {path}；应由月度定时任务先发布当月阈值"
+                f"缺少 {path}；应由 live 自动发布当月阈值"
             )
         source_month = self.latest_published_month(month)
         if source_month is None:
@@ -1414,10 +1532,13 @@ def run_fetch_bars(args: argparse.Namespace) -> int:
         raise ValueError(f"历史行情日期范围无效: {start} > {end}")
 
     host, port = live_connection(args)
-    context = OpenQuoteContext(host=host, port=port)
     rows: list[dict[str, Any]] = []
     page_key = None
-    try:
+    with managed_futu_context(
+        OpenQuoteContext,
+        host=host,
+        port=port,
+    ) as context:
         while True:
             ret, data, page_key = context.request_history_kline(
                 args.symbol,
@@ -1447,8 +1568,6 @@ def run_fetch_bars(args: argparse.Namespace) -> int:
             if page_key is None:
                 break
             time.sleep(0.4)
-    finally:
-        context.close()
 
     by_key = {row["time_key"]: row for row in rows if row["time_key"]}
     bars = [by_key[key] for key in sorted(by_key)]
@@ -1551,6 +1670,73 @@ def run_calibrate(args: argparse.Namespace) -> int:
     return 0
 
 
+def current_market_month(now: Optional[datetime] = None) -> date:
+    current = now or datetime.now(MARKET_TIMEZONE)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=MARKET_TIMEZONE)
+    else:
+        current = current.astimezone(MARKET_TIMEZONE)
+    return current.date().replace(day=1)
+
+
+def ensure_live_threshold(
+    args: argparse.Namespace,
+    runtime: LiveRuntimePaths,
+    now: Optional[datetime] = None,
+) -> tuple[str, bool]:
+    """Ensure the current month's audited threshold exists before inference."""
+    runtime.prepare()
+    cutoff = current_market_month(now)
+    month = cutoff.strftime("%Y-%m")
+    publication = runtime.thresholds_dir / f"threshold_{month}.json"
+    if publication.is_file():
+        try:
+            provider = load_live_threshold_provider(
+                publication,
+                symbol=args.symbol,
+                allow_freeze=False,
+            )
+            provider.for_date(cutoff.isoformat())
+            return month, False
+        except (
+            ValueError,
+            OSError,
+            json.JSONDecodeError,
+        ) as exc:
+            eprint(f"{publication} 审计失效，重新生成: {exc}")
+
+    cutoff_text = cutoff.isoformat()
+    run_fetch_bars(
+        argparse.Namespace(
+            symbol=args.symbol,
+            as_of=cutoff_text,
+            start=None,
+            end=None,
+            output=str(runtime.bars_file),
+            config=args.config,
+            host=args.host,
+            port=args.port,
+            futu_time_convention=args.futu_time_convention,
+        )
+    )
+    run_calibrate(
+        argparse.Namespace(
+            bars_file=str(runtime.bars_file),
+            symbol=args.symbol,
+            bar_time_convention=args.futu_time_convention,
+            as_of=cutoff_text,
+            output=str(publication),
+        )
+    )
+    provider = load_live_threshold_provider(
+        publication,
+        symbol=args.symbol,
+        allow_freeze=False,
+    )
+    provider.for_date(cutoff.isoformat())
+    return month, True
+
+
 class LiveState:
     def __init__(
         self,
@@ -1626,7 +1812,11 @@ class LiveEventNotifier:
             return event.get("action") in {"BUY", "SELL"}
         if event_type == "ERROR":
             return True
-        return self.notify_lifecycle and event_type in {"READY", "STOPPED"}
+        return self.notify_lifecycle and event_type in {
+            "READY",
+            "STOPPED",
+            "THRESHOLD_READY",
+        }
 
     def event_key(self, event: dict[str, Any]) -> str:
         return "|".join(
@@ -1896,23 +2086,23 @@ class LiveSignalEngine:
             self.current = bar
 
 
-def live_provider(args: argparse.Namespace) -> Any:
-    if getattr(args, "thresholds_dir", None):
-        return ThresholdDirectoryProvider(
-            Path(args.thresholds_dir).resolve(),
-            symbol=args.symbol,
-            allow_freeze=args.allow_threshold_freeze,
-        )
-    return load_live_threshold_provider(
-        Path(args.thresholds_file).resolve(),
+def live_provider(
+    args: argparse.Namespace,
+    runtime: LiveRuntimePaths,
+) -> ThresholdDirectoryProvider:
+    return ThresholdDirectoryProvider(
+        runtime.thresholds_dir,
         symbol=args.symbol,
-        allow_freeze=args.allow_threshold_freeze,
+        allow_freeze=False,
     )
 
 
 def _run_live(
     args: argparse.Namespace,
     notifier: Optional[LiveEventNotifier],
+    runtime: LiveRuntimePaths,
+    running_script_sha256: str,
+    stopped: threading.Event,
 ) -> int:
     try:
         from futu import (
@@ -1923,15 +2113,17 @@ def _run_live(
             RET_ERROR,
             RET_OK,
             SubType,
+            SysNotifyHandlerBase,
+            SysNotifyType,
         )
     except ImportError as exc:
         raise RuntimeError(
             "live 模式需要 futu-api；安装命令: pip install futu-api"
         ) from exc
 
-    provider = live_provider(args)
+    provider = live_provider(args, runtime)
     state = LiveState(
-        Path(args.state_file).resolve(),
+        runtime.state_file,
         args.initial_position,
         args.entry_date,
     )
@@ -1942,12 +2134,21 @@ def _run_live(
         args.futu_time_convention,
         event_callback=notifier.notify if notifier is not None else None,
     )
+    fatal_event = threading.Event()
+    fatal_lock = threading.Lock()
+    fatal_messages: list[str] = []
+
+    def record_fatal(message: str) -> None:
+        with fatal_lock:
+            if not fatal_messages:
+                fatal_messages.append(message)
+                fatal_event.set()
 
     class Handler(CurKlineHandlerBase):
         def on_recv_rsp(self, rsp_pb: Any) -> tuple[int, Any]:
             ret_code, data = super().on_recv_rsp(rsp_pb)
             if ret_code != RET_OK:
-                engine.emit({"type": "ERROR", "message": str(data)})
+                record_fatal(f"Futu K线回调失败: {data}")
                 return RET_ERROR, data
             try:
                 for index in range(len(data)):
@@ -1955,20 +2156,34 @@ def _run_live(
                     if str(row.get("code", "")) == args.symbol:
                         engine.on_bar(engine.bar_from_row(row))
             except Exception as exc:
-                engine.emit({"type": "ERROR", "message": repr(exc)})
+                record_fatal(f"实时K线处理失败: {exc!r}")
                 return RET_ERROR, data
             return RET_OK, data
 
+    class SystemHandler(SysNotifyHandlerBase):
+        def on_recv_rsp(self, rsp_pb: Any) -> tuple[int, Any]:
+            ret_code, content = super().on_recv_rsp(rsp_pb)
+            if ret_code != RET_OK:
+                record_fatal(f"Futu 系统通知失败: {content}")
+                return RET_ERROR, content
+            if not isinstance(content, tuple) or len(content) != 3:
+                record_fatal(f"Futu 系统通知格式无效: {content!r}")
+                return RET_ERROR, content
+            notify_type, _sub_type, data = content
+            if (
+                notify_type == SysNotifyType.CONN_STATUS
+                and isinstance(data, dict)
+                and data.get("qot_logined") is False
+            ):
+                record_fatal("Futu 行情连接已断开")
+            return RET_OK, content
+
     host, port = live_connection(args)
-    context = OpenQuoteContext(host=host, port=port)
-    stopped = threading.Event()
-
-    def stop_handler(_signum: int, _frame: Any) -> None:
-        stopped.set()
-
-    old_sigint = signal.signal(signal.SIGINT, stop_handler)
-    old_sigterm = signal.signal(signal.SIGTERM, stop_handler)
-    try:
+    with managed_futu_context(
+        OpenQuoteContext,
+        host=host,
+        port=port,
+    ) as context:
         ret, message = context.subscribe(
             [args.symbol], [SubType.K_15M], subscribe_push=False
         )
@@ -1987,20 +2202,69 @@ def _run_live(
             for index in range(len(data))
         ]
         engine.bootstrap(rows)
-        context.set_handler(Handler())
+        if context.set_handler(Handler()) != RET_OK:
+            raise RuntimeError("注册Futu K线回调失败")
+        if context.set_handler(SystemHandler()) != RET_OK:
+            raise RuntimeError("注册Futu系统回调失败")
         ret, message = context.subscribe(
             [args.symbol], [SubType.K_15M], subscribe_push=True
         )
         if ret != RET_OK:
             raise RuntimeError(f"开启K线推送失败: {message}")
-        deadline = time.monotonic() + args.duration if args.duration > 0 else None
+        deadline = (
+            time.monotonic() + args.duration
+            if args.duration > 0
+            else None
+        )
+        ensured_month = current_market_month().strftime("%Y-%m")
+        next_maintenance = (
+            time.monotonic() + LIVE_MAINTENANCE_INTERVAL_SECONDS
+        )
         while not stopped.wait(1.0):
-            if deadline is not None and time.monotonic() >= deadline:
+            if fatal_event.is_set():
+                with fatal_lock:
+                    message = fatal_messages[0]
+                raise RuntimeError(message)
+            if (
+                sha256_file(Path(__file__).resolve())
+                != running_script_sha256
+            ):
+                raise RuntimeError(
+                    "脚本文件在 live 运行期间发生变化；退出并由PM2重启"
+                )
+            now_monotonic = time.monotonic()
+            if deadline is not None and now_monotonic >= deadline:
                 break
-    finally:
-        signal.signal(signal.SIGINT, old_sigint)
-        signal.signal(signal.SIGTERM, old_sigterm)
-        context.close()
+            month = current_market_month().strftime("%Y-%m")
+            if (
+                month != ensured_month
+                and now_monotonic >= next_maintenance
+            ):
+                try:
+                    ensured_month, generated = ensure_live_threshold(
+                        args,
+                        runtime,
+                    )
+                    engine.emit(
+                        {
+                            "type": "THRESHOLD_READY",
+                            "month": ensured_month,
+                            "generated": generated,
+                        }
+                    )
+                except Exception as exc:
+                    engine.emit(
+                        {
+                            "type": "ERROR",
+                            "message": (
+                                f"{month} 自动更新阈值失败，将重试: "
+                                f"{exc!r}"
+                            ),
+                        }
+                    )
+                next_maintenance = (
+                    now_monotonic + LIVE_MAINTENANCE_INTERVAL_SECONDS
+                )
     engine.emit({"type": "STOPPED", "position": state.position})
     return 0
 
@@ -2008,7 +2272,37 @@ def _run_live(
 def run_live(args: argparse.Namespace) -> int:
     notifier = build_live_notifier(args.config, args.notify_lifecycle)
     try:
-        return _run_live(args, notifier)
+        runtime = LiveRuntimePaths.from_argument(args.runtime_dir)
+        runtime.prepare()
+        with graceful_stop_event() as stopped:
+            with RuntimeFileLock(runtime.lock_file):
+                running_script_sha256 = sha256_file(
+                    Path(__file__).resolve()
+                )
+                month, generated = ensure_live_threshold(args, runtime)
+                if stopped.is_set():
+                    return 0
+                if notifier is not None and args.notify_lifecycle:
+                    notifier.notify(
+                        {
+                            "strategy": STRATEGY,
+                            "version": VERSION,
+                            "symbol": args.symbol,
+                            "emitted_at": datetime.now().isoformat(
+                                timespec="seconds"
+                            ),
+                            "type": "THRESHOLD_READY",
+                            "month": month,
+                            "generated": generated,
+                        }
+                    )
+                return _run_live(
+                    args,
+                    notifier,
+                    runtime,
+                    running_script_sha256,
+                    stopped,
+                )
     except Exception as exc:
         if notifier is not None:
             notifier.notify(
@@ -2102,7 +2396,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     live.add_argument("--history-bars", type=int, default=200)
     live.add_argument("--duration", type=int, default=0)
-    live.add_argument("--state-file", required=True)
+    live.add_argument(
+        "--runtime-dir",
+        required=True,
+        help="绝对路径；保存行情、月度阈值、状态和实例锁",
+    )
     live.add_argument(
         "--initial-position", choices=("flat", "long"), default="flat"
     )
@@ -2112,20 +2410,6 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("end", "start"),
         default="end",
         help="Futu time_key口径；默认值为K线结束时间end",
-    )
-    threshold_source = live.add_mutually_exclusive_group(required=True)
-    threshold_source.add_argument(
-        "--thresholds-file",
-        help="由 calibrate 发布并通过审计校验的当月JSON",
-    )
-    threshold_source.add_argument(
-        "--thresholds-dir",
-        help="按threshold_YYYY-MM.json命名的发布目录；跨月自动热加载",
-    )
-    live.add_argument(
-        "--allow-threshold-freeze",
-        action="store_true",
-        help="仅作显式运营降级：当前月缺失时沿用最近发布阈值",
     )
     live.add_argument(
         "--notify-lifecycle",

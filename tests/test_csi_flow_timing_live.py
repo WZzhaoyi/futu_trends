@@ -5,6 +5,7 @@ import sys
 import tempfile
 import types
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -117,13 +118,39 @@ class StrategyDefinitionTest(unittest.TestCase):
                 "live",
                 "--symbol",
                 "SH.000902",
-                "--state-file",
-                "/tmp/state.json",
-                "--thresholds-file",
-                "/tmp/threshold.json",
+                "--runtime-dir",
+                "/tmp/csi-flow",
             ]
         )
         self.assertEqual(live_args.futu_time_convention, "end")
+
+
+class LiveRuntimeTest(unittest.TestCase):
+    def test_runtime_paths_are_fixed_and_require_absolute_root(self):
+        with self.assertRaisesRegex(ValueError, "绝对路径"):
+            timing.LiveRuntimePaths.from_argument("relative/runtime")
+
+        runtime = timing.LiveRuntimePaths.from_argument("/tmp/csi-flow")
+        self.assertEqual(runtime.bars_file, Path("/tmp/csi-flow/calibration_bars.json"))
+        self.assertEqual(runtime.thresholds_dir, Path("/tmp/csi-flow/thresholds"))
+        self.assertEqual(runtime.state_file, Path("/tmp/csi-flow/state.json"))
+
+    def test_runtime_lock_rejects_a_second_live_instance(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            path = Path(raw_dir) / "live.lock"
+            with timing.RuntimeFileLock(path):
+                with self.assertRaisesRegex(RuntimeError, "已有 live 实例"):
+                    with timing.RuntimeFileLock(path):
+                        self.fail("second lock unexpectedly acquired")
+            with timing.RuntimeFileLock(path):
+                pass
+
+    def test_market_month_uses_china_timezone(self):
+        value = datetime(2026, 6, 30, 16, 30, tzinfo=timezone.utc)
+        self.assertEqual(
+            timing.current_market_month(value).isoformat(),
+            "2026-07-01",
+        )
 
 
 class PublicationAndStateIdentityTest(unittest.TestCase):
@@ -199,6 +226,81 @@ class PublicationAndStateIdentityTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "状态文件策略"):
                 timing.LiveState(state_path, "flat", None)
 
+    def live_args(self):
+        return argparse.Namespace(
+            symbol="SH.000902",
+            config=None,
+            host="127.0.0.1",
+            port=11111,
+            futu_time_convention="end",
+        )
+
+    def test_live_threshold_skips_valid_current_publication(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            runtime = timing.LiveRuntimePaths.from_argument(raw_dir)
+            runtime.prepare()
+            publication = runtime.thresholds_dir / "threshold_2026-07.json"
+            publication.write_text(
+                json.dumps(self.valid_publication()),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(timing, "run_fetch_bars") as fetch,
+                mock.patch.object(timing, "run_calibrate") as calibrate,
+            ):
+                month, generated = timing.ensure_live_threshold(
+                    self.live_args(),
+                    runtime,
+                    datetime(2026, 7, 2, tzinfo=timezone.utc),
+                )
+            self.assertEqual(month, "2026-07")
+            self.assertFalse(generated)
+            fetch.assert_not_called()
+            calibrate.assert_not_called()
+
+    def test_live_threshold_fetches_and_calibrates_when_missing(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            runtime = timing.LiveRuntimePaths.from_argument(raw_dir)
+            calls = []
+
+            def fake_fetch(args):
+                calls.append(("fetch", args.as_of, args.output))
+                Path(args.output).write_text("{}", encoding="utf-8")
+                return 0
+
+            def fake_calibrate(args):
+                calls.append(("calibrate", args.as_of, args.output))
+                Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+                Path(args.output).write_text(
+                    json.dumps(self.valid_publication()),
+                    encoding="utf-8",
+                )
+                return 0
+
+            with (
+                mock.patch.object(
+                    timing,
+                    "run_fetch_bars",
+                    side_effect=fake_fetch,
+                ),
+                mock.patch.object(
+                    timing,
+                    "run_calibrate",
+                    side_effect=fake_calibrate,
+                ),
+            ):
+                month, generated = timing.ensure_live_threshold(
+                    self.live_args(),
+                    runtime,
+                    datetime(2026, 7, 2, tzinfo=timezone.utc),
+                )
+            self.assertEqual(month, "2026-07")
+            self.assertTrue(generated)
+            self.assertEqual(
+                [call[0] for call in calls],
+                ["fetch", "calibrate"],
+            )
+
 
 class ThresholdDirectoryProviderTest(unittest.TestCase):
     def fake_loader(self, path, symbol, allow_freeze):
@@ -245,7 +347,7 @@ class ThresholdDirectoryProviderTest(unittest.TestCase):
             strict = timing.ThresholdDirectoryProvider(
                 directory, "SH.000902", allow_freeze=False
             )
-            with self.assertRaisesRegex(ValueError, "月度定时任务"):
+            with self.assertRaisesRegex(ValueError, "live 自动发布"):
                 strict.for_date("2026-08-03")
 
             frozen = timing.ThresholdDirectoryProvider(
@@ -282,15 +384,108 @@ class LiveConnectionTest(unittest.TestCase):
             )
 
 
+class LiveContextCleanupTest(unittest.TestCase):
+    def test_callback_failure_exits_and_closes_context_once(self):
+        contexts = []
+
+        class FakeCurKlineHandlerBase:
+            def on_recv_rsp(self, _rsp_pb):
+                return -1, "callback failed"
+
+        class FakeSysNotifyHandlerBase:
+            def on_recv_rsp(self, _rsp_pb):
+                return 0, ("CONN_STATUS", None, {"qot_logined": True})
+
+        class FakeContext:
+            def __init__(self, host, port):
+                self.handlers = []
+                self.subscribe_count = 0
+                self.close_count = 0
+                contexts.append(self)
+
+            def subscribe(self, *_args, **_kwargs):
+                self.subscribe_count += 1
+                if self.subscribe_count == 2:
+                    handler = next(
+                        item
+                        for item in self.handlers
+                        if isinstance(item, FakeCurKlineHandlerBase)
+                    )
+                    handler.on_recv_rsp(None)
+                return 0, "ok"
+
+            def get_cur_kline(self, *_args, **_kwargs):
+                return 0, []
+
+            def set_handler(self, handler):
+                self.handlers.append(handler)
+                return 0
+
+            def close(self):
+                self.close_count += 1
+
+        fake_futu = types.SimpleNamespace(
+            AuType=types.SimpleNamespace(NONE="NONE"),
+            CurKlineHandlerBase=FakeCurKlineHandlerBase,
+            KLType=types.SimpleNamespace(K_15M="K_15M"),
+            OpenQuoteContext=FakeContext,
+            RET_ERROR=-1,
+            RET_OK=0,
+            SubType=types.SimpleNamespace(K_15M="K_15M"),
+            SysNotifyHandlerBase=FakeSysNotifyHandlerBase,
+            SysNotifyType=types.SimpleNamespace(CONN_STATUS="CONN_STATUS"),
+        )
+        with tempfile.TemporaryDirectory() as raw_dir:
+            runtime = timing.LiveRuntimePaths.from_argument(raw_dir)
+            runtime.prepare()
+            args = argparse.Namespace(
+                symbol="SH.000902",
+                config=None,
+                host="127.0.0.1",
+                port=11111,
+                history_bars=200,
+                duration=5,
+                initial_position="flat",
+                entry_date=None,
+                futu_time_convention="end",
+            )
+            with (
+                mock.patch.dict(sys.modules, {"futu": fake_futu}),
+                mock.patch.object(timing, "live_provider", return_value=object()),
+                mock.patch.object(
+                    timing.LiveSignalEngine,
+                    "bootstrap",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    timing.LiveSignalEngine,
+                    "emit",
+                    return_value=None,
+                ),
+                self.assertRaisesRegex(RuntimeError, "callback failed"),
+            ):
+                timing._run_live(
+                    args,
+                    None,
+                    runtime,
+                    timing.sha256_file(MODULE_PATH),
+                    timing.threading.Event(),
+                )
+        self.assertEqual(len(contexts), 1)
+        self.assertEqual(contexts[0].close_count, 1)
+
+
 class FetchBarsTest(unittest.TestCase):
     def test_fetches_all_pages_and_publishes_atomic_input(self):
         calls = []
+        contexts = []
 
         class FakeContext:
             def __init__(self, host, port):
                 self.host = host
                 self.port = port
                 self.closed = False
+                contexts.append(self)
 
             def request_history_kline(self, symbol, **kwargs):
                 calls.append((symbol, kwargs))
@@ -348,6 +543,46 @@ class FetchBarsTest(unittest.TestCase):
         self.assertEqual(calls[0][1]["autype"], "NONE")
         self.assertIsNone(calls[0][1]["page_req_key"])
         self.assertEqual(calls[1][1]["page_req_key"], b"next")
+        self.assertTrue(contexts[0].closed)
+
+    def test_fetch_closes_context_when_futu_request_fails(self):
+        contexts = []
+
+        class FakeContext:
+            def __init__(self, host, port):
+                self.closed = False
+                contexts.append(self)
+
+            def request_history_kline(self, *_args, **_kwargs):
+                return -1, "request failed", None
+
+            def close(self):
+                self.closed = True
+
+        fake_futu = types.SimpleNamespace(
+            AuType=types.SimpleNamespace(NONE="NONE"),
+            KLType=types.SimpleNamespace(K_15M="K_15M"),
+            OpenQuoteContext=FakeContext,
+            RET_OK=0,
+        )
+        args = argparse.Namespace(
+            as_of="2026-07-01",
+            start=None,
+            end=None,
+            host="127.0.0.1",
+            port=11111,
+            config=None,
+            symbol="SH.000902",
+            output="/tmp/not-written.json",
+            futu_time_convention="end",
+        )
+        with (
+            mock.patch.dict(sys.modules, {"futu": fake_futu}),
+            self.assertRaisesRegex(RuntimeError, "request failed"),
+        ):
+            timing.run_fetch_bars(args)
+        self.assertEqual(len(contexts), 1)
+        self.assertTrue(contexts[0].closed)
 
 
 if __name__ == "__main__":
