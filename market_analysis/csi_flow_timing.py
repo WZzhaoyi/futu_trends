@@ -1,83 +1,13 @@
 #!/usr/bin/env python3
-"""M0: CSI Free Float price-only intraday timing strategy.
+"""中证流通择时信号。
 
-Strategy id: M0-v0.5-price-rolling9-held-downside.
-``live`` emits signals and persists state; it never submits an order.
-Production execution needs independent order, fill, reconciliation,
-market-data integrity, alerting and kill-switch services.
-Notification routing: BUY, SELL and ERROR events are pushed asynchronously
-through the project ``NotificationEngine`` to the Webhook, Telegram and Email
-channels configured in ``config.ini``; SIGNAL/NONE events are not pushed.
-The Futu SDK logs under ``~/.com.futunn.FutuOpenD/Log`` on macOS; the service
-account needs a writable home/log directory.
+策略版本：M1-LF-held-downside-rolling10-exact-grid
 
-Paths in commands may be absolute; no command assumes a working directory.
-
-Backtest::
-
-    python /absolute/path/csi_flow_timing.py backtest \
-      --bars-file /absolute/path/csi_flow_15m_futu.json \
-      --symbol 000902.SH --start 2022-01-04 --end 2026-07-23 \
-      --output-dir /absolute/path/m0_backtest
-
-Generate one month's threshold::
-
-    python /absolute/path/csi_flow_timing.py fetch-bars \
-      --symbol SH.000902 --as-of 2026-07-01 \
-      --config /absolute/path/config.ini \
-      --output /absolute/path/csi_flow_15m_futu.json
-
-    python /absolute/path/csi_flow_timing.py calibrate \
-      --bars-file /absolute/path/csi_flow_15m_futu.json \
-      --symbol 000902.SH --bar-time-convention end --as-of 2026-07-01 \
-      --output /absolute/path/threshold_2026-07.json
-
-Signal-only live inference::
-
-    python /absolute/path/csi_flow_timing.py live \
-      --symbol SH.000902 \
-      --thresholds-dir /absolute/path/thresholds \
-      --state-file /absolute/path/m0_live_state.json \
-      --config /absolute/path/config.ini --futu-time-convention end
-
-``live`` is a long-running process. Use a process supervisor (PM2, systemd or
-launchd) for it; a system timer such as cron should only refresh
-``threshold_YYYY-MM.json`` before the first decision point of a new month,
-via the project wrapper ``market_analysis/run_csi_flow_calibration.sh``::
-
-    PYTHON=/path/to/python /bin/bash market_analysis/run_csi_flow_calibration.sh
-    # crontab (monthly, 00:15; escape % in crontab):
-    15 0 1 * * PYTHON=/path/to/python /bin/bash /path/to/run_csi_flow_calibration.sh >> /path/to/cron_csi_flow_$(date +\%Y\%m\%d).log 2>&1
-
-The wrapper reads environment variables for overrides:
-``CSI_FLOW_FETCH_FROM_FUTU=0`` skips the Futu refresh and reuses the bars
-file pointed to by ``CSI_FLOW_BARS_FILE`` (for pipelines that maintain their
-own history); ``CSI_FLOW_BAR_TIME_CONVENTION`` defaults to ``end`` because
-Futu's raw ``time_key`` is the bar's close time — set it to ``start`` only if
-your OpenD returns bar open times.
-
-Operational constraints (enforced by the code):
-
-* Futu ``time_key`` convention (``--futu-time-convention``) must be verified
-  against a known bar first; it shifts every bar key by 15 minutes and
-  directly determines whether the 10:00, 10:30 and 14:00 checkpoints align.
-* ``calibrate`` rejects a training window that does not end strictly before
-  the target month, so a stale history file fails rather than publishing a
-  silently outdated threshold.
-* ``live`` does not exit by trading day or session: it holds the Futu K-line
-  subscription until SIGINT/SIGTERM or ``--duration`` lapses, idles naturally
-  outside RTH, and never backfills checkpoints missed while down. Run it
-  24x7 and treat an in-session stop as an alert. If the environment forces
-  daily start/stop, launch at 09:15 and SIGTERM at 15:15 on trading days,
-  but also filter the Futu trading calendar for statutory holidays — a plain
-  weekday cron (``1-5``) does not detect market closures.
-* With the current month's threshold missing, ``live`` fails and notifies by
-  default; ``--allow-threshold-freeze`` is an explicit operational downgrade
-  that reuses the most recent published threshold.
-* Threshold publications embed the SHA-256 of this script. After any change
-  to ``csi_flow_timing.py``, republish the current month's threshold; the
-  loader rejects a threshold whose recorded SHA does not match the running
-  script.
+用法：
+    python /absolute/path/csi_flow_timing.py backtest --help
+    python /absolute/path/csi_flow_timing.py fetch-bars --help
+    python /absolute/path/csi_flow_timing.py calibrate --help
+    python /absolute/path/csi_flow_timing.py live --help
 """
 
 from __future__ import annotations
@@ -96,16 +26,23 @@ import statistics
 import sys
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
+try:
+    import numpy as np
+except ImportError:  # live inference itself does not require NumPy
+    np = None
 
-VERSION = "M0-v0.5-price-rolling9-held-downside-exact-grid"
+
+STRATEGY = "m1"
+STRATEGY_STATUS = "frozen_primary"
+VERSION = "M1-LF-held-downside-rolling10-exact-grid"
 PUBLISH_SCHEMA_VERSION = 1
 SEARCH_METHOD = "exact_frozen_grid"
-WINDOW_MONTHS = 9
+WINDOW_MONTHS = 10
 VOLATILITY_BARS = 32
 CALIBRATION_COST_BPS = 5.0
 CONSTRAINT_COST_BPS = 10.0
@@ -119,10 +56,24 @@ ENTRY_TIMES = {"10:30", "14:00"}
 EXIT_TIMES = {"10:00", "10:30", "14:00"}
 ALL_DECISION_TIMES = ENTRY_TIMES | EXIT_TIMES
 
-ENTRY_Z30_GRID = (-0.50, -0.25, 0.00, 0.25, 0.50, 0.75, 1.00, 1.25)
-ENTRY_Z60_GRID = (-0.25, 0.00, 0.25, 0.50, 0.75, 1.00, 1.25, 1.50)
-EXIT_Z30_GRID = (-1.50, -1.25, -1.00, -0.75, -0.50, -0.25, 0.00, 0.25)
-EXIT_Z60_GRID = (-1.50, -1.25, -1.00, -0.75, -0.50, -0.25, 0.00, 0.25)
+ENTRY_Z30_GRID = tuple(
+    round(-0.50 + 0.25 * index, 2) for index in range(13)
+)
+ENTRY_Z60_GRID = tuple(
+    round(-0.25 + 0.25 * index, 2) for index in range(11)
+)
+EXIT_Z30_GRID = tuple(
+    round(-1.25 + 0.25 * index, 2) for index in range(7)
+)
+EXIT_Z60_GRID = tuple(
+    round(-1.50 + 0.25 * index, 2) for index in range(8)
+)
+GRID_POINTS = (
+    len(ENTRY_Z30_GRID)
+    * len(ENTRY_Z60_GRID)
+    * len(EXIT_Z30_GRID)
+    * len(EXIT_Z60_GRID)
+)
 
 @dataclass(frozen=True)
 class Bar:
@@ -168,7 +119,7 @@ class Threshold:
     entry_z60: float
     exit_z30: float
     exit_z60: float
-    source: str = VERSION
+    source: str = field(default_factory=lambda: VERSION)
 
 
 @dataclass(frozen=True)
@@ -641,7 +592,7 @@ def optimize_exhaustive(
     cache: dict[Candidate, Evaluation],
     constraint_cache: dict[Candidate, Evaluation],
 ) -> tuple[Candidate, Evaluation]:
-    """Evaluate every point in the frozen grid and return the global optimum."""
+    """Standard-library fallback for the exact 8,008-point grid."""
     rows: list[tuple[Candidate, Evaluation]] = []
     for values in itertools.product(
         ENTRY_Z30_GRID,
@@ -665,6 +616,205 @@ def optimize_exhaustive(
         if constraint.strategy_return >= MIN_CONSTRAINT_RETURN:
             rows.append((candidate, evaluation))
     return choose_global_optimum(rows)
+
+
+def optimize_exhaustive_vectorized(
+    bars: list[Bar],
+    features: list[Optional[Feature]],
+) -> tuple[Candidate, Evaluation, int, Evaluation]:
+    """Evaluate all 8,008 candidates exactly with vectorized state arrays.
+
+    Candidate states are independent; NumPy only evaluates them in parallel.
+    The path, next-bar execution, T+1 rule, objective and tie-break are the
+    same as ``evaluate_candidate``. The chosen candidate is re-evaluated by
+    that scalar implementation before publication.
+    """
+    if np is None:
+        cache: dict[Candidate, Evaluation] = {}
+        constraint_cache: dict[Candidate, Evaluation] = {}
+        candidate, evaluation = optimize_exhaustive(
+            bars, features, cache, constraint_cache
+        )
+        return (
+            candidate,
+            evaluation,
+            len(cache),
+            constraint_cache[candidate],
+        )
+
+    candidates = [
+        Candidate(*values)
+        for values in itertools.product(
+            ENTRY_Z30_GRID,
+            ENTRY_Z60_GRID,
+            EXIT_Z30_GRID,
+            EXIT_Z60_GRID,
+        )
+    ]
+    count = len(candidates)
+    entry_z30 = np.array(
+        [candidate.entry_z30 for candidate in candidates], dtype=float
+    )
+    entry_z60 = np.array(
+        [candidate.entry_z60 for candidate in candidates], dtype=float
+    )
+    exit_z30 = np.array(
+        [candidate.exit_z30 for candidate in candidates], dtype=float
+    )
+    exit_z60 = np.array(
+        [candidate.exit_z60 for candidate in candidates], dtype=float
+    )
+    costs = np.array(
+        [CALIBRATION_COST_BPS, CONSTRAINT_COST_BPS], dtype=float
+    ) / 10000
+    cash = np.ones((2, count), dtype=float)
+    units = np.zeros((2, count), dtype=float)
+    holding = np.zeros(count, dtype=bool)
+    pending = np.zeros(count, dtype=np.int8)
+    entry_session = np.full(count, -1, dtype=np.int32)
+    buys = np.zeros(count, dtype=np.int16)
+    sells = np.zeros(count, dtype=np.int16)
+    exposure_bars = np.zeros(count, dtype=np.int32)
+    day_held_bars = np.zeros(count, dtype=np.int16)
+    day_bar_count = 0
+    previous_daily_equity = np.ones((2, count), dtype=float)
+    previous_daily_benchmark = 1.0
+    daily_return_sum = np.zeros(count, dtype=float)
+    held_downside_square_sum = np.zeros(count, dtype=float)
+    day_count = 0
+    last_equity = np.ones((2, count), dtype=float)
+
+    session_dates = sorted({bar.trading_date for bar in bars})
+    session_lookup = {
+        trading_date: index
+        for index, trading_date in enumerate(session_dates)
+    }
+    sessions = np.array(
+        [session_lookup[bar.trading_date] for bar in bars], dtype=np.int32
+    )
+    first_open = bars[0].open
+
+    for index, bar in enumerate(bars):
+        buy_pending = pending == 1
+        if np.any(buy_pending):
+            units[:, buy_pending] = (
+                cash[:, buy_pending]
+                * (1 - costs[:, None])
+                / bar.open
+            )
+            cash[:, buy_pending] = 0.0
+            holding[buy_pending] = True
+            entry_session[buy_pending] = sessions[index]
+            pending[buy_pending] = 0
+            buys[buy_pending] += 1
+
+        sell_pending = pending == 2
+        if np.any(sell_pending):
+            cash[:, sell_pending] = (
+                units[:, sell_pending]
+                * bar.open
+                * (1 - costs[:, None])
+            )
+            units[:, sell_pending] = 0.0
+            holding[sell_pending] = False
+            entry_session[sell_pending] = -1
+            pending[sell_pending] = 0
+            sells[sell_pending] += 1
+
+        feature = features[index]
+        if feature is not None and index < len(bars) - 1:
+            no_pending = pending == 0
+            if bar.clock in ENTRY_TIMES:
+                buy_signal = (
+                    (~holding)
+                    & no_pending
+                    & (feature.z30 >= entry_z30)
+                    & (feature.z60 >= entry_z60)
+                )
+                pending[buy_signal] = 1
+            if bar.clock in EXIT_TIMES:
+                sell_signal = (
+                    holding
+                    & no_pending
+                    & (sessions[index] > entry_session)
+                    & (feature.z30 <= exit_z30)
+                    & (feature.z60 <= exit_z60)
+                )
+                pending[sell_signal] = 2
+
+        equity = cash + units * bar.close
+        exposure_bars[holding] += 1
+        day_held_bars[holding] += 1
+        day_bar_count += 1
+        last_equity = equity
+        day_end = (
+            index == len(bars) - 1
+            or bars[index + 1].trading_date != bar.trading_date
+        )
+        if day_end:
+            strategy_daily = equity / previous_daily_equity - 1
+            benchmark = bar.close / first_open
+            benchmark_daily = benchmark / previous_daily_benchmark - 1
+            day_exposure = day_held_bars / day_bar_count
+            daily_return_sum += strategy_daily[0]
+            held_downside_square_sum += (
+                day_exposure * min(benchmark_daily, 0.0)
+            ) ** 2
+            previous_daily_equity = equity.copy()
+            previous_daily_benchmark = benchmark
+            day_held_bars.fill(0)
+            day_bar_count = 0
+            day_count += 1
+
+    held_downside = np.sqrt(held_downside_square_sum / day_count)
+    scores = np.full(count, -np.inf)
+    valid = held_downside > 1e-12
+    scores[valid] = (
+        (daily_return_sum[valid] / day_count)
+        / held_downside[valid]
+        * math.sqrt(252)
+    )
+    stress_return = last_equity[1] - 1
+    exposure = exposure_bars / len(bars)
+    eligible = (
+        (np.minimum(buys, sells) >= MIN_ROUND_TRIPS)
+        & (exposure >= MIN_EXPOSURE)
+        & (exposure <= MAX_EXPOSURE)
+        & np.isfinite(scores)
+        & (stress_return >= MIN_CONSTRAINT_RETURN)
+    )
+    indexes = np.flatnonzero(eligible)
+    if not len(indexes):
+        raise RuntimeError(
+            "完整阈值网格中没有同时满足成本、交易次数、暴露和有限目标的候选"
+        )
+    best_score = np.max(scores[indexes])
+    ties = [
+        int(index)
+        for index in indexes
+        if scores[index] == best_score
+    ]
+    chosen_index = min(
+        ties,
+        key=lambda index: (
+            abs(candidates[index].entry_z30)
+            + abs(candidates[index].entry_z60)
+            + abs(candidates[index].exit_z30)
+            + abs(candidates[index].exit_z60),
+            candidates[index].entry_z30,
+            candidates[index].entry_z60,
+            candidates[index].exit_z30,
+            candidates[index].exit_z60,
+        ),
+    )
+    candidate = candidates[chosen_index]
+    evaluation = evaluate_candidate(
+        bars, features, candidate, CALIBRATION_COST_BPS
+    )
+    constraint = evaluate_candidate(
+        bars, features, candidate, CONSTRAINT_COST_BPS
+    )
+    return candidate, evaluation, count, constraint
 
 
 def calibrate_month(
@@ -701,15 +851,7 @@ def calibrate_month(
             f"{train_bars[-1].trading_date}"
         )
 
-    cache: dict[Candidate, Evaluation] = {}
-    constraint_cache: dict[Candidate, Evaluation] = {}
-    candidate, evaluation = optimize_exhaustive(
-        train_bars,
-        train_features,
-        cache,
-        constraint_cache,
-    )
-    return candidate, evaluation, len(cache), constraint_cache[candidate]
+    return optimize_exhaustive_vectorized(train_bars, train_features)
 
 
 def build_schedule(
@@ -734,7 +876,10 @@ def build_schedule(
         )
         audits.append(
             {
+                "strategy": STRATEGY,
+                "version": VERSION,
                 "month": month,
+                "window_months": WINDOW_MONTHS,
                 "window_start": shift_months(
                     cutoff, -WINDOW_MONTHS
                 ).isoformat(),
@@ -755,6 +900,7 @@ def build_schedule(
                 "constraint_strategy_return": constraint.strategy_return,
                 "search_method": SEARCH_METHOD,
                 "search_evaluations": count,
+                "grid_points": GRID_POINTS,
             }
         )
         eprint(
@@ -854,17 +1000,27 @@ def load_live_threshold_provider(
         raise ValueError(
             f"阈值版本 {raw.get('version')!r} 与脚本 {VERSION!r} 不一致"
         )
+    if raw.get("strategy") != STRATEGY:
+        raise ValueError(
+            f"阈值策略 {raw.get('strategy')!r} 与脚本 "
+            f"{STRATEGY!r} 不一致"
+        )
+    if raw.get("strategy_status") != STRATEGY_STATUS:
+        raise ValueError(
+            f"阈值策略状态 {raw.get('strategy_status')!r} 与脚本 "
+            f"{STRATEGY_STATUS!r} 不一致"
+        )
+    if int(raw.get("window_months", 0)) != WINDOW_MONTHS:
+        raise ValueError(
+            f"阈值校准窗口不是冻结的 {WINDOW_MONTHS} 个月"
+        )
+    if int(raw.get("grid_points", 0)) != GRID_POINTS:
+        raise ValueError(f"阈值网格点数不是冻结的 {GRID_POINTS}")
     if raw.get("search_method") != SEARCH_METHOD:
         raise ValueError("阈值文件不是完整精确网格搜索结果")
-    expected_evaluations = (
-        len(ENTRY_Z30_GRID)
-        * len(ENTRY_Z60_GRID)
-        * len(EXIT_Z30_GRID)
-        * len(EXIT_Z60_GRID)
-    )
-    if int(raw.get("search_evaluations", 0)) != expected_evaluations:
+    if int(raw.get("search_evaluations", 0)) != GRID_POINTS:
         raise ValueError(
-            f"阈值文件搜索数不是完整网格 {expected_evaluations}"
+            f"阈值文件搜索数不是完整网格 {GRID_POINTS}"
         )
     if float(raw.get("constraint_strategy_return", -math.inf)) < (
         MIN_CONSTRAINT_RETURN
@@ -1123,6 +1279,8 @@ def simulate(
     total_return = last["equity"] - 1
     benchmark_return = last["benchmark"] - 1
     metrics = {
+        "strategy": STRATEGY,
+        "strategy_status": STRATEGY_STATUS,
         "version": VERSION,
         "test_start": start,
         "test_end": end,
@@ -1143,6 +1301,7 @@ def simulate(
         "sells": sum(action.side == "SELL" for action in actions),
         "ending_position": curve[-1]["position"],
         "window_months": WINDOW_MONTHS,
+        "grid_points": GRID_POINTS,
         "objective": "held_market_downside_ratio",
         "calibration_cost_bps": CALIBRATION_COST_BPS,
         "constraint_cost_bps": CONSTRAINT_COST_BPS,
@@ -1265,7 +1424,7 @@ def run_fetch_bars(args: argparse.Namespace) -> int:
                 start=start,
                 end=end,
                 ktype=KLType.K_15M,
-                autype=AuType.QFQ,
+                autype=AuType.NONE,
                 max_count=1000,
                 page_req_key=page_key,
             )
@@ -1299,6 +1458,7 @@ def run_fetch_bars(args: argparse.Namespace) -> int:
         "schema_version": 1,
         "source": "futu.request_history_kline",
         "symbol": args.symbol,
+        "autype": "NONE",
         "fetched_at": datetime.now().astimezone().isoformat(
             timespec="seconds"
         ),
@@ -1355,6 +1515,8 @@ def run_calibrate(args: argparse.Namespace) -> int:
     payload = {
         "schema_version": PUBLISH_SCHEMA_VERSION,
         "publication_kind": "monthly_threshold",
+        "strategy": STRATEGY,
+        "strategy_status": STRATEGY_STATUS,
         "version": VERSION,
         "script_sha256": sha256_file(Path(__file__).resolve()),
         "published_at": datetime.now().astimezone().isoformat(
@@ -1366,6 +1528,8 @@ def run_calibrate(args: argparse.Namespace) -> int:
         "window_start": window_start,
         "window_end": cutoff.fromordinal(cutoff.toordinal() - 1).isoformat(),
         "search_method": SEARCH_METHOD,
+        "window_months": WINDOW_MONTHS,
+        "grid_points": GRID_POINTS,
         "threshold": asdict(threshold),
         "training_evaluation": asdict(evaluation),
         "constraint_cost_bps": CONSTRAINT_COST_BPS,
@@ -1397,6 +1561,16 @@ class LiveState:
         self.path = path
         if path.exists():
             raw = json.loads(path.read_text(encoding="utf-8"))
+            if raw.get("strategy") != STRATEGY:
+                raise ValueError(
+                    f"状态文件策略 {raw.get('strategy')!r} 与当前 "
+                    f"{STRATEGY!r} 不一致"
+                )
+            if raw.get("version") != VERSION:
+                raise ValueError(
+                    f"状态文件版本 {raw.get('version')!r} 与当前 "
+                    f"{VERSION!r} 不一致"
+                )
             self.position = int(raw.get("position", 0))
             self.entry_date = raw.get("entry_date")
             self.pending = raw.get("pending")
@@ -1414,6 +1588,7 @@ class LiveState:
 
     def save(self) -> None:
         payload = {
+            "strategy": STRATEGY,
             "version": VERSION,
             "position": self.position,
             "entry_date": self.entry_date,
@@ -1440,7 +1615,7 @@ class LiveEventNotifier:
         self.last_enqueued: dict[str, float] = {}
         self.thread = threading.Thread(
             target=self._run,
-            name="m0-live-notifier",
+            name="m1-live-notifier",
             daemon=True,
         )
         self.thread.start()
@@ -1478,12 +1653,12 @@ class LiveEventNotifier:
         symbol = str(event.get("symbol", ""))
         action = str(event.get("action", ""))
         label = action if event_type == "SIGNAL" else event_type
-        subject = f"M0 {symbol} {label}".strip()
+        subject = f"M1 {symbol} {label}".strip()
         if event_type == "SIGNAL":
             feature = event.get("feature") or {}
             threshold = event.get("threshold") or {}
             message = (
-                f"[M0] {symbol} {action}\n"
+                f"[M1] {symbol} {action}\n"
                 f"信号K线: {event.get('bar_key')}\n"
                 f"z30/z60: {float(feature.get('z30', math.nan)):.3f} / "
                 f"{float(feature.get('z60', math.nan)):.3f}\n"
@@ -1491,10 +1666,10 @@ class LiveEventNotifier:
                 f"信号前仓位: {event.get('position_before')}"
             )
         elif event_type == "ERROR":
-            message = f"[M0] {symbol} 实时推理错误\n{event.get('message', '')}"
+            message = f"[M1] {symbol} 实时推理错误\n{event.get('message', '')}"
         else:
             message = (
-                f"[M0] {symbol} {event_type}\n"
+                f"[M1] {symbol} {event_type}\n"
                 f"仓位状态: {event.get('position')}\n"
                 f"时间: {event.get('emitted_at', '')}"
             )
@@ -1571,6 +1746,7 @@ class LiveSignalEngine:
 
     def emit(self, event: dict[str, Any]) -> None:
         payload = {
+            "strategy": STRATEGY,
             "version": VERSION,
             "symbol": self.symbol,
             "emitted_at": datetime.now().isoformat(timespec="seconds"),
@@ -1802,7 +1978,7 @@ def _run_live(
             args.symbol,
             args.history_bars,
             KLType.K_15M,
-            AuType.QFQ,
+            AuType.NONE,
         )
         if ret != RET_OK:
             raise RuntimeError(f"获取预热K线失败: {data}")
@@ -1837,6 +2013,7 @@ def run_live(args: argparse.Namespace) -> int:
         if notifier is not None:
             notifier.notify(
                 {
+                    "strategy": STRATEGY,
                     "version": VERSION,
                     "symbol": args.symbol,
                     "emitted_at": datetime.now().isoformat(timespec="seconds"),
@@ -1868,7 +2045,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     backtest = subparsers.add_parser(
-        "backtest", help="自动rolling9校准并回测"
+        "backtest", help="自动rolling10校准并回测"
     )
     add_bar_arguments(backtest)
     backtest.add_argument("--start", required=True)
@@ -1894,7 +2071,7 @@ def build_parser() -> argparse.ArgumentParser:
     fetch_bars.add_argument(
         "--futu-time-convention",
         choices=("end", "start"),
-        default="start",
+        default="end",
         help="记录Futu time_key口径，供后续calibrate使用",
     )
     fetch_bars.set_defaults(func=run_fetch_bars)
@@ -1933,8 +2110,8 @@ def build_parser() -> argparse.ArgumentParser:
     live.add_argument(
         "--futu-time-convention",
         choices=("end", "start"),
-        required=True,
-        help="必须按已核对的Futu time_key口径显式指定",
+        default="end",
+        help="Futu time_key口径；默认值为K线结束时间end",
     )
     threshold_source = live.add_mutually_exclusive_group(required=True)
     threshold_source.add_argument(

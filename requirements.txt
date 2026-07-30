@@ -33,7 +33,7 @@ fastapi==0.135.1
 fonttools==4.56.0
 frozendict==2.4.6
 frozenlist==1.6.0
-futu-api==8.8.4808
+futu-api==10.8.6808
 future==1.0.0
 google-api-core==2.25.1
 google-api-python-client==2.173.0

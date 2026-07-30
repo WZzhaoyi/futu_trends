@@ -64,6 +64,7 @@ class LiveEventNotifierTest(unittest.TestCase):
         self.assertEqual(len(engine.webhooks), 2)
         self.assertEqual(len(engine.telegrams), 2)
         self.assertEqual(len(engine.emails), 2)
+        self.assertIn("[M1]", engine.webhooks[0])
         self.assertIn("SH.000902 BUY", engine.webhooks[0])
         self.assertIn("feed failed", engine.webhooks[1])
 
@@ -81,6 +82,122 @@ class LiveEventNotifierTest(unittest.TestCase):
         notifier.close()
         self.assertEqual(len(engine.webhooks), 1)
         self.assertIn("READY", engine.webhooks[0])
+
+
+class StrategyDefinitionTest(unittest.TestCase):
+    def test_frozen_m1_definition_and_cli_defaults(self):
+        self.assertEqual(timing.STRATEGY, "m1")
+        self.assertEqual(
+            timing.VERSION,
+            "M1-LF-held-downside-rolling10-exact-grid",
+        )
+        self.assertEqual(timing.WINDOW_MONTHS, 10)
+        self.assertEqual(timing.GRID_POINTS, 8008)
+        self.assertEqual(
+            timing.GRID_POINTS,
+            len(timing.ENTRY_Z30_GRID)
+            * len(timing.ENTRY_Z60_GRID)
+            * len(timing.EXIT_Z30_GRID)
+            * len(timing.EXIT_Z60_GRID),
+        )
+
+        parser = timing.build_parser()
+        fetch_args = parser.parse_args(
+            [
+                "fetch-bars",
+                "--as-of",
+                "2026-07-01",
+                "--output",
+                "/tmp/bars.json",
+            ]
+        )
+        self.assertEqual(fetch_args.futu_time_convention, "end")
+        live_args = parser.parse_args(
+            [
+                "live",
+                "--symbol",
+                "SH.000902",
+                "--state-file",
+                "/tmp/state.json",
+                "--thresholds-file",
+                "/tmp/threshold.json",
+            ]
+        )
+        self.assertEqual(live_args.futu_time_convention, "end")
+
+
+class PublicationAndStateIdentityTest(unittest.TestCase):
+    def valid_publication(self):
+        return {
+            "schema_version": timing.PUBLISH_SCHEMA_VERSION,
+            "publication_kind": "monthly_threshold",
+            "strategy": timing.STRATEGY,
+            "strategy_status": timing.STRATEGY_STATUS,
+            "version": timing.VERSION,
+            "script_sha256": timing.sha256_file(MODULE_PATH),
+            "symbol": "000902.SH",
+            "month": "2026-07",
+            "available_from": "2026-07-01",
+            "window_start": "2025-09-01",
+            "window_end": "2026-06-30",
+            "search_method": timing.SEARCH_METHOD,
+            "window_months": timing.WINDOW_MONTHS,
+            "grid_points": timing.GRID_POINTS,
+            "threshold": {
+                "month": "2026-07",
+                "entry_z30": 0.0,
+                "entry_z60": 1.5,
+                "exit_z30": -0.25,
+                "exit_z60": 0.25,
+                "source": timing.VERSION,
+            },
+            "training_evaluation": {
+                "score": 1.0,
+                "buys": 4,
+                "sells": 4,
+                "exposure": 0.5,
+            },
+            "constraint_strategy_return": 0.0,
+            "search_evaluations": timing.GRID_POINTS,
+            "data_audit": {
+                "source_file_sha256": "0" * 64,
+                "training_bars_sha256": "1" * 64,
+            },
+        }
+
+    def test_valid_publication_loads_and_m0_identity_is_rejected(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            path = Path(raw_dir) / "threshold_2026-07.json"
+            payload = self.valid_publication()
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            provider = timing.load_live_threshold_provider(
+                path, "SH.000902", allow_freeze=False
+            )
+            self.assertEqual(
+                provider.for_date("2026-07-02").source,
+                timing.VERSION,
+            )
+
+            payload["strategy"] = "m0"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "阈值策略"):
+                timing.load_live_threshold_provider(
+                    path, "SH.000902", allow_freeze=False
+                )
+
+    def test_state_is_m1_scoped_and_rejects_legacy_identity(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            state_path = Path(raw_dir) / "state.json"
+            state = timing.LiveState(state_path, "flat", None)
+            stored = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(stored["strategy"], "m1")
+            self.assertEqual(stored["version"], timing.VERSION)
+            self.assertEqual(state.position, 0)
+
+            stored["strategy"] = "m0"
+            state_path.write_text(json.dumps(stored), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "状态文件策略"):
+                timing.LiveState(state_path, "flat", None)
 
 
 class ThresholdDirectoryProviderTest(unittest.TestCase):
@@ -200,7 +317,7 @@ class FetchBarsTest(unittest.TestCase):
                 self.closed = True
 
         fake_futu = types.SimpleNamespace(
-            AuType=types.SimpleNamespace(QFQ="QFQ"),
+            AuType=types.SimpleNamespace(NONE="NONE"),
             KLType=types.SimpleNamespace(K_15M="K_15M"),
             OpenQuoteContext=FakeContext,
             RET_OK=0,
@@ -216,17 +333,19 @@ class FetchBarsTest(unittest.TestCase):
                 config=None,
                 symbol="SH.000902",
                 output=str(output),
-                futu_time_convention="start",
+                futu_time_convention="end",
             )
             with mock.patch.dict(sys.modules, {"futu": fake_futu}):
                 timing.run_fetch_bars(args)
             payload = json.loads(output.read_text(encoding="utf-8"))
 
-        self.assertEqual(payload["start"], "2025-09-01")
+        self.assertEqual(payload["start"], "2025-08-01")
         self.assertEqual(payload["end"], "2026-06-30")
-        self.assertEqual(payload["bar_time_convention"], "start")
+        self.assertEqual(payload["bar_time_convention"], "end")
+        self.assertEqual(payload["autype"], "NONE")
         self.assertEqual(len(payload["bars"]), 2)
         self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][1]["autype"], "NONE")
         self.assertIsNone(calls[0][1]["page_req_key"])
         self.assertEqual(calls[1][1]["page_req_key"], b"next")
 
