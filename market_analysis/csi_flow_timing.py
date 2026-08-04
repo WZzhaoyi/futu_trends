@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """中证流通择时信号。
 
-策略版本：M1-LF-held-downside-rolling10-exact-grid
+策略版本：M1-LF-held-downside-rolling9-exact-grid
 
 用法：
     python /absolute/path/csi_flow_timing.py backtest --help
@@ -40,10 +40,10 @@ except ImportError:  # live inference itself does not require NumPy
 
 STRATEGY = "m1"
 STRATEGY_STATUS = "frozen_primary"
-VERSION = "M1-LF-held-downside-rolling10-exact-grid"
+VERSION = "M1-LF-held-downside-rolling9-exact-grid"
 PUBLISH_SCHEMA_VERSION = 1
 SEARCH_METHOD = "exact_frozen_grid"
-WINDOW_MONTHS = 10
+WINDOW_MONTHS = 9
 VOLATILITY_BARS = 32
 CALIBRATION_COST_BPS = 5.0
 CONSTRAINT_COST_BPS = 10.0
@@ -2339,7 +2339,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     backtest = subparsers.add_parser(
-        "backtest", help="自动rolling10校准并回测"
+        "backtest", help="自动rolling9校准并回测"
     )
     add_bar_arguments(backtest)
     backtest.add_argument("--start", required=True)

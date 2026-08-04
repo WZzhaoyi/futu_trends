@@ -90,9 +90,9 @@ class StrategyDefinitionTest(unittest.TestCase):
         self.assertEqual(timing.STRATEGY, "m1")
         self.assertEqual(
             timing.VERSION,
-            "M1-LF-held-downside-rolling10-exact-grid",
+            "M1-LF-held-downside-rolling9-exact-grid",
         )
-        self.assertEqual(timing.WINDOW_MONTHS, 10)
+        self.assertEqual(timing.WINDOW_MONTHS, 9)
         self.assertEqual(timing.GRID_POINTS, 8008)
         self.assertEqual(
             timing.GRID_POINTS,
@@ -534,7 +534,7 @@ class FetchBarsTest(unittest.TestCase):
                 timing.run_fetch_bars(args)
             payload = json.loads(output.read_text(encoding="utf-8"))
 
-        self.assertEqual(payload["start"], "2025-08-01")
+        self.assertEqual(payload["start"], "2025-09-01")
         self.assertEqual(payload["end"], "2026-06-30")
         self.assertEqual(payload["bar_time_convention"], "end")
         self.assertEqual(payload["autype"], "NONE")

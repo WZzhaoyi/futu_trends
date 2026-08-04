@@ -430,13 +430,12 @@ if __name__ == "__main__":
     header = '名称 | 信号 | 动量 | 20D% | 60D% | 评分'
     raw_msg = '{} {} {}:\n{}\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group if group else '', push_type, header, '\n'.join(trends_df['msg']))
 
-    # 原始消息（telegram/email/webhook 去除到价区间 [low,high]）
+    # 全量消息仅用于 Telegram 和邮件（去除到价区间 [low,high]）
     raw_msg_clean = _re.sub(r'\[\d+\.?\d*,\d+\.?\d*\]', '', raw_msg)
 
     notification = NotificationEngine(config)
     notification.send_telegram_message(raw_msg_clean,'https://www.futunn.com/')
     notification.send_email(f'{group} {push_type}',raw_msg_clean)
-    notification.send_webhook(raw_msg_clean)
 
     _futu_keywords = [k.strip() for k in _futu_kw_str.split(',') if k.strip()]
     if _futu_keywords:
@@ -450,6 +449,8 @@ if __name__ == "__main__":
         notification.send_futu_message([str(code) for code in filter_df.index.tolist()],filter_df['msg'].tolist(),target_prices[1].tolist(),target_prices[0].tolist())
 
         filter_msg = '{} {} {}:\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group if group else '', push_type, '\n'.join(filter_df['msg']))
+        # Webhook
+        notification.send_webhook(_re.sub(r'\[\d+\.?\d*,\d+\.?\d*\]', '', filter_msg))
         # google sheet
         notification.send_google_sheet_message(filter_msg)
         # feishu sheet
