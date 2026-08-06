@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """中证流通择时信号。
 
-策略版本：M1-LF-held-downside-rolling9-exact-grid
+策略版本：M1-LF-held-downside-exact-grid-strength-v1
 
 用法：
     python /absolute/path/csi_flow_timing.py backtest --help
     python /absolute/path/csi_flow_timing.py fetch-bars --help
     python /absolute/path/csi_flow_timing.py calibrate --help
     python /absolute/path/csi_flow_timing.py live --help
+
+实时示例：
+    python /absolute/path/csi_flow_timing.py live \
+        --runtime-dir /absolute/path/runtime --window-months 9 --n 9
 """
 
 from __future__ import annotations
@@ -40,10 +44,18 @@ except ImportError:  # live inference itself does not require NumPy
 
 STRATEGY = "m1"
 STRATEGY_STATUS = "frozen_primary"
-VERSION = "M1-LF-held-downside-rolling9-exact-grid"
-PUBLISH_SCHEMA_VERSION = 1
+VERSION = "M1-LF-held-downside-exact-grid-strength-v1"
+PUBLISH_SCHEMA_VERSION = 2
 SEARCH_METHOD = "exact_frozen_grid"
 WINDOW_MONTHS = 9
+STRENGTH_N = 9
+STRENGTH_FORMULA = "15m_log_price_regression_return"
+STRENGTH_SYMBOLS = (
+    "SH.510500",
+    "SH.510050",
+    "SH.510300",
+    "SH.512100",
+)
 VOLATILITY_BARS = 32
 CALIBRATION_COST_BPS = 5.0
 CONSTRAINT_COST_BPS = 10.0
@@ -150,6 +162,13 @@ class Evaluation:
     exposure: float
     buys: int
     sells: int
+
+
+@dataclass(frozen=True)
+class StrengthRank:
+    rank: int
+    symbol: str
+    score: float
 
 
 @dataclass(frozen=True)
@@ -311,6 +330,27 @@ def normalize_symbol(value: str) -> str:
     return text
 
 
+def canonical_strength_symbol(value: str) -> str:
+    normalized = normalize_symbol(value)
+    for symbol in STRENGTH_SYMBOLS:
+        if normalize_symbol(symbol) == normalized:
+            return symbol
+    raise ValueError(
+        f"不支持的强度标的 {value!r}；需要 {', '.join(STRENGTH_SYMBOLS)}"
+    )
+
+
+def parse_symbol_path(value: str) -> tuple[str, Path]:
+    if "=" not in value:
+        raise argparse.ArgumentTypeError("参数必须为 SYMBOL=/absolute/path")
+    raw_symbol, raw_path = value.split("=", 1)
+    try:
+        symbol = canonical_strength_symbol(raw_symbol)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return symbol, Path(raw_path).expanduser().resolve()
+
+
 def parse_timestamp(value: Any, shift_minutes: int = 0) -> str:
     if isinstance(value, (int, float)):
         parsed = datetime(1899, 12, 30) + timedelta(days=float(value))
@@ -396,6 +436,79 @@ def load_bars(
     if not bars:
         raise ValueError(f"未从 {path} 读到匹配 {symbol or '任意标的'} 的行情")
     return bars
+
+
+def regression_return_score(closes: list[float]) -> float:
+    """Return the fitted log-price move across N completed 15-minute bars."""
+    if len(closes) < 2:
+        raise ValueError("强度 N 必须至少为2")
+    if not all(math.isfinite(value) and value > 0 for value in closes):
+        raise ValueError("强度计算包含非正数或非有限收盘价")
+    values = [math.log(value) for value in closes]
+    center = (len(values) - 1) / 2
+    x_centered = [index - center for index in range(len(values))]
+    denominator = math.fsum(value * value for value in x_centered)
+    if denominator <= 1e-12:
+        raise ValueError("强度回归自变量退化")
+    mean_y = statistics.mean(values)
+    slope = math.fsum(
+        x_value * (y_value - mean_y)
+        for x_value, y_value in zip(x_centered, values)
+    ) / denominator
+    return math.expm1(slope * (len(values) - 1))
+
+
+def rank_strength(
+    bars_by_symbol: dict[str, list[Bar]],
+    signal_key: str,
+    n: int,
+) -> dict[str, Any]:
+    """Rank the four frozen ETFs using only common bars through signal_key."""
+    if n < 2:
+        raise ValueError("--n/--strength-n 必须至少为2")
+    if set(bars_by_symbol) != set(STRENGTH_SYMBOLS):
+        missing = sorted(set(STRENGTH_SYMBOLS) - set(bars_by_symbol))
+        extra = sorted(set(bars_by_symbol) - set(STRENGTH_SYMBOLS))
+        raise ValueError(f"强度标的集合错误，缺少={missing}，多余={extra}")
+    closes: dict[str, dict[str, float]] = {}
+    common_keys: Optional[set[str]] = None
+    for symbol in STRENGTH_SYMBOLS:
+        values = {
+            bar.key: bar.close
+            for bar in bars_by_symbol[symbol]
+            if bar.key <= signal_key
+        }
+        closes[symbol] = values
+        keys = set(values)
+        common_keys = keys if common_keys is None else common_keys & keys
+    keys = sorted(common_keys or set())[-n:]
+    if len(keys) != n:
+        raise ValueError(
+            f"{signal_key} 前四ETF共同15分钟K线仅 {len(keys)} 根，"
+            f"不足 N={n}"
+        )
+    order = {symbol: index for index, symbol in enumerate(STRENGTH_SYMBOLS)}
+    scores = {
+        symbol: regression_return_score(
+            [closes[symbol][key] for key in keys]
+        )
+        for symbol in STRENGTH_SYMBOLS
+    }
+    ranked_symbols = sorted(
+        STRENGTH_SYMBOLS,
+        key=lambda symbol: (-scores[symbol], order[symbol]),
+    )
+    ranking = [
+        StrengthRank(rank=index + 1, symbol=symbol, score=scores[symbol])
+        for index, symbol in enumerate(ranked_symbols)
+    ]
+    return {
+        "n": n,
+        "formula": STRENGTH_FORMULA,
+        "observation_start": keys[0],
+        "observation_end": keys[-1],
+        "ranking": [asdict(item) for item in ranking],
+    }
 
 
 def sample_std(values: list[float]) -> Optional[float]:
@@ -940,8 +1053,9 @@ def calibrate_month(
     bars: list[Bar],
     features: list[Optional[Feature]],
     cutoff: date,
+    window_months: int = WINDOW_MONTHS,
 ) -> tuple[Candidate, Evaluation, int, Evaluation]:
-    window_start = shift_months(cutoff, -WINDOW_MONTHS).isoformat()
+    window_start = shift_months(cutoff, -window_months).isoformat()
     cutoff_text = cutoff.isoformat()
     indices = [
         index
@@ -978,12 +1092,13 @@ def build_schedule(
     features: list[Optional[Feature]],
     start: str,
     end: str,
+    window_months: int = WINDOW_MONTHS,
 ) -> tuple[dict[str, Threshold], list[dict[str, Any]]]:
     schedule: dict[str, Threshold] = {}
     audits: list[dict[str, Any]] = []
     for cutoff in month_sequence(start, end):
         candidate, evaluation, count, constraint = calibrate_month(
-            bars, features, cutoff
+            bars, features, cutoff, window_months
         )
         month = cutoff.strftime("%Y-%m")
         schedule[month] = Threshold(
@@ -998,9 +1113,9 @@ def build_schedule(
                 "strategy": STRATEGY,
                 "version": VERSION,
                 "month": month,
-                "window_months": WINDOW_MONTHS,
+                "window_months": window_months,
                 "window_start": shift_months(
-                    cutoff, -WINDOW_MONTHS
+                    cutoff, -window_months
                 ).isoformat(),
                 "window_end": cutoff.fromordinal(
                     cutoff.toordinal() - 1
@@ -1100,6 +1215,7 @@ def load_live_threshold_provider(
     path: Path,
     symbol: str,
     allow_freeze: bool,
+    window_months: int = WINDOW_MONTHS,
 ) -> ThresholdProvider:
     """Load and validate an audited monthly publication for live inference."""
     raw = read_records(path)
@@ -1128,9 +1244,9 @@ def load_live_threshold_provider(
             f"阈值策略状态 {raw.get('strategy_status')!r} 与脚本 "
             f"{STRATEGY_STATUS!r} 不一致"
         )
-    if int(raw.get("window_months", 0)) != WINDOW_MONTHS:
+    if int(raw.get("window_months", 0)) != window_months:
         raise ValueError(
-            f"阈值校准窗口不是冻结的 {WINDOW_MONTHS} 个月"
+            f"阈值校准窗口不是本次指定的 {window_months} 个月"
         )
     if int(raw.get("grid_points", 0)) != GRID_POINTS:
         raise ValueError(f"阈值网格点数不是冻结的 {GRID_POINTS}")
@@ -1207,10 +1323,12 @@ class ThresholdDirectoryProvider:
         directory: Path,
         symbol: str,
         allow_freeze: bool,
+        window_months: int = WINDOW_MONTHS,
     ) -> None:
         self.directory = directory
         self.symbol = symbol
         self.allow_freeze = allow_freeze
+        self.window_months = window_months
         self.providers: dict[str, tuple[tuple[int, int], ThresholdProvider]] = {}
         self.warned: set[str] = set()
         if not directory.is_dir():
@@ -1230,6 +1348,7 @@ class ThresholdDirectoryProvider:
             path,
             symbol=self.symbol,
             allow_freeze=False,
+            window_months=self.window_months,
         )
         if month not in provider.schedule:
             raise ValueError(f"{path} 发布月份不是文件名声明的 {month}")
@@ -1365,6 +1484,7 @@ def simulate(
     start: str,
     end: str,
     cost_bps: float,
+    window_months: int = WINDOW_MONTHS,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     test_bars = [bar for bar in bars if in_range(bar.key, start, end)]
     if not test_bars:
@@ -1418,7 +1538,7 @@ def simulate(
         "buys": sum(action.side == "BUY" for action in actions),
         "sells": sum(action.side == "SELL" for action in actions),
         "ending_position": curve[-1]["position"],
-        "window_months": WINDOW_MONTHS,
+        "window_months": window_months,
         "grid_points": GRID_POINTS,
         "objective": "held_market_downside_ratio",
         "calibration_cost_bps": CALIBRATION_COST_BPS,
@@ -1445,6 +1565,7 @@ def write_outputs(
     actions: list[Action],
     schedule: dict[str, Threshold],
     audits: list[dict[str, Any]],
+    strength_rankings: Optional[list[dict[str, Any]]] = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "metrics.json").write_text(
@@ -1458,6 +1579,34 @@ def write_outputs(
         [asdict(schedule[key]) for key in sorted(schedule)],
     )
     write_csv(output_dir / "calibration_audit.csv", audits)
+    if strength_rankings is not None:
+        write_csv(output_dir / "strength_rankings.csv", strength_rankings)
+
+
+def build_strength_rankings(
+    actions: list[Action],
+    bars_by_symbol: dict[str, list[Bar]],
+    n: int,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for action in actions:
+        if action.side != "BUY":
+            continue
+        result = rank_strength(bars_by_symbol, action.signal_key, n)
+        row: dict[str, Any] = {
+            "signal_key": action.signal_key,
+            "execution_key": action.execution_key,
+            "n": n,
+            "formula": STRENGTH_FORMULA,
+            "observation_start": result["observation_start"],
+            "observation_end": result["observation_end"],
+        }
+        for item in result["ranking"]:
+            rank = int(item["rank"])
+            row[f"rank_{rank}_symbol"] = item["symbol"]
+            row[f"rank_{rank}_score"] = item["score"]
+        rows.append(row)
+    return rows
 
 
 def run_backtest(args: argparse.Namespace) -> int:
@@ -1472,11 +1621,55 @@ def run_backtest(args: argparse.Namespace) -> int:
     if start > end:
         raise ValueError("start 晚于 end")
     features = build_features(bars)
-    schedule, audits = build_schedule(bars, features, start, end)
+    schedule, audits = build_schedule(
+        bars, features, start, end, args.window_months
+    )
     provider = ThresholdProvider(schedule)
     actions = generate_actions(bars, features, provider, start, end)
-    metrics, curve = simulate(bars, actions, start, end, args.cost_bps)
+    metrics, curve = simulate(
+        bars,
+        actions,
+        start,
+        end,
+        args.cost_bps,
+        args.window_months,
+    )
     metrics["bars_file"] = str(bars_path)
+    strength_paths = dict(args.strength_bars or [])
+    strength_rankings: Optional[list[dict[str, Any]]] = None
+    if strength_paths:
+        if set(strength_paths) != set(STRENGTH_SYMBOLS):
+            missing = sorted(set(STRENGTH_SYMBOLS) - set(strength_paths))
+            raise ValueError(
+                "--strength-bars 必须同时提供四只ETF；"
+                f"缺少 {missing}"
+            )
+        strength_bars = {
+            symbol: load_bars(
+                path,
+                symbol=symbol,
+                time_convention=args.bar_time_convention,
+            )
+            for symbol, path in strength_paths.items()
+        }
+        strength_rankings = build_strength_rankings(
+            actions, strength_bars, args.strength_n
+        )
+        metrics["strength_ranking"] = {
+            "enabled": True,
+            "n": args.strength_n,
+            "formula": STRENGTH_FORMULA,
+            "adjustment": "Futu QFQ expected",
+            "buy_signals": len(strength_rankings),
+            "latest": strength_rankings[-1] if strength_rankings else None,
+        }
+    else:
+        metrics["strength_ranking"] = {
+            "enabled": False,
+            "n": args.strength_n,
+            "formula": STRENGTH_FORMULA,
+            "reason": "未提供四个 --strength-bars；本次仅回测择时",
+        }
     if args.output_dir:
         write_outputs(
             Path(args.output_dir).resolve(),
@@ -1485,17 +1678,35 @@ def run_backtest(args: argparse.Namespace) -> int:
             actions,
             schedule,
             audits,
+            strength_rankings,
         )
     if args.json:
         print(json.dumps(metrics, ensure_ascii=False, indent=2))
     else:
         print(f"{VERSION} 回测完成")
+        print(
+            f"参数: WINDOW_MONTHS={args.window_months}, "
+            f"N={args.strength_n}"
+        )
         print(f"区间: {start} 至 {end}")
         print(f"策略收益: {metrics['total_return']:.4%}")
         print(f"基准收益: {metrics['benchmark_return']:.4%}")
         print(f"简单超额: {metrics['excess_difference']:.4%}")
         print(f"最大回撤: {metrics['max_drawdown']:.4%}")
         print(f"Sortino: {metrics['strategy_sortino']:.4f}")
+        if strength_rankings is None:
+            print("强度排名: 未启用（未提供四个 --strength-bars）")
+        else:
+            latest = strength_rankings[-1] if strength_rankings else None
+            print(
+                "强度排名: "
+                + (
+                    f"{len(strength_rankings)} 个买入信号，"
+                    f"最近第一名 {latest['rank_1_symbol']}"
+                    if latest
+                    else "没有买入信号"
+                )
+            )
     return 0
 
 
@@ -1524,8 +1735,9 @@ def run_fetch_bars(args: argparse.Namespace) -> int:
         ) from exc
 
     cutoff = first_of_month(args.as_of)
+    window_months = int(getattr(args, "window_months", WINDOW_MONTHS))
     start = args.start or shift_months(
-        cutoff, -(WINDOW_MONTHS + 1)
+        cutoff, -(window_months + 1)
     ).isoformat()
     end = args.end or cutoff.fromordinal(cutoff.toordinal() - 1).isoformat()
     if start > end:
@@ -1583,6 +1795,7 @@ def run_fetch_bars(args: argparse.Namespace) -> int:
         ),
         "start": start,
         "end": end,
+        "window_months": window_months,
         "bar_time_convention": args.futu_time_convention,
         "bars": bars,
     }
@@ -1598,6 +1811,7 @@ def run_fetch_bars(args: argparse.Namespace) -> int:
                 "bars": len(bars),
                 "first_bar": bars[0]["time_key"],
                 "last_bar": bars[-1]["time_key"],
+                "window_months": window_months,
             },
             ensure_ascii=False,
         )
@@ -1614,7 +1828,8 @@ def run_calibrate(args: argparse.Namespace) -> int:
     )
     features = build_features(bars)
     cutoff = first_of_month(args.as_of)
-    window_start = shift_months(cutoff, -WINDOW_MONTHS).isoformat()
+    window_months = int(getattr(args, "window_months", WINDOW_MONTHS))
+    window_start = shift_months(cutoff, -window_months).isoformat()
     cutoff_text = cutoff.isoformat()
     training_bars = [
         bar
@@ -1622,7 +1837,7 @@ def run_calibrate(args: argparse.Namespace) -> int:
         if window_start <= bar.trading_date < cutoff_text
     ]
     candidate, evaluation, count, constraint = calibrate_month(
-        bars, features, cutoff
+        bars, features, cutoff, window_months
     )
     threshold = Threshold(
         month=cutoff.strftime("%Y-%m"),
@@ -1647,7 +1862,7 @@ def run_calibrate(args: argparse.Namespace) -> int:
         "window_start": window_start,
         "window_end": cutoff.fromordinal(cutoff.toordinal() - 1).isoformat(),
         "search_method": SEARCH_METHOD,
-        "window_months": WINDOW_MONTHS,
+        "window_months": window_months,
         "grid_points": GRID_POINTS,
         "threshold": asdict(threshold),
         "training_evaluation": asdict(evaluation),
@@ -1686,6 +1901,7 @@ def ensure_live_threshold(
 ) -> tuple[str, bool]:
     """Ensure the current month's audited threshold exists before inference."""
     runtime.prepare()
+    window_months = int(getattr(args, "window_months", WINDOW_MONTHS))
     cutoff = current_market_month(now)
     month = cutoff.strftime("%Y-%m")
     publication = runtime.thresholds_dir / f"threshold_{month}.json"
@@ -1695,6 +1911,7 @@ def ensure_live_threshold(
                 publication,
                 symbol=args.symbol,
                 allow_freeze=False,
+                window_months=window_months,
             )
             provider.for_date(cutoff.isoformat())
             return month, False
@@ -1717,6 +1934,7 @@ def ensure_live_threshold(
             host=args.host,
             port=args.port,
             futu_time_convention=args.futu_time_convention,
+            window_months=window_months,
         )
     )
     run_calibrate(
@@ -1726,12 +1944,14 @@ def ensure_live_threshold(
             bar_time_convention=args.futu_time_convention,
             as_of=cutoff_text,
             output=str(publication),
+            window_months=window_months,
         )
     )
     provider = load_live_threshold_provider(
         publication,
         symbol=args.symbol,
         allow_freeze=False,
+        window_months=window_months,
     )
     provider.for_date(cutoff.isoformat())
     return month, True
@@ -1847,14 +2067,24 @@ class LiveEventNotifier:
         if event_type == "SIGNAL":
             feature = event.get("feature") or {}
             threshold = event.get("threshold") or {}
+            strength = event.get("strength") or {}
+            ranked = strength.get("ranking") or []
+            ranking_text = " > ".join(
+                f"{item.get('symbol')}({float(item.get('score', math.nan)):.3%})"
+                for item in ranked
+            )
             message = (
                 f"[M1] {symbol} {action}\n"
                 f"信号K线: {event.get('bar_key')}\n"
                 f"z30/z60: {float(feature.get('z30', math.nan)):.3f} / "
                 f"{float(feature.get('z60', math.nan)):.3f}\n"
                 f"阈值月份: {threshold.get('month', '')}\n"
+                f"参数: WINDOW_MONTHS={event.get('window_months')}, "
+                f"N={event.get('strength_n')}\n"
                 f"信号前仓位: {event.get('position_before')}"
             )
+            if action == "BUY":
+                message += f"\n强度排名: {ranking_text}"
         elif event_type == "ERROR":
             message = f"[M1] {symbol} 实时推理错误\n{event.get('message', '')}"
         else:
@@ -1923,15 +2153,22 @@ class LiveSignalEngine:
         provider: Any,
         state: LiveState,
         time_convention: str,
+        window_months: int = WINDOW_MONTHS,
+        strength_n: int = STRENGTH_N,
         event_callback: Optional[Callable[[dict[str, Any]], None]] = None,
     ) -> None:
         self.symbol = symbol
         self.provider = provider
         self.state = state
+        self.window_months = window_months
+        self.strength_n = strength_n
         self.event_callback = event_callback
         self.shift_minutes = 15 if time_convention == "start" else 0
         self.completed: list[Bar] = []
         self.current: Optional[Bar] = None
+        self.strength_bars: dict[str, list[Bar]] = {
+            symbol: [] for symbol in STRENGTH_SYMBOLS
+        }
         self.lock = threading.Lock()
 
     def emit(self, event: dict[str, Any]) -> None:
@@ -1939,6 +2176,8 @@ class LiveSignalEngine:
             "strategy": STRATEGY,
             "version": VERSION,
             "symbol": self.symbol,
+            "window_months": self.window_months,
+            "strength_n": self.strength_n,
             "emitted_at": datetime.now().isoformat(timespec="seconds"),
             **event,
         }
@@ -1990,11 +2229,38 @@ class LiveSignalEngine:
                 "forming_bar": self.current.key,
                 "position": self.state.position,
                 "entry_date": self.state.entry_date,
+                "strength": {
+                    "symbols": list(STRENGTH_SYMBOLS),
+                    "n": self.strength_n,
+                    "formula": STRENGTH_FORMULA,
+                    "adjustment": "QFQ",
+                    "history_bars": {
+                        symbol: len(self.strength_bars[symbol])
+                        for symbol in STRENGTH_SYMBOLS
+                    },
+                },
                 "active_threshold": asdict(
                     self.provider.for_date(self.current.trading_date)
                 ),
             }
         )
+
+    def bootstrap_strength(self, rows_by_symbol: dict[str, list[Any]]) -> None:
+        if set(rows_by_symbol) != set(STRENGTH_SYMBOLS):
+            raise ValueError("实时强度预热必须覆盖四只ETF")
+        for symbol in STRENGTH_SYMBOLS:
+            bars = [self.bar_from_row(row) for row in rows_by_symbol[symbol]]
+            by_key = {bar.key: bar for bar in bars}
+            ordered = [by_key[key] for key in sorted(by_key)]
+            if len(ordered) < self.strength_n:
+                raise ValueError(
+                    f"{symbol} 实时预热仅有 {len(ordered)} 根，"
+                    f"不足 N={self.strength_n}"
+                )
+            self.strength_bars[symbol] = ordered[-1200:]
+
+    def current_strength(self, signal_key: str) -> dict[str, Any]:
+        return rank_strength(self.strength_bars, signal_key, self.strength_n)
 
     def execute_pending(self, bar: Bar) -> None:
         pending = self.state.pending
@@ -2041,8 +2307,18 @@ class LiveSignalEngine:
             and bar.trading_date > self.state.entry_date
         )
         action = "NONE"
+        strength: Optional[dict[str, Any]] = None
         if self.state.position == 0 and bar.clock in ENTRY_TIMES and buy_score:
-            action = "BUY"
+            try:
+                strength = self.current_strength(bar.key)
+                action = "BUY"
+            except ValueError as exc:
+                self.emit(
+                    {
+                        "type": "ERROR",
+                        "message": f"强度排名不可用，BUY信号未发布: {exc}",
+                    }
+                )
         elif (
             self.state.position == 1
             and t1_sellable
@@ -2067,8 +2343,20 @@ class LiveSignalEngine:
                 "t1_sellable": t1_sellable,
                 "feature": asdict(feature),
                 "threshold": asdict(threshold),
+                "strength": strength,
             }
         )
+
+    def on_strength_bar(self, bar: Bar) -> None:
+        with self.lock:
+            symbol = canonical_strength_symbol(bar.symbol)
+            by_key = {
+                item.key: item for item in self.strength_bars[symbol]
+            }
+            by_key[bar.key] = bar
+            self.strength_bars[symbol] = [
+                by_key[key] for key in sorted(by_key)[-1200:]
+            ]
 
     def on_bar(self, bar: Bar) -> None:
         with self.lock:
@@ -2094,6 +2382,7 @@ def live_provider(
         runtime.thresholds_dir,
         symbol=args.symbol,
         allow_freeze=False,
+        window_months=getattr(args, "window_months", WINDOW_MONTHS),
     )
 
 
@@ -2132,6 +2421,8 @@ def _run_live(
         provider,
         state,
         args.futu_time_convention,
+        window_months=getattr(args, "window_months", WINDOW_MONTHS),
+        strength_n=getattr(args, "strength_n", STRENGTH_N),
         event_callback=notifier.notify if notifier is not None else None,
     )
     fatal_event = threading.Event()
@@ -2153,8 +2444,16 @@ def _run_live(
             try:
                 for index in range(len(data)):
                     row = data.iloc[index] if hasattr(data, "iloc") else data[index]
-                    if str(row.get("code", "")) == args.symbol:
-                        engine.on_bar(engine.bar_from_row(row))
+                    bar = engine.bar_from_row(row)
+                    if normalize_symbol(bar.symbol) == normalize_symbol(
+                        args.symbol
+                    ):
+                        engine.on_bar(bar)
+                    elif normalize_symbol(bar.symbol) in {
+                        normalize_symbol(symbol)
+                        for symbol in STRENGTH_SYMBOLS
+                    }:
+                        engine.on_strength_bar(bar)
             except Exception as exc:
                 record_fatal(f"实时K线处理失败: {exc!r}")
                 return RET_ERROR, data
@@ -2184,11 +2483,32 @@ def _run_live(
         host=host,
         port=port,
     ) as context:
+        subscribed_symbols = [args.symbol, *STRENGTH_SYMBOLS]
         ret, message = context.subscribe(
-            [args.symbol], [SubType.K_15M], subscribe_push=False
+            subscribed_symbols, [SubType.K_15M], subscribe_push=False
         )
         if ret != RET_OK:
             raise RuntimeError(f"订阅预热失败: {message}")
+        strength_rows: dict[str, list[Any]] = {}
+        for symbol in STRENGTH_SYMBOLS:
+            ret, strength_data = context.get_cur_kline(
+                symbol,
+                max(
+                    args.history_bars,
+                    getattr(args, "strength_n", STRENGTH_N) + 1,
+                ),
+                KLType.K_15M,
+                AuType.QFQ,
+            )
+            if ret != RET_OK:
+                raise RuntimeError(f"获取 {symbol} QFQ 预热K线失败: {strength_data}")
+            strength_rows[symbol] = [
+                strength_data.iloc[index]
+                if hasattr(strength_data, "iloc")
+                else strength_data[index]
+                for index in range(len(strength_data))
+            ]
+        engine.bootstrap_strength(strength_rows)
         ret, data = context.get_cur_kline(
             args.symbol,
             args.history_bars,
@@ -2207,7 +2527,7 @@ def _run_live(
         if context.set_handler(SystemHandler()) != RET_OK:
             raise RuntimeError("注册Futu系统回调失败")
         ret, message = context.subscribe(
-            [args.symbol], [SubType.K_15M], subscribe_push=True
+            subscribed_symbols, [SubType.K_15M], subscribe_push=True
         )
         if ret != RET_OK:
             raise RuntimeError(f"开启K线推送失败: {message}")
@@ -2321,6 +2641,39 @@ def run_live(args: argparse.Namespace) -> int:
             notifier.close()
 
 
+def integer_at_least(minimum: int) -> Callable[[str], int]:
+    def parse(value: str) -> int:
+        try:
+            parsed = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("必须是整数") from exc
+        if parsed < minimum:
+            raise argparse.ArgumentTypeError(f"必须不小于 {minimum}")
+        return parsed
+
+    return parse
+
+
+def add_window_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--window-months",
+        type=integer_at_least(1),
+        default=WINDOW_MONTHS,
+        help=f"M1阈值滚动校准月数（默认 {WINDOW_MONTHS}）",
+    )
+
+
+def add_strength_n_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--n",
+        "--strength-n",
+        dest="strength_n",
+        type=integer_at_least(2),
+        default=STRENGTH_N,
+        help=f"四ETF强度回归的固定15分钟K线根数（默认 {STRENGTH_N}）",
+    )
+
+
 def add_bar_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--bars-file", required=True, help="15分钟OHLC JSON/CSV")
     parser.add_argument("--symbol", default="000902.SH")
@@ -2339,13 +2692,24 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     backtest = subparsers.add_parser(
-        "backtest", help="自动rolling9校准并回测"
+        "backtest", help="按指定WINDOW_MONTHS校准并回测"
     )
     add_bar_arguments(backtest)
+    add_window_argument(backtest)
+    add_strength_n_argument(backtest)
     backtest.add_argument("--start", required=True)
     backtest.add_argument("--end")
     backtest.add_argument("--cost-bps", type=float, default=5.0)
     backtest.add_argument("--output-dir")
+    backtest.add_argument(
+        "--strength-bars",
+        type=parse_symbol_path,
+        action="append",
+        help=(
+            "可重复：SYMBOL=/absolute/path；同时提供四只ETF后，"
+            "为每个BUY输出固定N强度排名"
+        ),
+    )
     backtest.add_argument("--json", action="store_true")
     backtest.set_defaults(func=run_backtest)
 
@@ -2353,6 +2717,7 @@ def build_parser() -> argparse.ArgumentParser:
         "fetch-bars", help="从Futu刷新月度校准所需的15分钟历史K线"
     )
     fetch_bars.add_argument("--symbol", default="SH.000902")
+    add_window_argument(fetch_bars)
     fetch_bars.add_argument("--as-of", required=True, help="目标月份首日")
     fetch_bars.add_argument("--start", help="可选覆盖历史起始日")
     fetch_bars.add_argument("--end", help="可选覆盖历史截止日")
@@ -2374,6 +2739,7 @@ def build_parser() -> argparse.ArgumentParser:
         "calibrate", help="仅使用目标月份以前数据生成当月阈值"
     )
     add_bar_arguments(calibrate)
+    add_window_argument(calibrate)
     calibrate.add_argument("--as-of", required=True)
     calibrate.add_argument(
         "--output",
@@ -2395,6 +2761,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--port", type=int, help="覆盖config.ini中的FUTU_PORT"
     )
     live.add_argument("--history-bars", type=int, default=200)
+    add_window_argument(live)
+    add_strength_n_argument(live)
     live.add_argument("--duration", type=int, default=0)
     live.add_argument(
         "--runtime-dir",

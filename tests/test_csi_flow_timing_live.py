@@ -55,6 +55,13 @@ class LiveEventNotifierTest(unittest.TestCase):
             "position_before": 0,
             "feature": {"z30": 1.0, "z60": 1.25},
             "threshold": {"month": "2026-07"},
+            "window_months": 9,
+            "strength_n": 9,
+            "strength": {
+                "ranking": [
+                    {"rank": 1, "symbol": "SH.510500", "score": 0.01}
+                ],
+            },
         }
         notifier.notify(action)
         notifier.notify(action)
@@ -67,6 +74,7 @@ class LiveEventNotifierTest(unittest.TestCase):
         self.assertEqual(len(engine.emails), 2)
         self.assertIn("[M1]", engine.webhooks[0])
         self.assertIn("SH.000902 BUY", engine.webhooks[0])
+        self.assertIn("SH.510500", engine.webhooks[0])
         self.assertIn("feed failed", engine.webhooks[1])
 
     def test_lifecycle_notifications_are_opt_in(self):
@@ -90,9 +98,11 @@ class StrategyDefinitionTest(unittest.TestCase):
         self.assertEqual(timing.STRATEGY, "m1")
         self.assertEqual(
             timing.VERSION,
-            "M1-LF-held-downside-rolling9-exact-grid",
+            "M1-LF-held-downside-exact-grid-strength-v1",
         )
+        self.assertEqual(timing.PUBLISH_SCHEMA_VERSION, 2)
         self.assertEqual(timing.WINDOW_MONTHS, 9)
+        self.assertEqual(timing.STRENGTH_N, 9)
         self.assertEqual(timing.GRID_POINTS, 8008)
         self.assertEqual(
             timing.GRID_POINTS,
@@ -113,6 +123,7 @@ class StrategyDefinitionTest(unittest.TestCase):
             ]
         )
         self.assertEqual(fetch_args.futu_time_convention, "end")
+        self.assertEqual(fetch_args.window_months, 9)
         live_args = parser.parse_args(
             [
                 "live",
@@ -123,6 +134,132 @@ class StrategyDefinitionTest(unittest.TestCase):
             ]
         )
         self.assertEqual(live_args.futu_time_convention, "end")
+        self.assertEqual(live_args.window_months, 9)
+        self.assertEqual(live_args.strength_n, 9)
+
+        configured = parser.parse_args(
+            [
+                "live",
+                "--symbol",
+                "SH.000902",
+                "--runtime-dir",
+                "/tmp/csi-flow",
+                "--window-months",
+                "10",
+                "--n",
+                "11",
+            ]
+        )
+        self.assertEqual(configured.window_months, 10)
+        self.assertEqual(configured.strength_n, 11)
+
+
+class StrengthRankingTest(unittest.TestCase):
+    def bar(self, symbol, index, close):
+        key = f"2026-07-01 {9 + (index // 4):02d}:{(index % 4) * 15:02d}"
+        return timing.Bar(
+            key=key,
+            open=close,
+            high=close,
+            low=close,
+            close=close,
+            symbol=symbol,
+        )
+
+    def test_regression_return_matches_fitted_log_price_move(self):
+        self.assertAlmostEqual(
+            timing.regression_return_score([1.0, 2.0, 4.0]),
+            3.0,
+        )
+
+    def test_rank_uses_common_completed_bars_and_ignores_future(self):
+        paths = {
+            "SH.510500": [1.00, 1.01, 1.02, 1.03, 1.04],
+            "SH.510050": [1.00, 0.99, 0.98, 0.97, 10.00],
+            "SH.510300": [1.00, 1.00, 1.00, 1.00, 1.00],
+            "SH.512100": [1.00, 1.005, 1.01, 1.015, 1.02],
+        }
+        bars = {
+            symbol: [
+                self.bar(symbol, index, close)
+                for index, close in enumerate(closes)
+            ]
+            for symbol, closes in paths.items()
+        }
+        signal_key = bars["SH.510500"][3].key
+        result = timing.rank_strength(bars, signal_key, 4)
+
+        self.assertEqual(result["observation_end"], signal_key)
+        self.assertEqual(
+            [item["symbol"] for item in result["ranking"]],
+            ["SH.510500", "SH.512100", "SH.510300", "SH.510050"],
+        )
+
+    def test_live_buy_signal_only_hints_ranking_and_fixed_n(self):
+        class Provider:
+            def for_date(self, value):
+                return timing.Threshold(
+                    month=value[:7],
+                    entry_z30=0.0,
+                    entry_z60=0.0,
+                    exit_z30=-1.0,
+                    exit_z60=-1.0,
+                )
+
+        with tempfile.TemporaryDirectory() as raw_dir:
+            state = timing.LiveState(Path(raw_dir) / "state.json", "flat", None)
+            events = []
+            engine = timing.LiveSignalEngine(
+                "SH.000902",
+                Provider(),
+                state,
+                "end",
+                window_months=10,
+                strength_n=4,
+                event_callback=events.append,
+            )
+            engine.strength_bars = {
+                symbol: [
+                    self.bar(symbol, index, close)
+                    for index, close in enumerate(closes[:4])
+                ]
+                for symbol, closes in {
+                    "SH.510500": [1.00, 1.01, 1.02, 1.03],
+                    "SH.510050": [1.00, 0.99, 0.98, 0.97],
+                    "SH.510300": [1.00, 1.00, 1.00, 1.00],
+                    "SH.512100": [1.00, 1.005, 1.01, 1.015],
+                }.items()
+            }
+            signal_bar = timing.Bar(
+                key="2026-07-01 10:30",
+                open=1.0,
+                high=1.0,
+                low=1.0,
+                close=1.0,
+                symbol="SH.000902",
+            )
+            with mock.patch.object(
+                timing,
+                "latest_feature",
+                return_value=timing.Feature(1.0, 1.0, 0.0, 0.0, 0.1),
+            ):
+                engine.finalize(signal_bar)
+
+        self.assertEqual(
+            state.pending,
+            {
+                "side": "BUY",
+                "signal_key": "2026-07-01 10:30",
+                "calibration_month": "2026-07",
+            },
+        )
+        signal = [event for event in events if event["type"] == "SIGNAL"][-1]
+        self.assertEqual(signal["strength_n"], 4)
+        self.assertEqual(signal["window_months"], 10)
+        self.assertEqual(
+            signal["strength"]["ranking"][0]["symbol"],
+            "SH.510500",
+        )
 
 
 class LiveRuntimeTest(unittest.TestCase):
@@ -303,7 +440,9 @@ class PublicationAndStateIdentityTest(unittest.TestCase):
 
 
 class ThresholdDirectoryProviderTest(unittest.TestCase):
-    def fake_loader(self, path, symbol, allow_freeze):
+    def fake_loader(
+        self, path, symbol, allow_freeze, window_months=timing.WINDOW_MONTHS
+    ):
         month = path.stem.removeprefix("threshold_")
         marker = len(path.read_text(encoding="utf-8"))
         threshold = timing.Threshold(
@@ -425,7 +564,7 @@ class LiveContextCleanupTest(unittest.TestCase):
                 self.close_count += 1
 
         fake_futu = types.SimpleNamespace(
-            AuType=types.SimpleNamespace(NONE="NONE"),
+            AuType=types.SimpleNamespace(NONE="NONE", QFQ="QFQ"),
             CurKlineHandlerBase=FakeCurKlineHandlerBase,
             KLType=types.SimpleNamespace(K_15M="K_15M"),
             OpenQuoteContext=FakeContext,
@@ -455,6 +594,11 @@ class LiveContextCleanupTest(unittest.TestCase):
                 mock.patch.object(
                     timing.LiveSignalEngine,
                     "bootstrap",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    timing.LiveSignalEngine,
+                    "bootstrap_strength",
                     return_value=None,
                 ),
                 mock.patch.object(
@@ -529,15 +673,17 @@ class FetchBarsTest(unittest.TestCase):
                 symbol="SH.000902",
                 output=str(output),
                 futu_time_convention="end",
+                window_months=10,
             )
             with mock.patch.dict(sys.modules, {"futu": fake_futu}):
                 timing.run_fetch_bars(args)
             payload = json.loads(output.read_text(encoding="utf-8"))
 
-        self.assertEqual(payload["start"], "2025-09-01")
+        self.assertEqual(payload["start"], "2025-08-01")
         self.assertEqual(payload["end"], "2026-06-30")
         self.assertEqual(payload["bar_time_convention"], "end")
         self.assertEqual(payload["autype"], "NONE")
+        self.assertEqual(payload["window_months"], 10)
         self.assertEqual(len(payload["bars"]), 2)
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0][1]["autype"], "NONE")
