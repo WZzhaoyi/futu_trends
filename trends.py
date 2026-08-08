@@ -347,12 +347,13 @@ def check_trends(code_in_group: pd.DataFrame, config: configparser.ConfigParser)
             recent_low = df['low'].iloc[-3:].min()
             ret_20d, ret_60d, score = calc_returns_score(close)
             kline_date = pd.to_datetime(df['time_key'].iloc[-1]).strftime('%Y%m%d') if 'time_key' in df.columns else ""
-            if ret_20d is not None:
-                msg += f' | {ret_20d:+.1f}%'
-            if ret_60d is not None:
-                msg += f' | {ret_60d:+.1f}%'
-            if score is not None:
-                msg += f' | {score:+.2f}'
+
+            # 涨跌幅
+            ret_1d = (close.iloc[-1] / close.iloc[-2] - 1) * 100 if len(close) >= 2 else None
+            msg += f' | {ret_1d:+.1f}%' if ret_1d is not None else ' | N/A'
+            msg += f' | {ret_20d:+.1f}%' if ret_20d is not None else ' | N/A'
+            msg += f' | {ret_60d:+.1f}%' if ret_60d is not None else ' | N/A'
+            # msg += f' | {score:+.2f}' if score is not None else ' | N/A'
 
             results.append({
                 'futu_code': futu_code,
@@ -427,7 +428,7 @@ if __name__ == "__main__":
     _snapshot_dir = config.get('CONFIG', 'SNAPSHOT_DIR', fallback=SNAPSHOT_DIR)
     save_snapshot(trends_df, group or 'default', push_type, _snapshot_dir)
 
-    header = '名称 | 信号 | 动量 | 20D% | 60D% | 评分'
+    header = '名称 | 信号 | 动量 | 1D% | 20D% | 60D%'
     raw_msg = '{} {} {}:\n{}\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group if group else '', push_type, header, '\n'.join(trends_df['msg']))
 
     # 全量消息仅用于 Telegram 和邮件（去除到价区间 [low,high]）

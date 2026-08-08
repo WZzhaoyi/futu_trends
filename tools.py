@@ -499,10 +499,15 @@ def calc_momentum(close: pd.Series, N=21, method='linear')->pd.Series:
 
 
 
-def calc_returns_score(close: pd.Series):
-    """计算20d/60d收益率和得分。返回 (ret_20d, ret_60d, score)。"""
-    ret_20d = float((close.iloc[-1] / close.iloc[-21] - 1) * 100) if len(close) >= 21 else None
-    ret_60d = float((close.iloc[-1] / close.iloc[-61] - 1) * 100) if len(close) >= 61 else None
+def calc_returns_score(close: pd.Series, ret_20d=None, ret_60d=None):
+    """计算20d/60d收益率和得分。返回 (ret_20d, ret_60d, score)。
+
+    传入的 ret_20d/ret_60d 优先使用（不重新计算），None 时按数据长度计算。
+    """
+    if ret_20d is None and len(close) >= 21:
+        ret_20d = float((close.iloc[-1] / close.iloc[-21] - 1) * 100)
+    if ret_60d is None and len(close) >= 61:
+        ret_60d = float((close.iloc[-1] / close.iloc[-61] - 1) * 100)
     score = round((ret_20d + ret_60d) / 2, 2) if ret_20d is not None and ret_60d is not None else None
     return ret_20d, ret_60d, score
 
