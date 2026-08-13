@@ -6,7 +6,7 @@ Futu Trends API 后端服务
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 import json
 import re
@@ -36,6 +36,11 @@ from indicator_service import (
     get_db_paths as _get_db_paths_svc,
     read_detect as _read_detect_svc,
     calculate_indicator as _calculate_indicator_svc,
+)
+from gui.backend.futu_quote import (
+    FUTU_FAVICON_URL,
+    create_futu_launch_page,
+    validate_futu_code,
 )
 
 # 配置日志
@@ -243,6 +248,19 @@ def get_detect_result(code: str):
         raise HTTPException(status_code=404, detail=f"No detect results found for {code}")
     return JSONResponse(content={'code': code, 'indicators': detect})
 
+# ---- 富途个股跳转（与调用页面、选股结果解耦）----
+
+@app.get("/api/futu/quote/{code}")
+def futu_quote(code: str):
+    """统一处理富途 App 唤起和官网兜底。"""
+    try:
+        normalized = validate_futu_code(code)
+        host = config.get("CONFIG", "FUTU_HOST", fallback="127.0.0.1")
+        port = config.getint("CONFIG", "FUTU_PORT", fallback=11111)
+        return HTMLResponse(content=create_futu_launch_page(host, port, normalized))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
 # ---- 条件选股结果（只读 cron 产出的静态 JSON，与选股任务解耦）----
 
 def _screener_date(date: Optional[str]) -> Optional[str]:
@@ -275,6 +293,11 @@ def screener_result(strategy: str, market: str, date: Optional[str] = None):
     return JSONResponse(content=json.loads(path.read_text(encoding='utf-8')))
 
 # ---- 页面路由 ----
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    """使用富途官网当前 favicon，避免各页面的默认图标请求返回 404。"""
+    return RedirectResponse(FUTU_FAVICON_URL)
 
 def _serve_page(name: str) -> HTMLResponse:
     html_path = Path(__file__).parent / name

@@ -83,16 +83,6 @@ function fmtCell(col, c) {
   return col.num ? Number(v).toFixed(2) : v;
 }
 
-// 行点击跳外部行情：A股→东财，港/美股→雅虎
-function quoteUrl(code) {
-  const [mkt, sym] = code.split('.');
-  if (mkt === 'SH' || mkt === 'SZ')
-    return `https://quote.eastmoney.com/${mkt.toLowerCase()}${sym}.html`;
-  if (mkt === 'HK')
-    return `https://finance.yahoo.com/quote/${String(parseInt(sym, 10)).padStart(4, '0')}.HK`;
-  return `https://finance.yahoo.com/quote/${sym}`;
-}
-
 function syncSortControls() {
   $('sort-field').value = sortKey || '';
   $('sort-dir').textContent = sortDesc ? '↓' : '↑';
@@ -204,7 +194,8 @@ $('market').addEventListener('change', loadResult);
 $('search').addEventListener('input', renderRows);
 $('tbody').addEventListener('click', e => {
   const row = e.target.closest('tr.row');
-  if (row) window.open(quoteUrl(row.dataset.code), '_blank', 'noopener');
+  if (row) window.open(`/api/futu/quote/${encodeURIComponent(row.dataset.code)}`,
+                       '_blank', 'noopener');
 });
 $('thead-row').addEventListener('click', e => {
   const th = e.target.closest('th.sortable');
