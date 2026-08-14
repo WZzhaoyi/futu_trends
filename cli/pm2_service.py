@@ -72,6 +72,9 @@ def build_service_spec(
     symbol: str = "SH.000902",
     initial_position: str = "flat",
     entry_date: str | None = None,
+    notification_mode: str = "position-aware",
+    window_months: int = 9,
+    t1_sell_mode: str = "defer-next-open",
     platform: str = sys.platform,
 ) -> ServiceSpec:
     """Resolve one PM2 instance exactly as its ecosystem file does."""
@@ -114,6 +117,12 @@ def build_service_spec(
             raise PM2ConfigError(
                 "initial-position=long 必须同时指定 --entry-date"
             )
+        if notification_mode not in {"position-aware", "position-independent"}:
+            raise PM2ConfigError("notification-mode 无效")
+        if window_months < 1:
+            raise PM2ConfigError("window-months 必须不小于 1")
+        if t1_sell_mode not in {"defer-next-open", "ignore-same-day"}:
+            raise PM2ConfigError("t1-sell-mode 无效")
         digest_input = "\0".join(
             (
                 identity,
@@ -127,6 +136,9 @@ def build_service_spec(
             "CSI_FLOW_RUNTIME_DIR": str(runtime_path),
             "CSI_FLOW_SYMBOL": symbol.upper(),
             "CSI_FLOW_INITIAL_POSITION": initial_position,
+            "CSI_FLOW_NOTIFICATION_MODE": notification_mode,
+            "CSI_FLOW_WINDOW_MONTHS": str(window_months),
+            "CSI_FLOW_T1_SELL_MODE": t1_sell_mode,
         }
         if entry_date:
             environment["CSI_FLOW_ENTRY_DATE"] = entry_date
@@ -237,6 +249,17 @@ def _build_parser() -> argparse.ArgumentParser:
         default="flat",
     )
     csi_flow.add_argument("--entry-date")
+    csi_flow.add_argument(
+        "--notification-mode",
+        choices=("position-aware", "position-independent"),
+        default="position-aware",
+    )
+    csi_flow.add_argument("--window-months", type=int, default=9)
+    csi_flow.add_argument(
+        "--t1-sell-mode",
+        choices=("defer-next-open", "ignore-same-day"),
+        default="defer-next-open",
+    )
 
     targets.add_parser("save", help="保存当前 PM2 进程列表")
     return parser
@@ -255,6 +278,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             symbol=getattr(args, "symbol", "SH.000902"),
             initial_position=getattr(args, "initial_position", "flat"),
             entry_date=getattr(args, "entry_date", None),
+            notification_mode=getattr(
+                args, "notification_mode", "position-aware"
+            ),
+            window_months=getattr(args, "window_months", 9),
+            t1_sell_mode=getattr(
+                args, "t1_sell_mode", "defer-next-open"
+            ),
         )
         pm2_args = build_pm2_args(args.action, spec)
     except PM2ConfigError as exc:

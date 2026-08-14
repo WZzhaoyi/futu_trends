@@ -59,6 +59,9 @@ class PM2ServiceTest(unittest.TestCase):
                 "CSI_FLOW_RUNTIME_DIR": str(runtime.absolute()),
                 "CSI_FLOW_SYMBOL": "SH.000902",
                 "CSI_FLOW_INITIAL_POSITION": "flat",
+                "CSI_FLOW_NOTIFICATION_MODE": "position-aware",
+                "CSI_FLOW_WINDOW_MONTHS": "9",
+                "CSI_FLOW_T1_SELL_MODE": "defer-next-open",
             },
         )
         self.assertEqual(
@@ -130,12 +133,24 @@ class PM2ServiceTest(unittest.TestCase):
                 str(self.config),
                 "--runtime-dir",
                 str(runtime.absolute()),
+                "--notification-mode",
+                "position-independent",
+                "--window-months",
+                "9",
+                "--t1-sell-mode",
+                "defer-next-open",
             ]
         )
         self.assertEqual(rc, 0)
         args, env = run_pm2_mock.call_args.args
         self.assertEqual(args[0], "start")
         self.assertEqual(env["CSI_FLOW_SYMBOL"], "SH.000902")
+        self.assertEqual(
+            env["CSI_FLOW_NOTIFICATION_MODE"],
+            "position-independent",
+        )
+        self.assertEqual(env["CSI_FLOW_WINDOW_MONTHS"], "9")
+        self.assertEqual(env["CSI_FLOW_T1_SELL_MODE"], "defer-next-open")
         self.assertEqual(
             env["CSI_FLOW_RUNTIME_DIR"],
             str(runtime.absolute()),

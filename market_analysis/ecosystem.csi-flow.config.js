@@ -10,6 +10,9 @@ const runtimeInput = process.env.CSI_FLOW_RUNTIME_DIR;
 const symbol = (process.env.CSI_FLOW_SYMBOL || "SH.000902").toUpperCase();
 const initialPosition = process.env.CSI_FLOW_INITIAL_POSITION || "flat";
 const entryDate = process.env.CSI_FLOW_ENTRY_DATE;
+const notificationMode = process.env.CSI_FLOW_NOTIFICATION_MODE || "position-aware";
+const windowMonths = process.env.CSI_FLOW_WINDOW_MONTHS || "9";
+const t1SellMode = process.env.CSI_FLOW_T1_SELL_MODE || "defer-next-open";
 const pythonInterpreter = process.env.CSI_FLOW_PYTHON
   || (process.platform === "win32" ? "python" : "python3");
 
@@ -24,6 +27,15 @@ if (!["flat", "long"].includes(initialPosition)) {
 }
 if (initialPosition === "long" && !entryDate) {
   throw new Error("初始多头状态必须提供 CSI_FLOW_ENTRY_DATE");
+}
+if (!["position-aware", "position-independent"].includes(notificationMode)) {
+  throw new Error("CSI_FLOW_NOTIFICATION_MODE 无效");
+}
+if (!/^\d+$/.test(windowMonths) || Number(windowMonths) < 1) {
+  throw new Error("CSI_FLOW_WINDOW_MONTHS 必须是正整数");
+}
+if (!["defer-next-open", "ignore-same-day"].includes(t1SellMode)) {
+  throw new Error("CSI_FLOW_T1_SELL_MODE 无效");
 }
 
 const configPath = path.resolve(projectRoot, configInput);
@@ -54,6 +66,9 @@ const args = [
   "--config", configPath,
   "--runtime-dir", runtimeDir,
   "--initial-position", initialPosition,
+  "--notification-mode", notificationMode,
+  "--window-months", windowMonths,
+  "--t1-sell-mode", t1SellMode,
 ];
 if (entryDate) {
   args.push("--entry-date", entryDate);

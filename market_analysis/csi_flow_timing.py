@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """中证流通择时信号。
 
-策略版本：M1-LF-held-downside-exact-grid-strength-v1
+策略版本：M1-LF-held-downside-exact-grid-strength-t1-defer-v2
 
 用法：
     python /absolute/path/csi_flow_timing.py backtest --help
@@ -44,12 +44,16 @@ except ImportError:  # live inference itself does not require NumPy
 
 STRATEGY = "m1"
 STRATEGY_STATUS = "frozen_primary"
-VERSION = "M1-LF-held-downside-exact-grid-strength-v1"
-PUBLISH_SCHEMA_VERSION = 2
+VERSION = "M1-LF-held-downside-exact-grid-strength-t1-defer-v2"
+LEGACY_STATE_VERSIONS = {"M1-LF-held-downside-exact-grid-strength-v1"}
+PUBLISH_SCHEMA_VERSION = 3
 SEARCH_METHOD = "exact_frozen_grid"
 WINDOW_MONTHS = 9
 STRENGTH_N = 9
 STRENGTH_FORMULA = "15m_log_price_regression_return"
+NOTIFICATION_MODES = ("position-aware", "position-independent")
+T1_SELL_MODES = ("defer-next-open", "ignore-same-day")
+T1_SELL_MODE = "defer-next-open"
 STRENGTH_SYMBOLS = (
     "SH.510500",
     "SH.510050",
@@ -616,9 +620,12 @@ def evaluate_candidate(
     features: list[Optional[Feature]],
     candidate: Candidate,
     cost_bps: float,
+    t1_sell_mode: str = T1_SELL_MODE,
 ) -> Evaluation:
     if not bars:
         raise ValueError("训练窗口没有行情")
+    if t1_sell_mode not in T1_SELL_MODES:
+        raise ValueError(f"t1_sell_mode 必须是 {', '.join(T1_SELL_MODES)}")
     session_dates = sorted({bar.trading_date for bar in bars})
     session_index = {value: index for index, value in enumerate(session_dates)}
     window_start_month = first_of_month(bars[0].trading_date)
@@ -641,6 +648,7 @@ def evaluate_candidate(
     units = 0.0
     state = 0
     pending: Optional[str] = None
+    deferred_t1_sell = False
     entry_session: Optional[int] = None
     buys = sells = exposure_bars = 0
     cost = cost_bps / 10000
@@ -673,6 +681,20 @@ def evaluate_candidate(
             current_quarter = block
 
         session = session_index[bar.trading_date]
+        if (
+            t1_sell_mode == "defer-next-open"
+            and deferred_t1_sell
+            and state == 1
+            and entry_session is not None
+            and session > entry_session
+        ):
+            cash = units * bar.open * (1 - cost)
+            units = 0.0
+            state = 0
+            entry_session = None
+            pending = None
+            deferred_t1_sell = False
+            sells += 1
         if pending == "BUY":
             units = cash * (1 - cost) / bar.open
             cash = 0.0
@@ -708,6 +730,15 @@ def evaluate_candidate(
                 and sell_score
             ):
                 pending = "SELL"
+            elif (
+                t1_sell_mode == "defer-next-open"
+                and state == 1
+                and entry_session is not None
+                and session == entry_session
+                and bar.clock in EXIT_TIMES
+                and sell_score
+            ):
+                deferred_t1_sell = True
 
         if units > 0:
             exposure_bars += 1
@@ -823,6 +854,7 @@ def optimize_exhaustive(
     features: list[Optional[Feature]],
     cache: dict[Candidate, Evaluation],
     constraint_cache: dict[Candidate, Evaluation],
+    t1_sell_mode: str = T1_SELL_MODE,
 ) -> tuple[Candidate, Evaluation]:
     """Standard-library fallback for the exact 8,008-point grid."""
     rows: list[tuple[Candidate, Evaluation]] = []
@@ -836,13 +868,21 @@ def optimize_exhaustive(
         evaluation = cache.get(candidate)
         if evaluation is None:
             evaluation = evaluate_candidate(
-                bars, features, candidate, CALIBRATION_COST_BPS
+                bars,
+                features,
+                candidate,
+                CALIBRATION_COST_BPS,
+                t1_sell_mode,
             )
             cache[candidate] = evaluation
         constraint = constraint_cache.get(candidate)
         if constraint is None:
             constraint = evaluate_candidate(
-                bars, features, candidate, CONSTRAINT_COST_BPS
+                bars,
+                features,
+                candidate,
+                CONSTRAINT_COST_BPS,
+                t1_sell_mode,
             )
             constraint_cache[candidate] = constraint
         if constraint.strategy_return >= MIN_CONSTRAINT_RETURN:
@@ -853,6 +893,7 @@ def optimize_exhaustive(
 def optimize_exhaustive_vectorized(
     bars: list[Bar],
     features: list[Optional[Feature]],
+    t1_sell_mode: str = T1_SELL_MODE,
 ) -> tuple[Candidate, Evaluation, int, Evaluation]:
     """Evaluate all 8,008 candidates exactly with vectorized state arrays.
 
@@ -861,11 +902,13 @@ def optimize_exhaustive_vectorized(
     same as ``evaluate_candidate``. The chosen candidate is re-evaluated by
     that scalar implementation before publication.
     """
+    if t1_sell_mode not in T1_SELL_MODES:
+        raise ValueError(f"t1_sell_mode 必须是 {', '.join(T1_SELL_MODES)}")
     if np is None:
         cache: dict[Candidate, Evaluation] = {}
         constraint_cache: dict[Candidate, Evaluation] = {}
         candidate, evaluation = optimize_exhaustive(
-            bars, features, cache, constraint_cache
+            bars, features, cache, constraint_cache, t1_sell_mode
         )
         return (
             candidate,
@@ -903,6 +946,7 @@ def optimize_exhaustive_vectorized(
     units = np.zeros((2, count), dtype=float)
     holding = np.zeros(count, dtype=bool)
     pending = np.zeros(count, dtype=np.int8)
+    deferred_t1_sell = np.zeros(count, dtype=bool)
     entry_session = np.full(count, -1, dtype=np.int32)
     buys = np.zeros(count, dtype=np.int16)
     sells = np.zeros(count, dtype=np.int16)
@@ -927,6 +971,25 @@ def optimize_exhaustive_vectorized(
     first_open = bars[0].open
 
     for index, bar in enumerate(bars):
+        if t1_sell_mode == "defer-next-open":
+            deferred_open = (
+                deferred_t1_sell
+                & holding
+                & (sessions[index] > entry_session)
+            )
+            if np.any(deferred_open):
+                cash[:, deferred_open] = (
+                    units[:, deferred_open]
+                    * bar.open
+                    * (1 - costs[:, None])
+                )
+                units[:, deferred_open] = 0.0
+                holding[deferred_open] = False
+                entry_session[deferred_open] = -1
+                deferred_t1_sell[deferred_open] = False
+                pending[deferred_open] = 0
+                sells[deferred_open] += 1
+
         buy_pending = pending == 1
         if np.any(buy_pending):
             units[:, buy_pending] = (
@@ -965,12 +1028,23 @@ def optimize_exhaustive_vectorized(
                 )
                 pending[buy_signal] = 1
             if bar.clock in EXIT_TIMES:
+                sell_score = (
+                    (feature.z30 <= exit_z30)
+                    & (feature.z60 <= exit_z60)
+                )
+                if t1_sell_mode == "defer-next-open":
+                    deferred_signal = (
+                        holding
+                        & no_pending
+                        & (sessions[index] == entry_session)
+                        & sell_score
+                    )
+                    deferred_t1_sell[deferred_signal] = True
                 sell_signal = (
                     holding
                     & no_pending
                     & (sessions[index] > entry_session)
-                    & (feature.z30 <= exit_z30)
-                    & (feature.z60 <= exit_z60)
+                    & sell_score
                 )
                 pending[sell_signal] = 2
 
@@ -1041,10 +1115,10 @@ def optimize_exhaustive_vectorized(
     )
     candidate = candidates[chosen_index]
     evaluation = evaluate_candidate(
-        bars, features, candidate, CALIBRATION_COST_BPS
+        bars, features, candidate, CALIBRATION_COST_BPS, t1_sell_mode
     )
     constraint = evaluate_candidate(
-        bars, features, candidate, CONSTRAINT_COST_BPS
+        bars, features, candidate, CONSTRAINT_COST_BPS, t1_sell_mode
     )
     return candidate, evaluation, count, constraint
 
@@ -1054,6 +1128,7 @@ def calibrate_month(
     features: list[Optional[Feature]],
     cutoff: date,
     window_months: int = WINDOW_MONTHS,
+    t1_sell_mode: str = T1_SELL_MODE,
 ) -> tuple[Candidate, Evaluation, int, Evaluation]:
     window_start = shift_months(cutoff, -window_months).isoformat()
     cutoff_text = cutoff.isoformat()
@@ -1084,7 +1159,9 @@ def calibrate_month(
             f"{train_bars[-1].trading_date}"
         )
 
-    return optimize_exhaustive_vectorized(train_bars, train_features)
+    return optimize_exhaustive_vectorized(
+        train_bars, train_features, t1_sell_mode
+    )
 
 
 def build_schedule(
@@ -1093,12 +1170,13 @@ def build_schedule(
     start: str,
     end: str,
     window_months: int = WINDOW_MONTHS,
+    t1_sell_mode: str = T1_SELL_MODE,
 ) -> tuple[dict[str, Threshold], list[dict[str, Any]]]:
     schedule: dict[str, Threshold] = {}
     audits: list[dict[str, Any]] = []
     for cutoff in month_sequence(start, end):
         candidate, evaluation, count, constraint = calibrate_month(
-            bars, features, cutoff, window_months
+            bars, features, cutoff, window_months, t1_sell_mode
         )
         month = cutoff.strftime("%Y-%m")
         schedule[month] = Threshold(
@@ -1114,6 +1192,7 @@ def build_schedule(
                 "version": VERSION,
                 "month": month,
                 "window_months": window_months,
+                "t1_sell_mode": t1_sell_mode,
                 "window_start": shift_months(
                     cutoff, -window_months
                 ).isoformat(),
@@ -1216,6 +1295,7 @@ def load_live_threshold_provider(
     symbol: str,
     allow_freeze: bool,
     window_months: int = WINDOW_MONTHS,
+    t1_sell_mode: str = T1_SELL_MODE,
 ) -> ThresholdProvider:
     """Load and validate an audited monthly publication for live inference."""
     raw = read_records(path)
@@ -1247,6 +1327,10 @@ def load_live_threshold_provider(
     if int(raw.get("window_months", 0)) != window_months:
         raise ValueError(
             f"阈值校准窗口不是本次指定的 {window_months} 个月"
+        )
+    if raw.get("t1_sell_mode") != t1_sell_mode:
+        raise ValueError(
+            f"阈值T+1退出模式不是本次指定的 {t1_sell_mode}"
         )
     if int(raw.get("grid_points", 0)) != GRID_POINTS:
         raise ValueError(f"阈值网格点数不是冻结的 {GRID_POINTS}")
@@ -1324,11 +1408,13 @@ class ThresholdDirectoryProvider:
         symbol: str,
         allow_freeze: bool,
         window_months: int = WINDOW_MONTHS,
+        t1_sell_mode: str = T1_SELL_MODE,
     ) -> None:
         self.directory = directory
         self.symbol = symbol
         self.allow_freeze = allow_freeze
         self.window_months = window_months
+        self.t1_sell_mode = t1_sell_mode
         self.providers: dict[str, tuple[tuple[int, int], ThresholdProvider]] = {}
         self.warned: set[str] = set()
         if not directory.is_dir():
@@ -1349,6 +1435,7 @@ class ThresholdDirectoryProvider:
             symbol=self.symbol,
             allow_freeze=False,
             window_months=self.window_months,
+            t1_sell_mode=self.t1_sell_mode,
         )
         if month not in provider.schedule:
             raise ValueError(f"{path} 发布月份不是文件名声明的 {month}")
@@ -1401,7 +1488,10 @@ def generate_actions(
     provider: ThresholdProvider,
     start: str,
     end: str,
+    t1_sell_mode: str = T1_SELL_MODE,
 ) -> list[Action]:
+    if t1_sell_mode not in T1_SELL_MODES:
+        raise ValueError(f"t1_sell_mode 必须是 {', '.join(T1_SELL_MODES)}")
     test_dates = sorted(
         {bar.trading_date for bar in bars if in_range(bar.key, start, end)}
     )
@@ -1409,11 +1499,32 @@ def generate_actions(
     actions: list[Action] = []
     state = 0
     pending: Optional[dict[str, str]] = None
+    deferred_t1_sell: Optional[dict[str, str]] = None
     entry_session: Optional[int] = None
     for index, bar in enumerate(bars):
         if not in_range(bar.key, start, end):
             continue
         session = session_index[bar.trading_date]
+        if (
+            t1_sell_mode == "defer-next-open"
+            and deferred_t1_sell is not None
+            and bar.trading_date > deferred_t1_sell["signal_date"]
+        ):
+            actions.append(
+                Action(
+                    side="SELL",
+                    signal_key=deferred_t1_sell["signal_key"],
+                    execution_key=bar.key,
+                    execution_price=bar.open,
+                    calibration_month=deferred_t1_sell[
+                        "calibration_month"
+                    ],
+                )
+            )
+            state = 0
+            entry_session = None
+            pending = None
+            deferred_t1_sell = None
         if pending is not None:
             actions.append(
                 Action(
@@ -1455,6 +1566,20 @@ def generate_actions(
             pending = {
                 "side": "SELL",
                 "signal_key": bar.key,
+                "calibration_month": threshold.month,
+            }
+        elif (
+            t1_sell_mode == "defer-next-open"
+            and state == 1
+            and entry_session is not None
+            and session == entry_session
+            and bar.clock in EXIT_TIMES
+            and sell_score
+            and deferred_t1_sell is None
+        ):
+            deferred_t1_sell = {
+                "signal_key": bar.key,
+                "signal_date": bar.trading_date,
                 "calibration_month": threshold.month,
             }
     return actions
@@ -1621,11 +1746,19 @@ def run_backtest(args: argparse.Namespace) -> int:
     if start > end:
         raise ValueError("start 晚于 end")
     features = build_features(bars)
+    t1_sell_mode = getattr(args, "t1_sell_mode", T1_SELL_MODE)
     schedule, audits = build_schedule(
-        bars, features, start, end, args.window_months
+        bars,
+        features,
+        start,
+        end,
+        args.window_months,
+        t1_sell_mode,
     )
     provider = ThresholdProvider(schedule)
-    actions = generate_actions(bars, features, provider, start, end)
+    actions = generate_actions(
+        bars, features, provider, start, end, t1_sell_mode
+    )
     metrics, curve = simulate(
         bars,
         actions,
@@ -1635,6 +1768,12 @@ def run_backtest(args: argparse.Namespace) -> int:
         args.window_months,
     )
     metrics["bars_file"] = str(bars_path)
+    metrics["t1_sell_mode"] = t1_sell_mode
+    metrics["deferred_t1_sells"] = sum(
+        action.side == "SELL"
+        and action.signal_key[:10] != action.execution_key[:10]
+        for action in actions
+    )
     strength_paths = dict(args.strength_bars or [])
     strength_rankings: Optional[list[dict[str, Any]]] = None
     if strength_paths:
@@ -1686,7 +1825,7 @@ def run_backtest(args: argparse.Namespace) -> int:
         print(f"{VERSION} 回测完成")
         print(
             f"参数: WINDOW_MONTHS={args.window_months}, "
-            f"N={args.strength_n}"
+            f"N={args.strength_n}, T1_SELL_MODE={t1_sell_mode}"
         )
         print(f"区间: {start} 至 {end}")
         print(f"策略收益: {metrics['total_return']:.4%}")
@@ -1829,6 +1968,7 @@ def run_calibrate(args: argparse.Namespace) -> int:
     features = build_features(bars)
     cutoff = first_of_month(args.as_of)
     window_months = int(getattr(args, "window_months", WINDOW_MONTHS))
+    t1_sell_mode = getattr(args, "t1_sell_mode", T1_SELL_MODE)
     window_start = shift_months(cutoff, -window_months).isoformat()
     cutoff_text = cutoff.isoformat()
     training_bars = [
@@ -1837,7 +1977,7 @@ def run_calibrate(args: argparse.Namespace) -> int:
         if window_start <= bar.trading_date < cutoff_text
     ]
     candidate, evaluation, count, constraint = calibrate_month(
-        bars, features, cutoff, window_months
+        bars, features, cutoff, window_months, t1_sell_mode
     )
     threshold = Threshold(
         month=cutoff.strftime("%Y-%m"),
@@ -1863,6 +2003,7 @@ def run_calibrate(args: argparse.Namespace) -> int:
         "window_end": cutoff.fromordinal(cutoff.toordinal() - 1).isoformat(),
         "search_method": SEARCH_METHOD,
         "window_months": window_months,
+        "t1_sell_mode": t1_sell_mode,
         "grid_points": GRID_POINTS,
         "threshold": asdict(threshold),
         "training_evaluation": asdict(evaluation),
@@ -1902,6 +2043,7 @@ def ensure_live_threshold(
     """Ensure the current month's audited threshold exists before inference."""
     runtime.prepare()
     window_months = int(getattr(args, "window_months", WINDOW_MONTHS))
+    t1_sell_mode = getattr(args, "t1_sell_mode", T1_SELL_MODE)
     cutoff = current_market_month(now)
     month = cutoff.strftime("%Y-%m")
     publication = runtime.thresholds_dir / f"threshold_{month}.json"
@@ -1912,6 +2054,7 @@ def ensure_live_threshold(
                 symbol=args.symbol,
                 allow_freeze=False,
                 window_months=window_months,
+                t1_sell_mode=t1_sell_mode,
             )
             provider.for_date(cutoff.isoformat())
             return month, False
@@ -1935,6 +2078,7 @@ def ensure_live_threshold(
             port=args.port,
             futu_time_convention=args.futu_time_convention,
             window_months=window_months,
+            t1_sell_mode=t1_sell_mode,
         )
     )
     run_calibrate(
@@ -1945,6 +2089,7 @@ def ensure_live_threshold(
             as_of=cutoff_text,
             output=str(publication),
             window_months=window_months,
+            t1_sell_mode=t1_sell_mode,
         )
     )
     provider = load_live_threshold_provider(
@@ -1952,6 +2097,7 @@ def ensure_live_threshold(
         symbol=args.symbol,
         allow_freeze=False,
         window_months=window_months,
+        t1_sell_mode=t1_sell_mode,
     )
     provider.for_date(cutoff.isoformat())
     return month, True
@@ -1965,6 +2111,7 @@ class LiveState:
         entry_date: Optional[str],
     ) -> None:
         self.path = path
+        migrated = False
         if path.exists():
             raw = json.loads(path.read_text(encoding="utf-8"))
             if raw.get("strategy") != STRATEGY:
@@ -1972,18 +2119,28 @@ class LiveState:
                     f"状态文件策略 {raw.get('strategy')!r} 与当前 "
                     f"{STRATEGY!r} 不一致"
                 )
-            if raw.get("version") != VERSION:
+            stored_version = raw.get("version")
+            if stored_version != VERSION and stored_version not in (
+                LEGACY_STATE_VERSIONS
+            ):
                 raise ValueError(
-                    f"状态文件版本 {raw.get('version')!r} 与当前 "
+                    f"状态文件版本 {stored_version!r} 与当前 "
                     f"{VERSION!r} 不一致"
                 )
+            migrated = stored_version != VERSION
             self.position = int(raw.get("position", 0))
             self.entry_date = raw.get("entry_date")
             self.pending = raw.get("pending")
+            self.deferred_t1_sell = raw.get("deferred_t1_sell")
+            self.signal_notification_dates = raw.get(
+                "signal_notification_dates", {}
+            )
         else:
             self.position = 1 if initial_position == "long" else 0
             self.entry_date = entry_date if self.position else None
             self.pending = None
+            self.deferred_t1_sell = None
+            self.signal_notification_dates: dict[str, str] = {}
             if self.position and not self.entry_date:
                 raise ValueError("--initial-position long 必须同时给 --entry-date")
             self.save()
@@ -1991,6 +2148,30 @@ class LiveState:
             raise ValueError("状态文件 position 只能是0或1")
         if self.position and not self.entry_date:
             raise ValueError("多头状态缺少 entry_date，无法执行T+1")
+        if self.deferred_t1_sell is not None:
+            if not isinstance(self.deferred_t1_sell, dict):
+                raise ValueError("状态文件 deferred_t1_sell 必须是对象或null")
+            required = {"signal_key", "feature", "threshold"}
+            if not required <= set(self.deferred_t1_sell):
+                raise ValueError("状态文件 deferred_t1_sell 字段不完整")
+            date.fromisoformat(str(self.deferred_t1_sell["signal_key"])[:10])
+        if not isinstance(self.signal_notification_dates, dict):
+            raise ValueError("状态文件 signal_notification_dates 必须是对象")
+        for side, trading_date in self.signal_notification_dates.items():
+            if side not in {"BUY", "SELL"}:
+                raise ValueError("状态文件包含无效的信号通知方向")
+            try:
+                date.fromisoformat(str(trading_date))
+            except ValueError as exc:
+                raise ValueError("状态文件包含无效的信号通知日期") from exc
+        if migrated:
+            self.save()
+
+    def signal_notified_on(self, side: str, trading_date: str) -> bool:
+        return self.signal_notification_dates.get(side) == trading_date
+
+    def mark_signal_notified(self, side: str, trading_date: str) -> None:
+        self.signal_notification_dates[side] = trading_date
 
     def save(self) -> None:
         payload = {
@@ -1999,6 +2180,8 @@ class LiveState:
             "position": self.position,
             "entry_date": self.entry_date,
             "pending": self.pending,
+            "deferred_t1_sell": self.deferred_t1_sell,
+            "signal_notification_dates": self.signal_notification_dates,
             "updated_at": datetime.now().isoformat(timespec="seconds"),
         }
         write_json_atomic(self.path, payload)
@@ -2155,6 +2338,8 @@ class LiveSignalEngine:
         time_convention: str,
         window_months: int = WINDOW_MONTHS,
         strength_n: int = STRENGTH_N,
+        notification_mode: str = "position-aware",
+        t1_sell_mode: str = T1_SELL_MODE,
         event_callback: Optional[Callable[[dict[str, Any]], None]] = None,
     ) -> None:
         self.symbol = symbol
@@ -2162,6 +2347,16 @@ class LiveSignalEngine:
         self.state = state
         self.window_months = window_months
         self.strength_n = strength_n
+        if notification_mode not in NOTIFICATION_MODES:
+            raise ValueError(
+                f"notification_mode 必须是 {', '.join(NOTIFICATION_MODES)}"
+            )
+        self.notification_mode = notification_mode
+        if t1_sell_mode not in T1_SELL_MODES:
+            raise ValueError(
+                f"t1_sell_mode 必须是 {', '.join(T1_SELL_MODES)}"
+            )
+        self.t1_sell_mode = t1_sell_mode
         self.event_callback = event_callback
         self.shift_minutes = 15 if time_convention == "start" else 0
         self.completed: list[Bar] = []
@@ -2178,6 +2373,7 @@ class LiveSignalEngine:
             "symbol": self.symbol,
             "window_months": self.window_months,
             "strength_n": self.strength_n,
+            "t1_sell_mode": self.t1_sell_mode,
             "emitted_at": datetime.now().isoformat(timespec="seconds"),
             **event,
         }
@@ -2214,6 +2410,18 @@ class LiveSignalEngine:
             )
         self.completed = bars[:-1]
         self.current = bars[-1]
+        if (
+            self.t1_sell_mode == "defer-next-open"
+            and self.state.deferred_t1_sell
+        ):
+            opening_bars = [
+                bar
+                for bar in bars
+                if bar.trading_date
+                > str(self.state.deferred_t1_sell["signal_key"])[:10]
+            ]
+            if opening_bars:
+                self.execute_deferred_t1_sell(opening_bars[0])
         if self.state.pending:
             next_bars = [
                 bar
@@ -2283,6 +2491,48 @@ class LiveSignalEngine:
             }
         )
 
+    def execute_deferred_t1_sell(self, opening_bar: Bar) -> None:
+        deferred = self.state.deferred_t1_sell
+        if not deferred or self.t1_sell_mode != "defer-next-open":
+            return
+        signal_date = str(deferred["signal_key"])[:10]
+        if opening_bar.trading_date <= signal_date:
+            return
+        position_before = self.state.position
+        self.state.deferred_t1_sell = None
+        if position_before != 1:
+            self.state.save()
+            return
+        self.state.position = 0
+        self.state.entry_date = None
+        self.state.pending = None
+        self.state.mark_signal_notified("SELL", opening_bar.trading_date)
+        self.state.save()
+        self.emit(
+            {
+                "type": "SIGNAL",
+                "bar_key": deferred["signal_key"],
+                "action": "SELL",
+                "execution": "CURRENT_BAR_OPEN",
+                "position_before": position_before,
+                "t1_sellable": True,
+                "feature": deferred["feature"],
+                "threshold": deferred["threshold"],
+                "strength": None,
+            }
+        )
+        self.emit(
+            {
+                "type": "EXECUTION_ASSUMED",
+                "side": "SELL",
+                "signal_key": deferred["signal_key"],
+                "execution_key": opening_bar.key,
+                "execution_price": opening_bar.open,
+                "position": self.state.position,
+                "note": "T+1隔日开盘同步信号状态，不发送订单",
+            }
+        )
+
     def finalize(self, bar: Bar) -> None:
         if self.completed and bar.key <= self.completed[-1].key:
             return
@@ -2306,12 +2556,39 @@ class LiveSignalEngine:
             and self.state.entry_date
             and bar.trading_date > self.state.entry_date
         )
-        action = "NONE"
+        buy_signal = bar.clock in ENTRY_TIMES and buy_score
+        sell_signal = bar.clock in EXIT_TIMES and sell_score
+        actionable_buy = self.state.position == 0 and buy_signal
+        actionable_sell = (
+            self.state.position == 1 and t1_sellable and sell_signal
+        )
+        deferred_t1_sell = (
+            self.t1_sell_mode == "defer-next-open"
+            and self.state.position == 1
+            and not t1_sellable
+            and sell_signal
+        )
+        if self.notification_mode == "position-independent":
+            notify_buy = buy_signal and not self.state.signal_notified_on(
+                "BUY", bar.trading_date
+            )
+            notify_sell = sell_signal and not self.state.signal_notified_on(
+                "SELL", bar.trading_date
+            )
+        else:
+            notify_buy = actionable_buy and not self.state.signal_notified_on(
+                "BUY", bar.trading_date
+            )
+            notify_sell = (
+                actionable_sell
+                and not self.state.signal_notified_on("SELL", bar.trading_date)
+            )
+        if deferred_t1_sell:
+            notify_sell = False
         strength: Optional[dict[str, Any]] = None
-        if self.state.position == 0 and bar.clock in ENTRY_TIMES and buy_score:
+        if notify_buy or actionable_buy:
             try:
                 strength = self.current_strength(bar.key)
-                action = "BUY"
             except ValueError as exc:
                 self.emit(
                     {
@@ -2319,33 +2596,57 @@ class LiveSignalEngine:
                         "message": f"强度排名不可用，BUY信号未发布: {exc}",
                     }
                 )
-        elif (
-            self.state.position == 1
-            and t1_sellable
-            and bar.clock in EXIT_TIMES
-            and sell_score
-        ):
-            action = "SELL"
-        if action != "NONE":
+                notify_buy = False
+                actionable_buy = False
+        execution_action = "NONE"
+        if actionable_buy:
+            execution_action = "BUY"
+        elif actionable_sell:
+            execution_action = "SELL"
+        state_changed = False
+        if execution_action != "NONE":
             self.state.pending = {
-                "side": action,
+                "side": execution_action,
                 "signal_key": bar.key,
                 "calibration_month": threshold.month,
             }
-            self.state.save()
-        self.emit(
-            {
-                "type": "SIGNAL",
-                "bar_key": bar.key,
-                "action": action,
-                "execution": "NEXT_BAR_OPEN",
-                "position_before": self.state.position,
-                "t1_sellable": t1_sellable,
+            state_changed = True
+        if deferred_t1_sell and self.state.deferred_t1_sell is None:
+            self.state.deferred_t1_sell = {
+                "signal_key": bar.key,
                 "feature": asdict(feature),
                 "threshold": asdict(threshold),
-                "strength": strength,
             }
-        )
+            state_changed = True
+        if notify_buy:
+            self.state.mark_signal_notified("BUY", bar.trading_date)
+            state_changed = True
+        if notify_sell:
+            self.state.mark_signal_notified("SELL", bar.trading_date)
+            state_changed = True
+        if state_changed:
+            self.state.save()
+        notification_actions = []
+        if notify_buy:
+            notification_actions.append("BUY")
+        if notify_sell:
+            notification_actions.append("SELL")
+        if not notification_actions:
+            notification_actions.append("NONE")
+        for action in notification_actions:
+            self.emit(
+                {
+                    "type": "SIGNAL",
+                    "bar_key": bar.key,
+                    "action": action,
+                    "execution": "NEXT_BAR_OPEN",
+                    "position_before": self.state.position,
+                    "t1_sellable": t1_sellable,
+                    "feature": asdict(feature),
+                    "threshold": asdict(threshold),
+                    "strength": strength if action == "BUY" else None,
+                }
+            )
 
     def on_strength_bar(self, bar: Bar) -> None:
         with self.lock:
@@ -2370,6 +2671,7 @@ class LiveSignalEngine:
                 return
             prior = self.current
             self.finalize(prior)
+            self.execute_deferred_t1_sell(bar)
             self.execute_pending(bar)
             self.current = bar
 
@@ -2383,6 +2685,7 @@ def live_provider(
         symbol=args.symbol,
         allow_freeze=False,
         window_months=getattr(args, "window_months", WINDOW_MONTHS),
+        t1_sell_mode=getattr(args, "t1_sell_mode", T1_SELL_MODE),
     )
 
 
@@ -2423,6 +2726,10 @@ def _run_live(
         args.futu_time_convention,
         window_months=getattr(args, "window_months", WINDOW_MONTHS),
         strength_n=getattr(args, "strength_n", STRENGTH_N),
+        notification_mode=getattr(
+            args, "notification_mode", "position-aware"
+        ),
+        t1_sell_mode=getattr(args, "t1_sell_mode", T1_SELL_MODE),
         event_callback=notifier.notify if notifier is not None else None,
     )
     fatal_event = threading.Event()
@@ -2663,6 +2970,18 @@ def add_window_argument(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_t1_sell_mode_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--t1-sell-mode",
+        choices=T1_SELL_MODES,
+        default=T1_SELL_MODE,
+        help=(
+            "同日买入后触发SELL的处理方式；defer-next-open在下一交易日"
+            "首根15分钟K线开盘退出，ignore-same-day保留旧策略"
+        ),
+    )
+
+
 def add_strength_n_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--n",
@@ -2696,6 +3015,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_bar_arguments(backtest)
     add_window_argument(backtest)
+    add_t1_sell_mode_argument(backtest)
     add_strength_n_argument(backtest)
     backtest.add_argument("--start", required=True)
     backtest.add_argument("--end")
@@ -2740,6 +3060,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_bar_arguments(calibrate)
     add_window_argument(calibrate)
+    add_t1_sell_mode_argument(calibrate)
     calibrate.add_argument("--as-of", required=True)
     calibrate.add_argument(
         "--output",
@@ -2762,6 +3083,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     live.add_argument("--history-bars", type=int, default=200)
     add_window_argument(live)
+    add_t1_sell_mode_argument(live)
     add_strength_n_argument(live)
     live.add_argument("--duration", type=int, default=0)
     live.add_argument(
@@ -2783,6 +3105,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--notify-lifecycle",
         action="store_true",
         help="除交易信号和错误外，也通知READY/STOPPED",
+    )
+    live.add_argument(
+        "--notification-mode",
+        choices=NOTIFICATION_MODES,
+        default="position-aware",
+        help=(
+            "position-aware 保留原仓位约束通知；"
+            "position-independent 忽略仓位且同日同方向仅通知一次"
+        ),
     )
     live.set_defaults(func=run_live)
     return parser
