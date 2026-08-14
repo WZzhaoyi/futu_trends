@@ -70,6 +70,48 @@ class PM2ServiceTest(unittest.TestCase):
         )
         self.assertTrue(spec.ecosystem_path.is_file())
 
+    def test_etf_premium_identity_and_environment(self):
+        runtime = Path(self.temp_dir.name) / "etf-runtime"
+        strategy = Path(self.temp_dir.name) / "strategy.json"
+        strategy.write_text("{}\n", encoding="utf-8")
+        cache = Path(self.temp_dir.name) / "cache"
+        spec = build_service_spec(
+            "etf-premium",
+            str(self.config),
+            runtime_dir=str(runtime.absolute()),
+            symbol="159941",
+            initial_position="low",
+            strategy_file=str(strategy),
+            cache_dir=str(cache),
+        )
+        identity = "\0".join(
+            (
+                str(self.config.absolute()),
+                str(runtime.absolute()),
+                "159941",
+            )
+        )
+        digest = hashlib.sha256(identity.encode()).hexdigest()[:8]
+        self.assertEqual(
+            spec.instance_name,
+            f"futu-etf-premium-{digest}",
+        )
+        self.assertEqual(
+            spec.environment["ETF_PREMIUM_RUNTIME_DIR"],
+            str(runtime.absolute()),
+        )
+        self.assertEqual(
+            spec.environment["ETF_PREMIUM_STRATEGY_FILE"],
+            str(strategy.absolute()),
+        )
+        self.assertEqual(spec.environment["ETF_PREMIUM_INITIAL_POSITION"], "low")
+        self.assertEqual(spec.environment["ETF_PREMIUM_MAX_NAV_AGE"], "14")
+        self.assertEqual(
+            spec.ecosystem_path.name,
+            "ecosystem.etf-premium.config.js",
+        )
+        self.assertTrue(spec.ecosystem_path.is_file())
+
     def test_identity_does_not_dereference_config_symlink(self):
         link = Path(self.temp_dir.name) / "linked.ini"
         try:
@@ -106,6 +148,22 @@ class PM2ServiceTest(unittest.TestCase):
                 str(self.config),
                 runtime_dir=str(Path(self.temp_dir.name).absolute()),
                 initial_position="long",
+            )
+        with self.assertRaises(PM2ConfigError):
+            build_service_spec(
+                "etf-premium",
+                str(self.config),
+                runtime_dir="relative/path",
+                symbol="159941",
+                initial_position="base",
+            )
+        with self.assertRaises(PM2ConfigError):
+            build_service_spec(
+                "etf-premium",
+                str(self.config),
+                runtime_dir=str(Path(self.temp_dir.name).absolute()),
+                symbol="SZ.159941",
+                initial_position="base",
             )
 
     def test_unix_pm2_override(self):
@@ -153,6 +211,33 @@ class PM2ServiceTest(unittest.TestCase):
         self.assertEqual(env["CSI_FLOW_T1_SELL_MODE"], "defer-next-open")
         self.assertEqual(
             env["CSI_FLOW_RUNTIME_DIR"],
+            str(runtime.absolute()),
+        )
+
+    @patch("cli.pm2_service.run_pm2", return_value=0)
+    def test_main_builds_etf_premium_service(self, run_pm2_mock):
+        runtime = Path(self.temp_dir.name) / "etf-runtime"
+        rc = main(
+            [
+                "etf-premium",
+                "start",
+                "--config",
+                str(self.config),
+                "--runtime-dir",
+                str(runtime.absolute()),
+                "--symbol",
+                "159941",
+                "--initial-position",
+                "base",
+            ]
+        )
+        self.assertEqual(rc, 0)
+        args, env = run_pm2_mock.call_args.args
+        self.assertEqual(args[0], "start")
+        self.assertEqual(env["ETF_PREMIUM_SYMBOL"], "159941")
+        self.assertEqual(env["ETF_PREMIUM_INTERVAL"], "60.0")
+        self.assertEqual(
+            env["ETF_PREMIUM_RUNTIME_DIR"],
             str(runtime.absolute()),
         )
 
