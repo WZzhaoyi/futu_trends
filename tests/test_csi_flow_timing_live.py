@@ -125,6 +125,8 @@ class StrategyDefinitionTest(unittest.TestCase):
         )
         self.assertEqual(fetch_args.futu_time_convention, "end")
         self.assertEqual(fetch_args.window_months, 9)
+        self.assertFalse(hasattr(fetch_args, "host"))
+        self.assertFalse(hasattr(fetch_args, "port"))
         live_args = parser.parse_args(
             [
                 "live",
@@ -139,6 +141,8 @@ class StrategyDefinitionTest(unittest.TestCase):
         self.assertEqual(live_args.strength_n, 9)
         self.assertEqual(live_args.notification_mode, "position-aware")
         self.assertEqual(live_args.t1_sell_mode, "defer-next-open")
+        self.assertFalse(hasattr(live_args, "host"))
+        self.assertFalse(hasattr(live_args, "port"))
 
         configured = parser.parse_args(
             [
@@ -232,6 +236,82 @@ class DeferredT1StrategyTest(unittest.TestCase):
         self.assertEqual(actions[-1].signal_key, "2026-07-01 14:00")
         self.assertEqual(actions[-1].execution_key, "2026-07-02 09:45")
         self.assertEqual(actions[-1].execution_price, 98.0)
+
+
+class CoreTransitionTest(unittest.TestCase):
+    def test_close_decision_covers_buy_sell_and_t1_defer(self):
+        threshold = timing.Candidate(0.0, 0.0, 0.0, 0.0)
+        buy = timing.Feature(1.0, 1.0, 0.0, 0.0, 0.1)
+        sell = timing.Feature(-1.0, -1.0, 0.0, 0.0, 0.1)
+
+        self.assertEqual(
+            timing.decide_at_close(0, False, "10:30", buy, threshold),
+            (True, False, "BUY", False),
+        )
+        self.assertEqual(
+            timing.decide_at_close(1, True, "10:00", sell, threshold),
+            (False, True, "SELL", False),
+        )
+        self.assertEqual(
+            timing.decide_at_close(1, False, "10:00", sell, threshold),
+            (False, True, None, True),
+        )
+    def test_batch_and_latest_feature_use_the_same_formula(self):
+        bars = [
+            timing.Bar(
+                key=f"2026-07-{1 + index // 16:02d} 10:{index % 4 * 15:02d}",
+                open=100 + index,
+                high=100 + index,
+                low=100 + index,
+                close=100 + index,
+            )
+            for index in range(timing.VOLATILITY_BARS + 8)
+        ]
+        self.assertEqual(
+            timing.latest_feature(bars),
+            timing.build_features(bars)[-1],
+        )
+
+    def test_numpy_optimizer_matches_standard_library_fallback(self):
+        bars = []
+        features = []
+        for cycle in range(5):
+            buy_day = 1 + cycle * 2
+            sell_day = buy_day + 1
+            rows = (
+                (
+                    buy_day,
+                    "10:30",
+                    100,
+                    100,
+                    timing.Feature(10, 10, 0, 0, 0.1),
+                ),
+                (buy_day, "10:45", 100, 99, None),
+                (
+                    sell_day,
+                    "10:00",
+                    103,
+                    103,
+                    timing.Feature(-10, -10, 0, 0, 0.1),
+                ),
+                (sell_day, "10:15", 103, 103, None),
+            )
+            for day, clock, opening, close, feature in rows:
+                bars.append(
+                    timing.Bar(
+                        key=f"2026-01-{day:02d} {clock}",
+                        open=opening,
+                        high=max(opening, close),
+                        low=min(opening, close),
+                        close=close,
+                    )
+                )
+                features.append(feature)
+
+        vectorized = timing.optimize_exhaustive_vectorized(bars, features)
+        with mock.patch.object(timing, "np", None):
+            fallback = timing.optimize_exhaustive_vectorized(bars, features)
+        self.assertEqual(vectorized, fallback)
 
 
 class StrengthRankingTest(unittest.TestCase):
@@ -717,8 +797,6 @@ class PublicationAndStateIdentityTest(unittest.TestCase):
         return argparse.Namespace(
             symbol="SH.000902",
             config=None,
-            host="127.0.0.1",
-            port=11111,
             futu_time_convention="end",
         )
 
@@ -732,8 +810,8 @@ class PublicationAndStateIdentityTest(unittest.TestCase):
                 encoding="utf-8",
             )
             with (
-                mock.patch.object(timing, "run_fetch_bars") as fetch,
-                mock.patch.object(timing, "run_calibrate") as calibrate,
+                mock.patch.object(timing, "fetch_calibration_bars") as fetch,
+                mock.patch.object(timing, "publish_calibration") as calibrate,
             ):
                 month, generated = timing.ensure_live_threshold(
                     self.live_args(),
@@ -750,29 +828,33 @@ class PublicationAndStateIdentityTest(unittest.TestCase):
             runtime = timing.LiveRuntimePaths.from_argument(raw_dir)
             calls = []
 
-            def fake_fetch(args):
-                calls.append(("fetch", args.as_of, args.output))
-                Path(args.output).write_text("{}", encoding="utf-8")
-                return 0
+            def fake_fetch(**values):
+                calls.append(("fetch", values["as_of"], values["output"]))
+                Path(values["output"]).write_text("{}", encoding="utf-8")
+                return {}
 
-            def fake_calibrate(args):
-                calls.append(("calibrate", args.as_of, args.output))
-                Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-                Path(args.output).write_text(
+            def fake_calibrate(**values):
+                calls.append(
+                    ("calibrate", values["as_of"], values["output"])
+                )
+                Path(values["output"]).parent.mkdir(
+                    parents=True, exist_ok=True
+                )
+                Path(values["output"]).write_text(
                     json.dumps(self.valid_publication()),
                     encoding="utf-8",
                 )
-                return 0
+                return self.valid_publication()
 
             with (
                 mock.patch.object(
                     timing,
-                    "run_fetch_bars",
+                    "fetch_calibration_bars",
                     side_effect=fake_fetch,
                 ),
                 mock.patch.object(
                     timing,
-                    "run_calibrate",
+                    "publish_calibration",
                     side_effect=fake_calibrate,
                 ),
             ):
@@ -858,24 +940,21 @@ class ThresholdDirectoryProviderTest(unittest.TestCase):
 
 
 class LiveConnectionTest(unittest.TestCase):
-    def test_config_values_and_cli_overrides(self):
+    def test_config_values_or_defaults(self):
         with tempfile.TemporaryDirectory() as raw_dir:
             path = Path(raw_dir) / "config.ini"
             path.write_text(
                 "[CONFIG]\nFUTU_HOST=10.0.0.2\nFUTU_PORT=22222\n",
                 encoding="utf-8",
             )
-            args = argparse.Namespace(
-                config=str(path), host=None, port=None
-            )
             self.assertEqual(
-                timing.live_connection(args), ("10.0.0.2", 22222)
+                timing.resolve_live_connection(str(path)),
+                ("10.0.0.2", 22222),
             )
-            args.host = "127.0.0.8"
-            args.port = 33333
-            self.assertEqual(
-                timing.live_connection(args), ("127.0.0.8", 33333)
-            )
+        self.assertEqual(
+            timing.resolve_live_connection(None),
+            ("127.0.0.1", 11111),
+        )
 
 
 class LiveContextCleanupTest(unittest.TestCase):
@@ -935,8 +1014,6 @@ class LiveContextCleanupTest(unittest.TestCase):
             args = argparse.Namespace(
                 symbol="SH.000902",
                 config=None,
-                host="127.0.0.1",
-                port=11111,
                 history_bars=200,
                 duration=5,
                 initial_position="flat",
@@ -945,7 +1022,11 @@ class LiveContextCleanupTest(unittest.TestCase):
             )
             with (
                 mock.patch.dict(sys.modules, {"futu": fake_futu}),
-                mock.patch.object(timing, "live_provider", return_value=object()),
+                mock.patch.object(
+                    timing,
+                    "ThresholdDirectoryProvider",
+                    return_value=object(),
+                ),
                 mock.patch.object(
                     timing.LiveSignalEngine,
                     "bootstrap",
@@ -1022,8 +1103,6 @@ class FetchBarsTest(unittest.TestCase):
                 as_of="2026-07-01",
                 start=None,
                 end=None,
-                host="127.0.0.1",
-                port=11111,
                 config=None,
                 symbol="SH.000902",
                 output=str(output),
@@ -1070,8 +1149,6 @@ class FetchBarsTest(unittest.TestCase):
             as_of="2026-07-01",
             start=None,
             end=None,
-            host="127.0.0.1",
-            port=11111,
             config=None,
             symbol="SH.000902",
             output="/tmp/not-written.json",
