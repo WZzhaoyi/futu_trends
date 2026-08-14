@@ -345,14 +345,13 @@ def calculate_win_rate(df, look_ahead=10, target_multiplier=1.1, atr_period=20, 
 
 def trading_system_z_score(trades: list, win_value=1, loss_value=0):
   """
-  计算交易系统盈亏序列的Z-score。
+  评估交易盈亏序列是否具有连续或交替特征。
 
-  参数:
-    trades (list): 一个由1（盈利）和0（亏损）组成的列表。
-                   例如: [1, 1, 0, 1, 0, 0, 1]
+  Z-score > 1.96 表示显著交替（均值回归），< -1.96 表示显著连续
+  （趋势/连胜连败）；[-1, 1] 通常视为随机，其余区间为弱倾向。
 
-  返回:
-    float or 0: 计算出的Z-score或错误信息。
+  trades 使用 win_value/loss_value 标记盈亏；样本少于30笔或只有单一
+  结果时返回0。
   """
   n = len(trades)
   if n < 30:

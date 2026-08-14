@@ -1,27 +1,198 @@
-from os import cpu_count
-import os
-import akshare as ak
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
-from typing import List, Dict
-import logging
-import time
-from pathlib import Path
-import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import threading
 import argparse
-from tqdm import tqdm
-from trend_emotion_timing import anchored_trend_score, trend_score, emotion_score
+import logging
+import os
+import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
+from os import cpu_count
+from pathlib import Path
+from typing import Dict, List
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
+import akshare as ak
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+
 logger = logging.getLogger(__name__)
+
+
+TREND_WINDOWS = (24, 32, 48, 64, 96, 128, 192, 256, 384, 512)
+TREND_CROSSOVERS = (
+    (20, 400), (50, 400), (100, 400), (200, 400),
+    (20, 200), (50, 200), (100, 200),
+    (20, 100), (50, 100), (20, 50),
+)
+REGRESSION_WINDOWS = (60, 80, 100, 120, 140, 160, 180, 240, 300, 360)
+RSI_WINDOWS = (5, 10, 14, 20)
+CANDLE_RANGE_WINDOWS = (3, 5, 8, 13)
+
+__all__ = (
+    "RSRatingCalculator",
+    "anchored_trend_score",
+    "cross_system",
+    "emotion_score",
+    "joint_score",
+    "linear_regression",
+    "rate_of_change",
+    "rescaled_candle_range",
+    "rescaled_rsi",
+    "simple_moving_average",
+    "trend_emotion_timing",
+    "trend_score",
+)
+
+
+def rate_of_change(price: pd.Series, window: int) -> np.ndarray:
+    """Return whether price is below the rolling high for the given window."""
+    rolling_high = price.rolling(window=window).max()
+    return np.select(
+        [price > rolling_high, price < rolling_high],
+        [1, -1],
+        default=0,
+    )
+
+
+def simple_moving_average(price: pd.Series, window: int) -> np.ndarray:
+    """Return the price position relative to its simple moving average."""
+    average = price.rolling(window=window).mean()
+    return np.select([price > average, price < average], [1, -1], default=0)
+
+
+def cross_system(price: pd.Series, short_window: int, long_window: int) -> np.ndarray:
+    """Return the position of a short moving average relative to a long one."""
+    if short_window >= long_window:
+        raise ValueError("short_window must be less than long_window")
+    short_average = price.rolling(window=short_window).mean()
+    long_average = price.rolling(window=long_window).mean()
+    return np.select(
+        [short_average > long_average, short_average < long_average],
+        [1, -1],
+        default=0,
+    )
+
+
+def linear_regression(price: pd.Series, window: int) -> pd.Series:
+    """Return the rolling regression-slope signal."""
+    def slope_signal(values: np.ndarray) -> int:
+        x = np.arange(len(values))
+        covariance = np.cov(x, values)
+        slope = covariance[0, 1] / covariance[0, 0]
+        residuals = values - (slope * x + np.mean(values) - slope * np.mean(x))
+        standard_error = (
+            np.sqrt(np.sum(residuals ** 2) / (len(values) - 2))
+            / np.sqrt(np.sum((x - np.mean(x)) ** 2))
+        )
+        if slope > standard_error:
+            return 1
+        if slope < -standard_error:
+            return -1
+        return 0
+
+    return price.rolling(window=window).apply(slope_signal)
+
+
+def trend_score(price: pd.Series) -> pd.Series:
+    """Calculate the average of the 40 trend indicator signals."""
+    score = pd.Series(0.0, index=price.index)
+    for window in TREND_WINDOWS:
+        score += rate_of_change(price, window)
+        score += simple_moving_average(price, window)
+    for short_window, long_window in TREND_CROSSOVERS:
+        score += cross_system(price, short_window, long_window)
+    for window in REGRESSION_WINDOWS:
+        score += linear_regression(price, window)
+    indicator_count = (
+        len(TREND_WINDOWS) * 2
+        + len(TREND_CROSSOVERS)
+        + len(REGRESSION_WINDOWS)
+    )
+    return score / indicator_count
+
+
+def joint_score(stock_price: pd.Series, benchmark_price: pd.Series) -> pd.Series:
+    """Combine absolute and benchmark-relative trend scores."""
+    relative_score = trend_score(stock_price / benchmark_price)
+    stock_score = trend_score(stock_price)
+    both_up = (relative_score > 0) & (stock_score > 0)
+    both_down = (relative_score < 0) & (stock_score < 0)
+    score = np.select(
+        [
+            both_up & (stock_score > relative_score),
+            both_up & (stock_score < relative_score),
+            both_down & (stock_score > relative_score),
+            both_down & (stock_score < relative_score),
+        ],
+        [relative_score, stock_score, stock_score, relative_score],
+        default=0,
+    )
+    return pd.Series(score, index=stock_price.index)
+
+
+def rescaled_rsi(price: pd.Series, window: int) -> pd.Series:
+    """Calculate RSI and rescale it from [0, 100] to [-1, 1]."""
+    delta = price.diff()
+    gain = delta.where(delta > 0, 0).rolling(window=window).mean()
+    loss = -delta.where(delta < 0, 0).rolling(window=window).mean()
+    loss = loss.mask(loss == 0, np.inf)
+    rsi = (100 - 100 / (1 + gain / loss)).replace([np.inf, -np.inf], 100)
+    return ((rsi.fillna(50).clip(0, 100) - 50) / 50)
+
+
+def rescaled_candle_range(price: pd.Series, window: int) -> pd.Series:
+    """Scale the close's position in its rolling range to [-1, 1]."""
+    rolling_high = price.rolling(window=window).max()
+    rolling_low = price.rolling(window=window).min()
+    return 2 * (price - rolling_low) / (rolling_high - rolling_low) - 1
+
+
+def emotion_score(price: pd.Series) -> pd.Series:
+    """Calculate the average RSI and candle-range oscillator score."""
+    score = pd.Series(0.0, index=price.index)
+    for window in RSI_WINDOWS:
+        score += rescaled_rsi(price, window)
+    for window in CANDLE_RANGE_WINDOWS:
+        score += rescaled_candle_range(price, window)
+    return score / (len(RSI_WINDOWS) + len(CANDLE_RANGE_WINDOWS))
+
+
+def anchored_trend_score(
+    score: pd.Series,
+    score_emotion: pd.Series,
+) -> pd.Series:
+    """Hold the trend score between emotion reset points."""
+    if score.empty:
+        return pd.Series(index=score.index, dtype=float)
+    if len(score) != len(score_emotion):
+        raise ValueError("score and score_emotion must have the same length")
+
+    anchored_score = pd.Series(index=score.index, dtype=float)
+    anchored_score.iloc[0] = score.iloc[0]
+    for index in range(1, len(score)):
+        emotion_reset = (
+            score_emotion.iloc[index] > -0.5
+            and score_emotion.iloc[index - 1] < 0.5
+        )
+        anchored_score.iloc[index] = (
+            score.iloc[index] if emotion_reset else anchored_score.iloc[index - 1]
+        )
+    return anchored_score
+
+
+def trend_emotion_timing(
+    score: pd.Series,
+    score_emotion: pd.Series,
+) -> pd.Series:
+    """Return long (1), short (-1), or neutral (0) timing signals."""
+    timing_indicator = anchored_trend_score(score, score_emotion) - score_emotion
+    timing = np.select(
+        [timing_indicator > 1, timing_indicator < -1],
+        [1, -1],
+        default=0,
+    )
+    return pd.Series(timing, index=score.index)
 
 class RSRatingCalculator:
     def __init__(self,code_list: List[str],market: str, cache_dir: str = 'data/rs_rating'):
@@ -236,7 +407,13 @@ class RSRatingCalculator:
         self.memory_cache[f'benchmark_{market}_returns'] = benchmark_returns
         return benchmark_returns
     
-    def _calculate_rs_rating(self, ticker: str, benchmark_returns: Dict[str, List[float]], market: str) -> Dict[str, float]:
+    def _calculate_rs_rating(
+        self,
+        ticker: str,
+        benchmark_returns: Dict[str, List[float]],
+        market: str,
+        stock_data: pd.DataFrame | None = None,
+    ) -> Dict[str, float]:
         """计算股票的RS Rating"""
         if market not in self.market_index_map.keys():
             raise ValueError(f"市场类型必须是 {self.market_index_map.keys()}")
@@ -245,7 +422,7 @@ class RSRatingCalculator:
         # benchmark_returns = self._get_benchmark_returns(market)
         
         # 获取目标股票数据
-        data = self._get_stock_data(ticker, market)
+        data = stock_data if stock_data is not None else self._get_stock_data(ticker, market)
         
         # 计算各周期的RS Rating
         rs_ratings = {}
@@ -306,7 +483,12 @@ class RSRatingCalculator:
             
         return covariance / market_variance
 
-    def _calculate_trend_emotion_timing(self, code: str, market: str) -> int:
+    def _calculate_trend_emotion_timing(
+        self,
+        code: str,
+        market: str,
+        stock_data: pd.DataFrame | None = None,
+    ) -> int:
         """
         计算股票的Trend Emotion Timing
         交易信号：
@@ -317,7 +499,7 @@ class RSRatingCalculator:
         if market not in self.market_index_map.keys():
             raise ValueError(f"market type must be one of {self.market_index_map.keys()}")
         # df_benchmark = self._get_stock_data(self.market_index_map[market], market)[-1000:]
-        df_stock = self._get_stock_data(code, market)
+        df_stock = stock_data if stock_data is not None else self._get_stock_data(code, market)
         if df_stock.empty or len(df_stock) < 500:
             return 0
         df_stock = df_stock[-1000:]
@@ -326,42 +508,34 @@ class RSRatingCalculator:
             
         score_trend = trend_score(df_stock['close'])
         score_emotion = emotion_score(df_stock['close'])
-        anchored_score = anchored_trend_score(score_trend, score_emotion)
-        timing_indicator = anchored_score - score_emotion
-        if timing_indicator.empty:
+        timing = trend_emotion_timing(score_trend, score_emotion)
+        if timing.empty:
             return 0
-        # 筛选上升趋势中超卖的股票 金色对角线​​：|Timing_Indicator| > 1.0（择时机会）
-        if timing_indicator.iloc[-1] > 1:
-            return 1
-        elif timing_indicator.iloc[-1] < -1:
-            return -1
-        else:
-            return 0
+        return int(timing.iloc[-1])
     
     def _process_single_stock(self, ticker: str, benchmark_returns: Dict[str, List[float]], stock_data: pd.DataFrame, market_data: pd.DataFrame) -> tuple:
         """处理单个股票的计算，用于并行执行"""
-        try:
-            if stock_data.empty:
-                raise ValueError(f"Failed to get stock data {ticker}")
-                
-            if market_data.empty:
-                raise ValueError(f"Failed to get market index data {self.market}")
-                
-            # 相对大盘表现、beta值、趋势情绪择时
-            rs_ratings = self._calculate_rs_rating(ticker, benchmark_returns, self.market)
-            beta = self._calculate_beta(stock_data, market_data)
-            trend_emotion_timing = self._calculate_trend_emotion_timing(ticker, self.market)
-            
-            result = {
-                'beta': beta,
-                'trend_emotion_timing': trend_emotion_timing
-            }
-            result.update(rs_ratings)
-            
-            return ticker, result
-            
-        except Exception as e:
-            raise e
+        if stock_data.empty:
+            raise ValueError(f"Failed to get stock data {ticker}")
+        if market_data.empty:
+            raise ValueError(f"Failed to get market index data {self.market}")
+
+        rs_ratings = self._calculate_rs_rating(
+            ticker,
+            benchmark_returns,
+            self.market,
+            stock_data,
+        )
+        result = {
+            'beta': self._calculate_beta(stock_data, market_data),
+            'trend_emotion_timing': self._calculate_trend_emotion_timing(
+                ticker,
+                self.market,
+                stock_data,
+            ),
+        }
+        result.update(rs_ratings)
+        return ticker, result
 
     def calculate(self) -> Dict[str, Dict[str, float]]:
         """计算股票的RS Rating、Beta值、Trend Emotion Timing
@@ -411,6 +585,11 @@ class RSRatingCalculator:
     
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    )
     parser = argparse.ArgumentParser(description='Rating calculator')
     parser.add_argument('--market', type=str, default='HSI',
                        help='Market type: A500, CSI300, HSI, SP500, GGT')
