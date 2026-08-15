@@ -15,16 +15,19 @@
 #  Written by Joey <wzzhaoyi@outlook.com>, 2023
 #  Copyright (c)  Joey - All Rights Reserved
 
+from __future__ import annotations
+
 import math
 import futu as ft
 import pandas as pd
 import numpy as np
-from typing import Union
-from scipy import stats
+from typing import TYPE_CHECKING, Union
 from datetime import datetime, timedelta
 import re
 import yfinance as yf
-from ib_async import Contract
+
+if TYPE_CHECKING:
+    from ib_async import Contract
 
 FUTU_MARKET_PREFIXES = ("US", "HK", "SH", "SZ")
 
@@ -125,6 +128,8 @@ def futu_code_to_ib_contract(futu_code: str) -> Contract:
     """将富途代码转换为 ib_async 的 Contract 对象（仅股票）
     E.g., HK.00700 -> Contract(symbol='700', secType='STK', exchange='SEHK', currency='HKD')
     """
+    from ib_async import Contract
+
     market, symbol = futu_code.split('.', 1)
     market = market.upper()
 
@@ -445,6 +450,8 @@ def siegelslopes_ma(price_ser: Union[pd.Series, np.ndarray],method:str="hierarch
     Returns:
         float: float
     """
+    from scipy import stats
+
     n: int = len(price_ser)
     res = stats.siegelslopes(price_ser, np.arange(n), method=method)
     return res.intercept + res.slope * (n-1)
@@ -479,7 +486,9 @@ def calc_momentum(close: pd.Series, N=21, method='linear')->pd.Series:
         if method == 'linear':
             slope, intercept = np.polyfit(x, y, 1)
             annualized_returns = math.pow(math.exp(slope), 250) - 1
-            r_squared = 1 - (sum((y - (slope * x + intercept))**2) / ((len(y) - 1) * np.var(y, ddof=1)))
+            residual = sum((y - (slope * x + intercept))**2)
+            total = sum((y - np.mean(y))**2)
+            r_squared = 1 - residual / total if total else 0
             score = annualized_returns * r_squared
         elif method == 'polynomial':
             slope_list = np.polyfit(x, y, 2)

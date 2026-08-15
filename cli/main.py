@@ -35,7 +35,8 @@ fundamental_analysis screeners / indicator_service），但不依赖其 HTTP/Fas
 == 运维子命令 ==
   web     子进程启动 gui/backend/api.py 的 Web 服务（页面 + /api/* 接口，默认 8001，
           占用报错；--forever 崩溃自动重启）
-  pm2     管理 order-engine / signal-api / csi-flow / etf-premium 的 PM2 进程
+  pm2     管理 order-engine / signal-api / csi-flow / etf-premium /
+          momentum-rotation 的 PM2 进程
 
 约定：JSON 类子命令输出严格 JSON 到 stdout、进度/告警到 stderr；web/pm2 例外。
 发布：现以仓库内脚本交付，已做到 CWD 无关（缓存绝对路径）+ OpenD 预检，

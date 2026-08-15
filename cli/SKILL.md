@@ -4,7 +4,7 @@ description: >
   futu_trends 统一功能导出与本地进程管理 CLI 的调用契约。行情命令只读并输出严格 JSON 到 stdout。
   当需要读取股票 K 线、做条件选股（SEPA/quality/growth_value/deep_value）、或计算单只标的的技术指标与
   趋势信号（MACD/KD/RSI/trend-template/RS/VCP），以及管理 order-engine / signal-api /
-  csi-flow / etf-premium PM2 进程时调用。
+  csi-flow / etf-premium / momentum-rotation PM2 进程时调用。
 ---
 
 # futu-trends-cli
@@ -29,13 +29,15 @@ PM2 管理命令的配置参数属于具体服务子命令：
 <PYTHON> <REPO>/cli/main.py pm2 signal-api <ACTION> --config <ABS_CONFIG> [--port 8001]
 <PYTHON> <REPO>/cli/main.py pm2 csi-flow <ACTION> --config <ABS_CONFIG> --runtime-dir <ABS_RUNTIME>
 <PYTHON> <REPO>/cli/main.py pm2 etf-premium <ACTION> --config <ABS_CONFIG> --runtime-dir <ABS_RUNTIME>
+<PYTHON> <REPO>/cli/main.py pm2 momentum-rotation <ACTION> --mode live-us|live-cn \
+  --config <ABS_CONFIG> --runtime-dir <ABS_RUNTIME>
 <PYTHON> <REPO>/cli/main.py pm2 save
 ```
 
 `pm2` 分派只使用 Python 标准库，不要求调用它的 Python 环境安装 futu/pandas/scipy；
 被管理进程的解释器由 ecosystem 决定，可通过 `ORDER_ENGINE_PYTHON=/path/to/python` 或
 `SIGNAL_API_PYTHON=/path/to/python`、`CSI_FLOW_PYTHON=/path/to/python`、
-`ETF_PREMIUM_PYTHON=/path/to/python` 覆盖。
+`ETF_PREMIUM_PYTHON=/path/to/python`、`MOMENTUM_ROTATION_PYTHON=/path/to/python` 覆盖。
 
 占位符（由部署方按本地环境替换，**不要硬编码进代码**）：
 - `<ENV_PYTHON>`：装好依赖的 python 解释器绝对路径（含 futu / pandas / yfinance 的环境）。
@@ -132,7 +134,8 @@ SR_PARAMS_DB=<DB_URI>
 
 **校验与 fail-fast（不回退默认、不静默带病启动）**：
 - `kline`/`screen`/`signals`/`web`：缺 `--config`、文件不可读、或缺 `[CONFIG]` 段 → 立即报错退出（非 0）。
-- `pm2 order-engine` / `pm2 signal-api` / `pm2 csi-flow` / `pm2 etf-premium`：
+- `pm2 order-engine` / `pm2 signal-api` / `pm2 csi-flow` / `pm2 etf-premium` /
+  `pm2 momentum-rotation`：
   缺 `--config` 或文件不存在 → 立即退出；`pm2 save` 不需要配置。
 - `web` 额外要求（由 api.py 校验）：`[CONFIG]` 必含 `FUTU_HOST`/`FUTU_PORT`/`DATA_SOURCE`，
   且 `FUTU_PORT`/`EMA_PERIOD`（若提供）须为整数，否则拒绝启动。
@@ -231,18 +234,30 @@ pm2 order-engine start|restart|stop|delete|logs|status --config <ABS_CONFIG>
 pm2 signal-api start|restart|stop|delete|logs|status --config <ABS_CONFIG> [--port <PORT>]
 pm2 csi-flow start|restart|stop|delete|logs|status --config <ABS_CONFIG> --runtime-dir <ABS_RUNTIME>
 pm2 etf-premium start|restart|stop|delete|logs|status --config <ABS_CONFIG> --runtime-dir <ABS_RUNTIME>
+pm2 momentum-rotation start|restart|stop|delete|logs|status --mode live-us|live-cn \
+  --config <ABS_CONFIG> --runtime-dir <ABS_RUNTIME>
 pm2 save
 ```
 
-- 四类服务都必须显式传 `--config`，无默认配置；文件不存在时退出码为 `2`。
+- 五类服务都必须显式传 `--config`，无默认配置；文件不存在时退出码为 `2`。
 - `signal-api` 端口默认 `8001`，配置绝对路径与端口共同确定 PM2 实例名。
 - `order-engine` 由配置绝对路径确定 PM2 实例名。
 - `csi-flow` 还必须传绝对 `--runtime-dir`；`live` 在其中自动维护行情、阈值、状态和实例锁。
 - `etf-premium` 也必须传绝对 `--runtime-dir`；默认标的 `159941`。交易信号只使用 T-1
   单位净值溢价，Futu IOPV 溢价只写入快照和通知作为盘中提示。
+- `momentum-rotation` 必须传绝对 `--runtime-dir`，只通知、不下单。`--mode` 只选择完整预设，
+  不再接受自定义 ETF 或窗口：
+  - `live-us`：`US.QQQ/US.SPY/US.FXI/US.UUP`，窗口均为 21；美东交易日 16:10 检测，
+    `US.UUP` 排名第一表示持有现金。
+  - `live-cn`：`SZ.159941/SZ.159949/SH.510300/SH.510880`，窗口均为 28；
+    北京交易日 15:10 检测。
+  两种模式每天最多通知一次，节假日由 Futu 交易日历跳过；`FUTU_HOST`、`FUTU_PORT` 和
+  `DATA_SOURCE[_市场]` 均从 `--config` 读取，涉及市场的数据源必须为 `futu`。
 - `ORDER_ENGINE_PYTHON` / `SIGNAL_API_PYTHON` / `CSI_FLOW_PYTHON` /
-  `ETF_PREMIUM_PYTHON` 可分别指定解释器；否则优先使用当前 `CONDA_PREFIX`。
-- `start` 使用 ecosystem 文件并传 `--update-env`；`restart` 更新环境；日志默认显示最后 100 行。
+  `ETF_PREMIUM_PYTHON` / `MOMENTUM_ROTATION_PYTHON` 可分别指定解释器；否则优先使用当前
+  `CONDA_PREFIX`。
+- `start` 与 `restart` 都重新加载 ecosystem 文件并传 `--update-env`，确保参数和环境同时更新；
+  日志默认显示最后 100 行。
 - PM2 只做进程级 liveness：`api.py` 退出后重启。`/` 不参与自动探活，OpenD/MongoDB/Longbridge
   等运行期依赖也不作为重启条件，避免依赖故障引发重启风暴。
 - `save` 保存当前 PM2 进程列表，供 PM2 startup/resurrect 使用。
@@ -256,6 +271,10 @@ SIGNAL_API_PYTHON=<API_PYTHON> <PYTHON> <REPO>/cli/main.py pm2 signal-api start 
 <PYTHON> <REPO>/cli/main.py pm2 signal-api status --config <ABS_SIGNAL_CONFIG> --port 8001
 ETF_PREMIUM_PYTHON=<ENV_PYTHON> <PYTHON> <REPO>/cli/main.py pm2 etf-premium start \
   --config <ABS_CONFIG> --runtime-dir <ABS_RUNTIME>
+MOMENTUM_ROTATION_PYTHON=<ENV_PYTHON> <PYTHON> <REPO>/cli/main.py pm2 momentum-rotation start \
+  --mode live-us --config <ABS_CONFIG> --runtime-dir <ABS_US_RUNTIME>
+MOMENTUM_ROTATION_PYTHON=<ENV_PYTHON> <PYTHON> <REPO>/cli/main.py pm2 momentum-rotation start \
+  --mode live-cn --config <ABS_CONFIG> --runtime-dir <ABS_CN_RUNTIME>
 <PYTHON> <REPO>/cli/main.py pm2 save
 ```
 

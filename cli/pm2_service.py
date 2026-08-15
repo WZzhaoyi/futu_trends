@@ -87,8 +87,9 @@ def build_service_spec(
     interval: float = 60.0,
     nav_refresh: float = 900.0,
     max_nav_age: int = 14,
-    max_quote_age: float = 180.0,
+    max_quote_age: float | None = None,
     max_errors: int = 5,
+    live_mode: str = "live-us",
     platform: str = sys.platform,
 ) -> ServiceSpec:
     """Resolve one PM2 instance exactly as its ecosystem file does."""
@@ -176,7 +177,8 @@ def build_service_spec(
             raise PM2ConfigError("symbol 必须是6位基金代码")
         if initial_position not in {"base", "low"}:
             raise PM2ConfigError("initial-position 只能是 base 或 low")
-        if min(interval, nav_refresh, max_quote_age) <= 0:
+        quote_age = 180.0 if max_quote_age is None else max_quote_age
+        if min(interval, nav_refresh, quote_age) <= 0:
             raise PM2ConfigError(
                 "interval、nav-refresh 和 max-quote-age 必须大于0"
             )
@@ -198,7 +200,7 @@ def build_service_spec(
             "ETF_PREMIUM_INTERVAL": str(interval),
             "ETF_PREMIUM_NAV_REFRESH": str(nav_refresh),
             "ETF_PREMIUM_MAX_NAV_AGE": str(max_nav_age),
-            "ETF_PREMIUM_MAX_QUOTE_AGE": str(max_quote_age),
+            "ETF_PREMIUM_MAX_QUOTE_AGE": str(quote_age),
             "ETF_PREMIUM_MAX_ERRORS": str(max_errors),
         }
         if strategy_file:
@@ -222,20 +224,56 @@ def build_service_spec(
             environment=environment,
         )
 
+    if service == "momentum-rotation":
+        if not runtime_dir:
+            raise PM2ConfigError("momentum-rotation 必须指定 --runtime-dir")
+        runtime_path = _resolved_runtime_dir(runtime_dir)
+        if live_mode not in {"live-us", "live-cn"}:
+            raise PM2ConfigError("mode 只能是 live-us 或 live-cn")
+        quote_age = 14400.0 if max_quote_age is None else max_quote_age
+        if min(interval, quote_age) <= 0 or max_errors <= 0:
+            raise PM2ConfigError(
+                "interval、max-quote-age 和 max-errors 必须大于0"
+            )
+        digest_input = "\0".join(
+            (
+                identity,
+                _identity_path(runtime_path, platform),
+                live_mode,
+            )
+        )
+        digest = hashlib.sha256(digest_input.encode()).hexdigest()[:8]
+        return ServiceSpec(
+            service=service,
+            config_path=config_path,
+            instance_name=f"futu-momentum-rotation-{digest}",
+            ecosystem_path=(
+                PROJECT_ROOT
+                / "market_analysis"
+                / "ecosystem.momentum-rotation.config.js"
+            ),
+            environment={
+                "MOMENTUM_ROTATION_CONFIG": str(config_path),
+                "MOMENTUM_ROTATION_RUNTIME_DIR": str(runtime_path),
+                "MOMENTUM_ROTATION_MODE": live_mode,
+                "MOMENTUM_ROTATION_INTERVAL": str(interval),
+                "MOMENTUM_ROTATION_MAX_QUOTE_AGE": str(quote_age),
+                "MOMENTUM_ROTATION_MAX_ERRORS": str(max_errors),
+            },
+        )
+
     raise PM2ConfigError(f"不支持的 PM2 服务: {service}")
 
 
 def build_pm2_args(action: str, spec: ServiceSpec) -> list[str]:
     if action not in MANAGED_ACTIONS:
         raise PM2ConfigError(f"不支持的 PM2 操作: {action}")
-    if action == "start":
+    if action in {"start", "restart"}:
         return [
             "start", str(spec.ecosystem_path),
             "--only", spec.instance_name,
             "--update-env",
         ]
-    if action == "restart":
-        return ["restart", spec.instance_name, "--update-env"]
     if action == "logs":
         return ["logs", spec.instance_name, "--lines", "100"]
     if action == "status":
@@ -282,7 +320,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="futu-trends pm2",
         description=(
-            "管理 order-engine、signal-api、csi-flow 与 etf-premium 的 PM2 进程"
+            "管理 order-engine、signal-api、csi-flow、etf-premium 与 "
+            "momentum-rotation 的 PM2 进程"
         ),
     )
     targets = parser.add_subparsers(dest="target", required=True)
@@ -352,6 +391,26 @@ def _build_parser() -> argparse.ArgumentParser:
     etf_premium.add_argument("--max-quote-age", type=float, default=180.0)
     etf_premium.add_argument("--max-errors", type=int, default=5)
 
+    momentum_rotation = targets.add_parser(
+        "momentum-rotation",
+        help="管理 ETF 动量轮动长期通知服务",
+    )
+    momentum_rotation.add_argument("action", choices=MANAGED_ACTIONS)
+    momentum_rotation.add_argument("--config", required=True)
+    momentum_rotation.add_argument("--runtime-dir", required=True)
+    momentum_rotation.add_argument(
+        "--mode",
+        choices=("live-us", "live-cn"),
+        default="live-us",
+    )
+    momentum_rotation.add_argument("--interval", type=float, default=60.0)
+    momentum_rotation.add_argument(
+        "--max-quote-age",
+        type=float,
+        default=14400.0,
+    )
+    momentum_rotation.add_argument("--max-errors", type=int, default=5)
+
     targets.add_parser("save", help="保存当前 PM2 进程列表")
     return parser
 
@@ -381,8 +440,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             interval=getattr(args, "interval", 60.0),
             nav_refresh=getattr(args, "nav_refresh", 900.0),
             max_nav_age=getattr(args, "max_nav_age", 14),
-            max_quote_age=getattr(args, "max_quote_age", 180.0),
+            max_quote_age=getattr(args, "max_quote_age", None),
             max_errors=getattr(args, "max_errors", 5),
+            live_mode=getattr(args, "mode", "live-us"),
         )
         pm2_args = build_pm2_args(args.action, spec)
     except PM2ConfigError as exc:
