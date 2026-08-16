@@ -28,39 +28,85 @@ sys.modules[SPEC.name] = momentum
 SPEC.loader.exec_module(momentum)
 
 
+def find_leg(name: str):
+    for leg in momentum.LIVE_LEGS:
+        if leg.name == name:
+            return leg
+    raise AssertionError(f"LIVE_LEGS 缺少 {name}")
+
+
 class LiveConfigurationTest(unittest.TestCase):
-    def test_live_modes_bundle_optimized_pairs_and_notification_times(self):
-        us = momentum.LIVE_PRESETS["live-us"]
-        cn = momentum.LIVE_PRESETS["live-cn"]
+    def test_live_legs_match_deployed_configuration(self):
+        us_a = find_leg("US-A")
+        self.assertEqual(us_a.market, "US")
         self.assertEqual(
-            us["pairs"],
-            (
-                ("US.QQQ", 21),
-                ("US.SPY", 21),
-                ("US.FXI", 21),
-                ("US.UUP", 21),
-            ),
+            us_a.symbols,
+            ("US.QQQ", "US.SPY", "US.FXI", "US.GLD"),
         )
-        self.assertEqual(us["cash_symbols"], {"US.UUP"})
-        self.assertEqual(us["notification_time"], time(16, 10))
-        self.assertEqual(str(us["timezone"]), "America/New_York")
+        self.assertEqual(us_a.window, 22)
+        self.assertEqual(us_a.cooldown, 13)
+        self.assertEqual(us_a.gap_eps, 0.0)
+        self.assertEqual(us_a.cash_symbols, ())
+        self.assertEqual(us_a.slippage, momentum.DEFAULT_SLIPPAGE_US)
+
+        us_b = find_leg("US-B")
+        self.assertEqual(us_b.market, "US")
         self.assertEqual(
-            cn["pairs"],
-            (
-                ("SZ.159941", 28),
-                ("SZ.159949", 28),
-                ("SH.510300", 28),
-                ("SH.510880", 28),
-            ),
+            us_b.symbols,
+            ("US.UUP", "US.QQQ", "US.FXI", "US.GLD"),
         )
-        self.assertEqual(cn["cash_symbols"], set())
-        self.assertEqual(cn["notification_time"], time(15, 10))
-        self.assertEqual(str(cn["timezone"]), "Asia/Shanghai")
+        self.assertEqual(us_b.window, 20)
+        self.assertEqual(us_b.cooldown, 0)
+        self.assertEqual(us_b.gap_eps, 0.32)
+        self.assertEqual(us_b.cash_symbols, ("US.UUP",))
+        self.assertEqual(us_b.slippage, momentum.DEFAULT_SLIPPAGE_US)
+
+        cn_a = find_leg("CN-A")
+        self.assertEqual(cn_a.market, "CN")
+        self.assertEqual(
+            cn_a.symbols,
+            ("SZ.159941", "SZ.159949", "SH.510300", "SH.518880"),
+        )
+        self.assertEqual(cn_a.window, 26)
+        self.assertEqual(cn_a.cooldown, 10)
+        self.assertEqual(cn_a.slippage, momentum.DEFAULT_SLIPPAGE_CN)
+
+        cn_b = find_leg("CN-B")
+        self.assertEqual(cn_b.market, "CN")
+        self.assertEqual(
+            cn_b.symbols,
+            ("SZ.159941", "SZ.159949", "SH.510300", "SH.510880"),
+        )
+        self.assertEqual(cn_b.window, 21)
+        self.assertEqual(cn_b.cooldown, 16)
+        self.assertEqual(cn_b.slippage, momentum.DEFAULT_SLIPPAGE_CN)
+
+    def test_market_specs_have_staggered_notification_times(self):
+        self.assertEqual(
+            momentum.MARKET_SPECS["US"]["notification_time"], time(16, 10)
+        )
+        self.assertEqual(
+            str(momentum.MARKET_SPECS["US"]["timezone"]),
+            "America/New_York",
+        )
+        self.assertEqual(
+            momentum.MARKET_SPECS["CN"]["notification_time"], time(15, 10)
+        )
+        self.assertEqual(
+            str(momentum.MARKET_SPECS["CN"]["timezone"]), "Asia/Shanghai"
+        )
+        self.assertEqual(
+            len({leg.market for leg in momentum.LIVE_LEGS}), 2
+        )
+        self.assertEqual(
+            [leg.name for leg in momentum.LIVE_LEGS],
+            ["US-A", "US-B", "CN-A", "CN-B"],
+        )
 
     def test_live_cli_has_no_strategy_or_connection_overrides(self):
         args = momentum.parse_args(
             [
-                "live-us",
+                "live",
                 "--runtime-dir",
                 "/tmp/momentum",
                 "--config",
@@ -68,13 +114,11 @@ class LiveConfigurationTest(unittest.TestCase):
             ]
         )
 
-        self.assertEqual(args.mode, "live-us")
+        self.assertEqual(args.mode, "live")
         self.assertEqual(args.end, date.today().isoformat())
-        self.assertEqual(args.max_quote_age, 14400)
         for name in (
             "etfs",
             "windows",
-            "cash_symbols",
             "notification_time",
             "host",
             "port",
@@ -103,7 +147,7 @@ class LiveConfigurationTest(unittest.TestCase):
 
 
 class LiveSignalTest(unittest.TestCase):
-    def test_momentum_score_reuses_linear_tools_calculation(self):
+    def test_momentum_score_uses_linear_method(self):
         expected = pd.Series([np.nan, 1.23])
         with patch.object(momentum, "calc_momentum", return_value=expected) as calculate:
             score = momentum.calculate_momentum_score(np.array([1.0, 1.1]))
@@ -132,61 +176,121 @@ class LiveSignalTest(unittest.TestCase):
             momentum.calculate_momentum_score(np.array([1.0, 1.1, 1.2, 1.3])),
         )
 
-    def test_transition_distinguishes_rotation_and_cash_proxy(self):
-        cash = {"US.UUP"}
+    def test_leg_decision_initial_none_and_cooldown(self):
+        leg = find_leg("US-A")
+        scores = {"US.QQQ": 0.8, "US.SPY": 0.6, "US.FXI": 0.5, "US.GLD": 0.2}
+        today = date(2026, 8, 14)
+
         self.assertEqual(
-            momentum.live_transition_action(None, "US.QQQ", cash),
+            momentum.live_leg_decision(leg, scores, None, None, today),
             "INITIAL",
         )
         self.assertEqual(
-            momentum.live_transition_action("US.QQQ", "US.SPY", cash),
-            "ROTATE",
+            momentum.live_leg_decision(
+                leg, scores, "US.QQQ", "2026-08-13", today
+            ),
+            "NONE",
         )
         self.assertEqual(
-            momentum.live_transition_action("US.SPY", "US.UUP", cash),
+            momentum.live_leg_decision(
+                leg, scores, "US.SPY", "2026-08-13", today
+            ),
+            "NONE",
+        )
+        cooldown_expired = momentum.live_leg_decision(
+            leg, scores, "US.SPY", "2026-07-31", today
+        )
+        self.assertEqual(cooldown_expired, "ROTATE")
+        cooldown_blocked = momentum.live_leg_decision(
+            leg, scores, "US.SPY", "2026-08-10", today
+        )
+        self.assertEqual(cooldown_blocked, "NONE")
+
+    def test_leg_decision_cash_and_min_score_rules(self):
+        leg = find_leg("US-B")
+        scores = {
+            "US.UUP": 0.9,
+            "US.QQQ": 0.8,
+            "US.FXI": 0.5,
+            "US.GLD": 0.2,
+        }
+        today = date(2026, 8, 14)
+
+        self.assertEqual(
+            momentum.live_leg_decision(leg, scores, None, None, today),
+            "INITIAL",
+        )
+        self.assertEqual(
+            momentum.live_leg_decision(
+                leg, scores, "US.QQQ", "2026-08-01", today
+            ),
             "SELL",
         )
         self.assertEqual(
-            momentum.live_transition_action("US.UUP", "US.QQQ", cash),
-            "BUY",
+            momentum.live_leg_decision(
+                leg, scores, "US.UUP", "2026-08-01", today
+            ),
+            "NONE",
+        )
+        scores_below_threshold = {
+            "US.QQQ": 0.05,
+            "US.UUP": 0.02,
+            "US.FXI": 0.01,
+            "US.GLD": 0.0,
+        }
+        self.assertEqual(
+            momentum.live_leg_decision(
+                leg, scores_below_threshold, "US.QQQ", "2026-08-01", today, 0.1
+            ),
+            "SELL",
+        )
+        self.assertEqual(
+            momentum.live_leg_decision(
+                leg, scores_below_threshold, None, None, today, 0.1
+            ),
+            "INITIAL",
+        )
+        scores_above_threshold = {
+            "US.QQQ": 0.8,
+            "US.UUP": 0.2,
+            "US.FXI": 0.1,
+            "US.GLD": 0.0,
+        }
+        self.assertEqual(
+            momentum.live_leg_decision(
+                leg, scores_above_threshold, None, None, today, 0.1
+            ),
+            "INITIAL",
         )
 
-    def test_daily_evaluation_waits_until_after_close_buffer(self):
-        self.assertFalse(
-            momentum.daily_evaluation_ready(
-                datetime.fromisoformat("2026-08-15T04:09:00+08:00"),
-                time(16, 10),
-                momentum.US_MARKET_TIMEZONE,
-            )
+    def test_leg_decision_epsilon_blocks_narrow_gap(self):
+        leg = find_leg("US-B")
+        scores = {
+            "US.QQQ": 0.80,
+            "US.SPY": 0.75,
+            "US.FXI": 0.50,
+            "US.GLD": 0.20,
+        }
+        today = date(2026, 8, 14)
+
+        self.assertEqual(
+            momentum.live_leg_decision(leg, scores, "US.SPY", "2026-08-01", today),
+            "NONE",
         )
-        self.assertTrue(
-            momentum.daily_evaluation_ready(
-                datetime.fromisoformat("2026-08-15T04:10:00+08:00"),
-                time(16, 10),
-                momentum.US_MARKET_TIMEZONE,
-            )
+        wide_gap = {
+            "US.QQQ": 0.95,
+            "US.SPY": 0.60,
+            "US.FXI": 0.50,
+            "US.GLD": 0.20,
+        }
+        self.assertEqual(
+            momentum.live_leg_decision(leg, wide_gap, "US.SPY", "2026-08-01", today),
+            "ROTATE",
         )
-        self.assertFalse(
-            momentum.daily_evaluation_ready(
-                datetime.fromisoformat("2026-08-16T04:10:00+08:00"),
-                time(16, 10),
-                momentum.US_MARKET_TIMEZONE,
-            )
+        reentry_from_cash_not_blocked = momentum.live_leg_decision(
+            leg, wide_gap, "US.UUP", "2026-08-10", today
         )
-        self.assertFalse(
-            momentum.daily_evaluation_ready(
-                datetime.fromisoformat("2026-08-14T15:09:00+08:00"),
-                time(15, 10),
-                momentum.CN_MARKET_TIMEZONE,
-            )
-        )
-        self.assertTrue(
-            momentum.daily_evaluation_ready(
-                datetime.fromisoformat("2026-08-14T15:10:00+08:00"),
-                time(15, 10),
-                momentum.CN_MARKET_TIMEZONE,
-            )
-        )
+        self.assertEqual(reentry_from_cash_not_blocked, "BUY")
 
     def test_futu_trading_calendar_distinguishes_holiday(self):
         trading = types.SimpleNamespace(
@@ -218,30 +322,43 @@ class LiveSignalTest(unittest.TestCase):
 
 
 class LiveRuntimeTest(unittest.TestCase):
-    def test_state_rejects_changed_pair_configuration(self):
+    def test_state_rejects_changed_leg_configuration(self):
         with tempfile.TemporaryDirectory() as raw_dir:
             path = Path(raw_dir) / "state.json"
-            state = momentum.LiveState(path, [("US.QQQ", 21)])
-            state.last_evaluation_date = "2026-08-14"
-            state.save([("US.QQQ", 21)])
+            state = momentum.LiveState(path, momentum.LIVE_LEGS)
+            state.leg_state("US-A")["selected_symbol"] = "US.QQQ"
+            state.save()
 
-            restarted = momentum.LiveState(path, [("US.QQQ", 21)])
-            self.assertEqual(restarted.last_evaluation_date, "2026-08-14")
+            restarted = momentum.LiveState(path, momentum.LIVE_LEGS)
+            self.assertEqual(
+                restarted.leg_state("US-A")["selected_symbol"], "US.QQQ"
+            )
 
+            tampered = [
+                momentum.LiveLeg(
+                    name=leg.name,
+                    market=leg.market,
+                    symbols=leg.symbols,
+                    window=leg.window + 1,
+                    cooldown=leg.cooldown,
+                    gap_eps=leg.gap_eps,
+                    cash_symbols=leg.cash_symbols,
+                    slippage=leg.slippage,
+                )
+                for leg in momentum.LIVE_LEGS
+            ]
             with self.assertRaisesRegex(ValueError, "配置不匹配"):
-                momentum.LiveState(path, [("US.QQQ", 22)])
+                momentum.LiveState(path, tuple(tampered))
 
     def test_runtime_directory_must_be_absolute(self):
         with self.assertRaisesRegex(ValueError, "绝对路径"):
-            momentum.LiveRuntimePaths.from_argument("relative/runtime", "live-us")
+            momentum.LiveRuntimePaths.from_argument("relative/runtime", "live")
 
-    def test_live_modes_use_separate_state_and_lock_files(self):
-        us = momentum.LiveRuntimePaths.from_argument("/tmp/runtime", "live-us")
-        cn = momentum.LiveRuntimePaths.from_argument("/tmp/runtime", "live-cn")
+    def test_runtime_uses_single_state_and_lock_files(self):
+        runtime = momentum.LiveRuntimePaths.from_argument("/tmp/runtime", "live")
 
-        self.assertEqual(us.state_file.name, "state-live-us.json")
-        self.assertEqual(cn.state_file.name, "state-live-cn.json")
-        self.assertNotEqual(us.lock_file, cn.lock_file)
+        self.assertEqual(runtime.state_file.name, "state-live.json")
+        self.assertEqual(runtime.lock_file.name, "live.lock")
 
 
 class FakeQuoteContext:
@@ -267,10 +384,12 @@ class FakeQuoteContext:
             "US.SPY": 111.0,
             "US.FXI": 80.0,
             "US.UUP": 100.0,
+            "US.GLD": 90.0,
             "SZ.159941": 121.0,
             "SZ.159949": 111.0,
             "SH.510300": 80.0,
             "SH.510880": 100.0,
+            "SH.518880": 100.0,
         }
         return 0, pd.DataFrame(
             [
@@ -333,7 +452,100 @@ class HolidayQuoteContext(FakeQuoteContext):
 
 
 class LiveEndToEndTest(unittest.TestCase):
-    def test_holiday_is_recorded_once_without_notification(self):
+    def test_evaluates_all_four_legs_independently(self):
+        fake_futu = types.ModuleType("futu")
+        fake_futu.AuType = types.SimpleNamespace(QFQ="QFQ")
+        fake_futu.OpenQuoteContext = FakeQuoteContext
+        fake_futu.RET_OK = 0
+        fake_futu.SubType = types.SimpleNamespace(K_DAY="K_DAY")
+        notifier = RecordingNotifier()
+        FakeQuoteContext.instances.clear()
+
+        with tempfile.TemporaryDirectory() as raw_dir:
+            config_path = Path(raw_dir) / "config.ini"
+            config_path.write_text(
+                "[CONFIG]\nDATA_SOURCE=futu\nFUTU_HOST=127.0.0.1\nFUTU_PORT=11111\n",
+                encoding="utf-8",
+            )
+            args = momentum.parse_args(
+                [
+                    "live",
+                    "--runtime-dir",
+                    raw_dir,
+                    "--config",
+                    str(config_path),
+                ]
+            )
+            with (
+                patch.dict(sys.modules, {"futu": fake_futu}),
+                patch.object(
+                    momentum,
+                    "build_live_notifier",
+                    return_value=notifier,
+                ),
+                patch.object(
+                    momentum,
+                    "prepare_history",
+                    side_effect=AssertionError(
+                        "live must not prepare backtest data"
+                    ),
+                ),
+                patch.object(
+                    momentum,
+                    "run_momentum_backtest",
+                    side_effect=AssertionError("live must not run a backtest"),
+                ),
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(momentum.run_live(args), 0)
+
+            state = momentum.LiveState(
+                Path(raw_dir) / "state-live.json",
+                momentum.LIVE_LEGS,
+            )
+            context = FakeQuoteContext.instances[0]
+
+        self.assertEqual(len(notifier.events), 4)
+        events_by_leg = {event["leg"]: event for event in notifier.events}
+        self.assertEqual(set(events_by_leg), {"US-A", "US-B", "CN-A", "CN-B"})
+        for leg, expected in (
+            ("US-A", "US.QQQ"),
+            ("US-B", "US.QQQ"),
+            ("CN-A", "SZ.159941"),
+            ("CN-B", "SZ.159941"),
+        ):
+            event = events_by_leg[leg]
+            self.assertEqual(event["action"], "INITIAL")
+            self.assertEqual(event["target_symbol"], expected)
+            self.assertEqual(event["selected_symbol"], expected)
+            self.assertEqual(event["evaluation_date"], "2026-08-14")
+            self.assertEqual(event["market"], leg.split("-")[0])
+            self.assertEqual(
+                state.leg_state(leg)["selected_symbol"], expected
+            )
+            self.assertEqual(
+                state.leg_state(leg)["last_evaluation_date"], "2026-08-14"
+            )
+        self.assertEqual(state.last_snapshot["type"], "SIGNAL")
+        self.assertEqual(len(context.subscriptions), 2)
+        self.assertEqual(
+            set(context.subscriptions[0][0]),
+            {"US.QQQ", "US.SPY", "US.FXI", "US.GLD", "US.UUP"},
+        )
+        self.assertEqual(
+            set(context.subscriptions[1][0]),
+            {
+                "SZ.159941",
+                "SZ.159949",
+                "SH.510300",
+                "SH.510880",
+                "SH.518880",
+            },
+        )
+        self.assertTrue(context.closed)
+        self.assertTrue(notifier.closed)
+
+    def test_on_holiday_records_idle_without_signal(self):
         fake_futu = types.ModuleType("futu")
         fake_futu.AuType = types.SimpleNamespace(QFQ="QFQ")
         fake_futu.OpenQuoteContext = HolidayQuoteContext
@@ -350,15 +562,11 @@ class LiveEndToEndTest(unittest.TestCase):
             )
             args = momentum.parse_args(
                 [
-                    "live-us",
+                    "live",
                     "--runtime-dir",
                     raw_dir,
                     "--config",
                     str(config_path),
-                    "--interval",
-                    "0.001",
-                    "--duration",
-                    "0.02",
                 ]
             )
             with (
@@ -368,98 +576,77 @@ class LiveEndToEndTest(unittest.TestCase):
                     "build_live_notifier",
                     return_value=notifier,
                 ),
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(momentum.run_live(args), 0)
+
+            state = momentum.LiveState(
+                Path(raw_dir) / "state-live.json",
+                momentum.LIVE_LEGS,
+            )
+
+        self.assertEqual(notifier.events, [])
+        self.assertEqual(state.last_snapshot["type"], "IDLE")
+        for leg in momentum.LIVE_LEGS:
+            self.assertEqual(
+                state.leg_state(leg.name)["last_evaluation_date"],
+                date.today().isoformat(),
+            )
+
+    def test_with_markets_filter_evaluates_only_requested_market(self):
+        fake_futu = types.ModuleType("futu")
+        fake_futu.AuType = types.SimpleNamespace(QFQ="QFQ")
+        fake_futu.OpenQuoteContext = FakeQuoteContext
+        fake_futu.RET_OK = 0
+        fake_futu.SubType = types.SimpleNamespace(K_DAY="K_DAY")
+        notifier = RecordingNotifier()
+        FakeQuoteContext.instances.clear()
+
+        with tempfile.TemporaryDirectory() as raw_dir:
+            config_path = Path(raw_dir) / "config.ini"
+            config_path.write_text(
+                "[CONFIG]\nDATA_SOURCE=futu\nFUTU_HOST=127.0.0.1\nFUTU_PORT=11111\n",
+                encoding="utf-8",
+            )
+            args = momentum.parse_args(
+                [
+                    "live",
+                    "--markets",
+                    "CN",
+                    "--runtime-dir",
+                    raw_dir,
+                    "--config",
+                    str(config_path),
+                ]
+            )
+            with (
+                patch.dict(sys.modules, {"futu": fake_futu}),
                 patch.object(
                     momentum,
-                    "daily_evaluation_ready",
-                    return_value=True,
+                    "build_live_notifier",
+                    return_value=notifier,
                 ),
                 redirect_stdout(io.StringIO()),
             ):
                 self.assertEqual(momentum.run_live(args), 0)
 
             state = momentum.LiveState(
-                Path(raw_dir) / "state-live-us.json",
-                list(momentum.LIVE_PRESETS["live-us"]["pairs"]),
+                Path(raw_dir) / "state-live.json",
+                momentum.LIVE_LEGS,
             )
+            context = FakeQuoteContext.instances[0]
 
-        context = HolidayQuoteContext.instances[0]
-        self.assertEqual(context.calendar_requests, 1)
-        self.assertEqual(state.last_snapshot["type"], "IDLE")
-        self.assertIn("非交易日", state.last_snapshot["message"])
-        self.assertEqual(notifier.events, [])
-        self.assertTrue(notifier.closed)
-
-    def test_both_modes_fetch_persist_and_notify_without_backtest(self):
-        fake_futu = types.ModuleType("futu")
-        fake_futu.AuType = types.SimpleNamespace(QFQ="QFQ")
-        fake_futu.OpenQuoteContext = FakeQuoteContext
-        fake_futu.RET_OK = 0
-        fake_futu.SubType = types.SimpleNamespace(K_DAY="K_DAY")
-        for mode, expected_symbol in (
-            ("live-us", "US.QQQ"),
-            ("live-cn", "SZ.159941"),
-        ):
-            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as raw_dir:
-                notifier = RecordingNotifier()
-                FakeQuoteContext.instances.clear()
-                config_path = Path(raw_dir) / "config.ini"
-                config_path.write_text(
-                    "[CONFIG]\nDATA_SOURCE=futu\nFUTU_HOST=127.0.0.1\nFUTU_PORT=11111\n",
-                    encoding="utf-8",
-                )
-                args = momentum.parse_args(
-                    [
-                        mode,
-                        "--runtime-dir",
-                        raw_dir,
-                        "--config",
-                        str(config_path),
-                        "--once",
-                    ]
-                )
-                with (
-                    patch.dict(sys.modules, {"futu": fake_futu}),
-                    patch.object(
-                        momentum,
-                        "build_live_notifier",
-                        return_value=notifier,
-                    ),
-                    patch.object(
-                        momentum,
-                        "prepare_history",
-                        side_effect=AssertionError(
-                            "live must not prepare backtest data"
-                        ),
-                    ),
-                    patch.object(
-                        momentum,
-                        "run_momentum_backtest",
-                        side_effect=AssertionError("live must not run a backtest"),
-                    ),
-                    redirect_stdout(io.StringIO()),
-                ):
-                    self.assertEqual(momentum.run_live(args), 0)
-
-                pairs = list(momentum.LIVE_PRESETS[mode]["pairs"])
-                state = momentum.LiveState(
-                    Path(raw_dir) / f"state-{mode}.json",
-                    pairs,
-                )
-                context = FakeQuoteContext.instances[0]
-                self.assertEqual(state.selected_symbol, expected_symbol)
-                self.assertEqual(state.last_evaluation_date, "2026-08-14")
-                self.assertEqual(len(notifier.events), 1)
-                self.assertEqual(
-                    notifier.events[0]["target_symbol"], expected_symbol
-                )
-                self.assertEqual(notifier.events[0]["action"], "INITIAL")
-                self.assertEqual(notifier.events[0]["mode"], mode)
-                self.assertTrue(notifier.closed)
-                self.assertEqual(
-                    context.subscriptions[0][0],
-                    [symbol for symbol, _window in pairs],
-                )
-                self.assertTrue(context.closed)
+        self.assertEqual(
+            {event["leg"] for event in notifier.events},
+            {"CN-A", "CN-B"},
+        )
+        self.assertEqual(len(context.subscriptions), 1)
+        self.assertEqual(
+            state.leg_state("US-A")["last_evaluation_date"], None
+        )
+        self.assertEqual(
+            state.leg_state("CN-A")["last_evaluation_date"], "2026-08-14"
+        )
 
 
 if __name__ == "__main__":

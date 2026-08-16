@@ -1,9 +1,14 @@
-"""原生动量轮动回测、优化与 Futu 实时信号监控。
+"""动量轮动：向量化回测/优化引擎与 Futu 实时信号监控。
+
+回测核心为向量化模拟器（`simulate`），支撑大规模网格优化
+（universe × window × 防抖参数）。扩展：
+- 冷静期 N（`cooldown`）：资产->资产轮动的日历天冷却（SELL->现金 / 现金->资产 不受限）
+- 分差阈值 ε（`gap_eps`）：决策日 score(新第一)-score(当前持仓) > ε 才轮动（与 N 互斥）
+- 现金符号（`cash_symbols`）：登顶时全部平仓持现金（默认无）
+- 滑点参数化：US $0.01/份（`DEFAULT_SLIPPAGE_US`）、CN ¥0.002/份（`DEFAULT_SLIPPAGE_CN`）
 
 live 示例（每个交易日收盘后检测并通知一次；不下单）：
-    python market_analysis/momentum_rotation_strategy.py live-us \
-        --runtime-dir /absolute/path/runtime --config config.ini
-    python market_analysis/momentum_rotation_strategy.py live-cn \
+    python market_analysis/momentum_rotation_strategy.py live \
         --runtime-dir /absolute/path/runtime --config config.ini
 """
 
@@ -14,19 +19,18 @@ import configparser
 import hashlib
 import json
 import math
+import multiprocessing
 import os
 import queue
-import signal
 import sys
 import threading
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time as datetime_time
 from itertools import combinations
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Iterator, Optional
+from typing import Any, Iterable, Optional
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -50,22 +54,16 @@ def calculate_momentum_score(data: np.ndarray) -> float:
     )
 
 
-# Latest Futu/QFQ native backtests for the two live presets:
-# US.QQQ US.SPY US.FXI US.UUP, window=21, 2016-06-14..2026-06-11,
-# total=521.47%, max_dd=-28.28%; benchmark US.SPY total=315.69%, max_dd=-33.72%.
-# SZ.159941 SZ.159949 SH.510300 SH.510880, window=28, 2016-07-25..2026-08-14,
-# total=368.75%, max_dd=-195.59%; benchmark SH.510300 total=71.82%, max_dd=-42.16%.
-# The CN equity curve crossed below zero; its later total return is not economically viable.
-# US.UUP is a cash signal: when it ranks first, live-us holds cash.
+# 全时段最优配置（滑点 CN ¥0.002 / US $0.01）：
+# US: QQQ SPY FXI GLD w22 N13 = 753.9% / -23.4% / Sortino 4.82（无现金符号）
+# US: UUP QQQ FXI GLD w20 ε0.32 = 692.3% / -24.8% / Sortino 4.58（UUP 现金）
+# CN: 159941 159949 510300 518880 w26 N10 = 1675.9% / -30.7% / Sortino 8.40
 
 LIVE_STRATEGY = "momentum-rotation"
-LIVE_VERSION = "momentum-rotation-live-v2"
-LIVE_SCHEMA_VERSION = 1
+LIVE_VERSION = "momentum-rotation-live-v4"
+LIVE_SCHEMA_VERSION = 2
 US_MARKET_TIMEZONE = ZoneInfo("America/New_York")
 CN_MARKET_TIMEZONE = ZoneInfo("Asia/Shanghai")
-# Covers US 13:00 early closes while still rejecting a quote stale since noon.
-LIVE_MAX_QUOTE_AGE_SECONDS = 4 * 60 * 60
-LIVE_MAX_CONSECUTIVE_ERRORS = 5
 
 DEFAULT_MODE = "optimize-universe"
 DEFAULT_START = "2016-06-12"
@@ -74,35 +72,73 @@ DEFAULT_CAPITAL = 1_000_000
 DEFAULT_OPTIMIZATION_TARGET = "sortino_ratio"
 DEFAULT_CANDIDATE_SYMBOLS = ["US.QQQ", "US.GLD", "US.SPY", "US.UUP", "US.FXI", "US.TLT"]
 # DEFAULT_CANDIDATE_SYMBOLS = ["SZ.159941", "SH.518880", "SZ.159949", "SH.510300", "SH.510880"]
-LIVE_PRESETS: dict[str, dict[str, Any]] = {
-    "live-us": {
-        "pairs": (
-            ("US.QQQ", 21),
-            ("US.SPY", 21),
-            ("US.FXI", 21),
-            ("US.UUP", 21),
-        ),
-        "cash_symbols": {"US.UUP"},
+DEFAULT_SLIPPAGE_US = 0.01   # USD/份，美股口径
+DEFAULT_SLIPPAGE_CN = 0.002  # CNY/份，A股 ETF 合理值（2 个最小报价单位）
+
+
+@dataclass(frozen=True)
+class LiveLeg:
+    """live 单腿配置：对应回测中一个 (宇宙, window, 防抖) 配置。
+
+    多条腿各自独立轮动、腿间零交互（资金初始划拨后不调整）。
+    """
+    name: str
+    market: str
+    symbols: tuple[str, ...]
+    window: int
+    cooldown: int = 0          # 与 gap_eps 互斥（同时设定报错）
+    gap_eps: float = 0.0
+    cash_symbols: tuple[str, ...] = ()   # 登顶时持现金的符号（现金代理，不硬编码）
+    slippage: float = DEFAULT_SLIPPAGE_US
+
+
+# 最终 live 组合
+# CN = N10 w26 沪深300 + N16 w21 沪深300红利
+# US = N13 w22 无UUP + ε32 w20 含UUP
+LIVE_LEGS: tuple[LiveLeg, ...] = (
+    LiveLeg(
+        name="US-A", market="US",
+        symbols=("US.QQQ", "US.SPY", "US.FXI", "US.GLD"),
+        window=22, cooldown=13,
+        slippage=DEFAULT_SLIPPAGE_US,
+    ),
+    LiveLeg(
+        name="US-B", market="US",
+        symbols=("US.UUP", "US.QQQ", "US.FXI", "US.GLD"),
+        window=20, gap_eps=0.32, cash_symbols=("US.UUP",),
+        slippage=DEFAULT_SLIPPAGE_US,
+    ),
+    LiveLeg(
+        name="CN-A", market="CN",
+        symbols=("SZ.159941", "SZ.159949", "SH.510300", "SH.518880"),
+        window=26, cooldown=10,
+        slippage=DEFAULT_SLIPPAGE_CN,
+    ),
+    LiveLeg(
+        name="CN-B", market="CN",
+        symbols=("SZ.159941", "SZ.159949", "SH.510300", "SH.510880"),
+        window=21, cooldown=16,
+        slippage=DEFAULT_SLIPPAGE_CN,
+    ),
+)
+
+MARKET_SPECS: dict[str, dict[str, Any]] = {
+    "US": {
         "timezone": US_MARKET_TIMEZONE,
         "notification_time": datetime_time(16, 10),
+        "trading_symbol": "US.QQQ",
     },
-    "live-cn": {
-        "pairs": (
-            ("SZ.159941", 28),
-            ("SZ.159949", 28),
-            ("SH.510300", 28),
-            ("SH.510880", 28),
-        ),
-        "cash_symbols": set(),
+    "CN": {
         "timezone": CN_MARKET_TIMEZONE,
         "notification_time": datetime_time(15, 10),
+        "trading_symbol": "SZ.159941",
     },
 }
-DEFAULT_LIVE_ETF_WINDOWS = LIVE_PRESETS["live-us"]["pairs"]
-DEFAULT_BACKTEST_SYMBOLS = [symbol for symbol, _window in DEFAULT_LIVE_ETF_WINDOWS]
+
+DEFAULT_BACKTEST_SYMBOLS = list(LIVE_LEGS[0].symbols)
 DEFAULT_UNIVERSE_SIZE = 4
 DEFAULT_BENCHMARK_SYMBOL = "US.SPY"
-DEFAULT_CASH_SYMBOLS = ["US.UUP"]
+DEFAULT_RATE = 0.001         # 佣金费率（单边）
 OPTIMIZATION_WINDOWS = range(20, 31)
 HISTORY_CACHE_DIR = PROJECT_ROOT / "data" / "backtest_cache" / "futu" / "source"
 OUTPUT_ROOT = PROJECT_ROOT / "output" / "backtest"
@@ -115,9 +151,12 @@ class BacktestConfig:
     end: str
     config_path: Optional[str] = None
     window: int = 21
+    cooldown: int = 0          # 资产->资产冷静期(日历天)；与 gap_eps 互斥
+    gap_eps: float = 0.0       # 决策日分差阈值：score(新第一)-score(当前持仓)<=eps 不轮动
+    cash_symbols: tuple[str, ...] = ()   # 现金符号：登顶时全部平仓持现金（不硬编码）
     capital: int = DEFAULT_CAPITAL
     rate: float = 0.001
-    # 每份固定单边价格差：美股 ETF 基准 $0.01；A股 ETF 基准 ¥0.001。
+    # 每份固定单边价格差：美股 ETF 基准 $0.01（DEFAULT_SLIPPAGE_US）；A股 ETF 基准 ¥0.002（DEFAULT_SLIPPAGE_CN）
     slippage: float = 0.01
     size: int = 1
     pricetick: float = 0.001
@@ -128,11 +167,17 @@ def make_backtest_config(
     args: argparse.Namespace,
     symbols: list[str],
 ) -> BacktestConfig:
+    cash_symbols = tuple(args.cash_symbols) if getattr(args, "cash_symbols", None) else ()
     return BacktestConfig(
         symbols=symbols,
         start=args.start,
         end=args.end,
         config_path=args.config,
+        window=getattr(args, "window", 21),
+        cooldown=getattr(args, "cooldown", 0),
+        gap_eps=getattr(args, "eps", 0.0),
+        cash_symbols=cash_symbols,
+        slippage=getattr(args, "slippage", 0.01),
     )
 
 
@@ -182,14 +227,28 @@ def _futu_config(path: Optional[str], symbol: str) -> configparser.ConfigParser:
 
 
 def prepare_history(config: BacktestConfig) -> dict[str, pd.DataFrame]:
+    """准备回测历史：优先使用共享缓存（可复现），缺失/覆盖不足时经 Futu 拉取。
+
+    缓存优先语义保证回测结果可复现；仅当某标的缓存缺失或未覆盖
+    [config.start, config.end] 时才走 get_kline_data 拉取。
+    """
     from data import get_kline_data
 
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     start, end = pd.Timestamp(config.start), pd.Timestamp(config.end)
-    count = max(len(pd.bdate_range(start, pd.Timestamp.today())) + 30, 270)
-    histories = {}
     symbols = list(dict.fromkeys(config.symbols + [DEFAULT_BENCHMARK_SYMBOL]))
-    for symbol in symbols:
+    histories: dict[str, pd.DataFrame] = {}
+    try:
+        cached = load_cached_histories(symbols, start=config.start, end=config.end)
+        for symbol in symbols:
+            frame = cached[symbol]
+            if len(frame) >= max(config.window + 10, 30):
+                histories[symbol] = frame
+    except (FileNotFoundError, ValueError):
+        pass
+    missing = [symbol for symbol in symbols if symbol not in histories]
+    for symbol in missing:
+        count = max(len(pd.bdate_range(start, end)) + 30, 270)
         frame = get_kline_data(
             symbol,
             _futu_config(config.config_path, symbol),
@@ -213,128 +272,383 @@ def _fill_price(side: str, limit: float, bar: pd.Series) -> Optional[float]:
     return None
 
 
-def _simulate_momentum(
-    config: BacktestConfig,
-    histories: Optional[dict[str, pd.DataFrame]] = None,
-) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
-    loaded = histories or prepare_history(config)
-    histories = {symbol: loaded[symbol] for symbol in config.symbols}
-    dates = sorted(set().union(*(frame.index for frame in histories.values())))
-    if len(dates) < 2:
-        raise RuntimeError("Backtest requires at least two bars")
+@dataclass(frozen=True)
+class SimParams:
+    """向量化模拟参数（与 BacktestConfig 同构，供 run_grid 大规模搜索使用）。"""
+    window: int = 21
+    cooldown: int = 0          # 资产->资产冷静期(日历天)；与 gap_eps 互斥
+    gap_eps: float = 0.0       # 决策日分差阈值：score(新第一)-score(当前持仓)<=eps 不轮动
+    cash_symbols: tuple[str, ...] = ()   # 现金符号：登顶时全部平仓持现金
+    slippage: float = DEFAULT_SLIPPAGE_US  # 每份滑点；CN 用 DEFAULT_SLIPPAGE_CN
+    rate: float = DEFAULT_RATE
+    pricetick: float = 0.001
+    size: int = 1
+    capital: float = DEFAULT_CAPITAL
+    warmup_extra: int = 5      # warmup = window + warmup_extra
 
-    warmup = max(config.window + 5, 10)
-    buffers = {symbol: [] for symbol in config.symbols}
-    positions = {symbol: 0 for symbol in config.symbols}
-    targets = positions.copy()
-    last_prices: dict[str, float] = {}
-    last_closes: dict[str, float] = {}
-    pre_closes = {symbol: float(frame.iloc[0]["Close"]) for symbol, frame in histories.items()}
-    sizing_cash = float(config.capital)
-    orders: list[dict[str, Any]] = []
-    trades: list[dict[str, Any]] = []
-    daily: list[dict[str, Any]] = []
 
-    for index, raw_date in enumerate(dates):
-        current = pd.Timestamp(raw_date).normalize()
-        bars = {symbol: frame.loc[current] for symbol, frame in histories.items() if current in frame.index}
-        start_positions = positions.copy()
-        day_trades: list[dict[str, Any]] = []
+def load_cached_histories(
+    symbols: list[str],
+    cache_dir: Path = HISTORY_CACHE_DIR,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+) -> dict[str, pd.DataFrame]:
+    """从 Futu K线文件缓存加载并规范化 OHLCV 历史。
 
-        if index:
-            remaining = []
-            for order in orders:
-                bar = bars.get(order["vt_symbol"])
-                price = None if bar is None else _fill_price(order["direction"], order["price"], bar)
-                if price is None:
-                    remaining.append(order)
-                    continue
-                change = order["volume"] if order["direction"] == "long" else -order["volume"]
-                positions[order["vt_symbol"]] += change
-                sizing_cash -= change * price * config.size
-                trade = {"datetime": current, **order, "price": price}
-                trades.append(trade)
-                day_trades.append(trade)
-            orders = remaining
+    缓存文件命名: data_{symbol.replace('.', '_')}_K_DAY_*.csv
+    """
+    frames: dict[str, pd.DataFrame] = {}
+    for symbol in symbols:
+        files = sorted(cache_dir.glob(f"data_{symbol.replace('.', '_')}_K_DAY_*.csv"))
+        if not files:
+            raise FileNotFoundError(f"缓存缺失: {symbol} in {cache_dir}")
+        raw = pd.read_csv(files[-1], parse_dates=["time_key"], index_col="time_key")
+        frame = _normalize_ohlcv(raw)
+        if start:
+            frame = frame.loc[pd.Timestamp(start):]
+        if end:
+            frame = frame.loc[: pd.Timestamp(end)]
+        if frame.empty:
+            raise ValueError(f"{symbol} 在 {start}~{end} 无数据")
+        frames[symbol] = frame
+    return frames
 
-        for symbol, bar in bars.items():
-            price = float(bar["Close"])
-            last_prices[symbol] = price
-            last_closes[symbol] = price
-            buffers[symbol].append(price)
-            buffers[symbol] = buffers[symbol][-warmup:]
 
-        if all(len(buffer) == warmup for buffer in buffers.values()):
-            scores = {
-                symbol: calculate_momentum_score(np.asarray(buffer[-config.window:]))
-                for symbol, buffer in buffers.items()
-            }
-            selected = max(scores, key=scores.get)
-            new_targets = {symbol: 0 for symbol in config.symbols}
-            if selected not in DEFAULT_CASH_SYMBOLS:
-                value = sizing_cash + sum(
-                    positions[symbol] * last_prices[symbol] * config.size
-                    for symbol in config.symbols
-                )
-                new_targets[selected] = max(
-                    int(max(value, 0) / (last_prices[selected] * config.size)),
-                    0,
-                )
-            if new_targets != targets:
-                targets = new_targets
-                orders = []
-                for symbol, bar in bars.items():
-                    change = targets[symbol] - positions[symbol]
-                    if not change:
-                        continue
-                    side = "long" if change > 0 else "short"
-                    orders.append(
-                        {
-                            "vt_symbol": symbol,
-                            "direction": side,
-                            "offset": "close" if positions[symbol] * change < 0 else "open",
-                            "price": round(float(bar["Close"]) / config.pricetick) * config.pricetick,
-                            "volume": abs(change),
-                        }
-                    )
+def align_histories(
+    histories: dict[str, pd.DataFrame],
+    align_to: Optional[str] = None,
+    exclude: tuple[str, ...] = (),
+) -> dict[str, pd.DataFrame]:
+    """对齐日历。
 
-        if not index:
+    - align_to=None: 取除 exclude 外所有标的数据日期的交集（同市场 ETF 推荐）
+    - align_to=symbol: 以该标的中日为基准，其余标的按最近收盘 ffill
+      （跨市场场景，如 CN 池中加入 US.UUP）
+    - exclude: 不参与对齐的标的（典型：不同交易日历的基准，如 CN 池的
+      US.SPY 基准应排除，只对齐 CN 标的）
+    """
+    members = {s: f for s, f in histories.items() if s not in exclude}
+    if align_to is None:
+        common = next(iter(members.values())).index
+        for frame in members.values():
+            common = common.intersection(frame.index)
+        return {s: frame.loc[common] for s, frame in members.items()}
+    base = histories[align_to].index
+    aligned = {}
+    for s, frame in members.items():
+        if s == align_to:
+            aligned[s] = frame
+        else:
+            out = frame.reindex(base).ffill()
+            for col in ("Open", "High", "Low"):
+                out[col] = out["Close"]
+            aligned[s] = out
+    return aligned
+
+
+def vectorized_momentum_scores(close: np.ndarray, window: int) -> np.ndarray:
+    """逐日滚动 window 日线性动量分数（与 calculate_momentum_score 同口径，向量化）。
+
+    分数 = (exp(250×日斜率) - 1) × R²。
+    返回 (n_days, n_symbols)，前 window-1 行为 NaN。
+    """
+    n = len(close)
+    out = np.full((n, close.shape[1]), np.nan)
+    w = window
+    mx = (w - 1) / 2.0
+    varx = w * (w * w - 1) / 12.0  # Σ(x-x̄)², x=0..w-1
+    L = np.log(close)
+    idx = np.arange(n, dtype=float)
+    for s in range(close.shape[1]):
+        y = L[:, s]
+        if np.isnan(y).any():
             continue
-        holding_pnl = sum(
-            start_positions[symbol] * (close - pre_closes[symbol]) * config.size
-            for symbol, close in last_closes.items()
-        )
-        trading_pnl = sum(
-            (trade["volume"] if trade["direction"] == "long" else -trade["volume"])
-            * (last_closes[trade["vt_symbol"]] - trade["price"])
-            * config.size
-            for trade in day_trades
-        )
-        turnover = sum(trade["volume"] * trade["price"] * config.size for trade in day_trades)
-        slippage = sum(trade["volume"] * config.slippage * config.size for trade in day_trades)
-        commission = turnover * config.rate
-        total_pnl = holding_pnl + trading_pnl
-        daily.append(
-            {
-                "date": current,
-                "trade_count": len(day_trades),
-                "turnover": turnover,
-                "commission": commission,
-                "slippage": slippage,
-                "trading_pnl": trading_pnl,
-                "holding_pnl": holding_pnl,
-                "total_pnl": total_pnl,
-                "net_pnl": total_pnl - commission - slippage,
-            }
-        )
-        pre_closes.update(last_closes)
+        sy = pd.Series(y).rolling(w).sum().to_numpy()
+        siy = pd.Series(y * idx).rolling(w).sum().to_numpy()
+        my = sy / w
+        mxy = (siy - (idx - w + 1) * sy) / w  # E[x_local·y]
+        my2 = pd.Series(y * y).rolling(w).mean().to_numpy()
+        vary = my2 - my * my
+        cov = mxy - mx * my  # 均值形式协方差
+        slope = w * cov / varx
+        with np.errstate(all="ignore"):
+            r2 = w * cov * cov / (varx * vary)
+        r2 = np.where(vary <= 0, 0.0, r2)
+        out[:, s] = (np.exp(slope * 250) - 1) * r2
+    return out
 
-    frame = pd.DataFrame(daily).set_index("date")
-    frame["balance"] = config.capital + frame["net_pnl"].cumsum()
+
+def verify_score_parity(
+    histories: dict[str, pd.DataFrame],
+    window: int = 21,
+    symbols: Optional[list[str]] = None,
+) -> float:
+    """校验向量化分数与 calculate_momentum_score 的最大绝对误差（应 < 1e-6）。"""
+    symbols = symbols or list(histories)
+    closes = np.column_stack([histories[s]["Close"].to_numpy(float) for s in symbols])
+    vec = vectorized_momentum_scores(closes, window)
+    max_err = 0.0
+    for j, s in enumerate(symbols):
+        refs = np.array(
+            [
+                calculate_momentum_score(histories[s]["Close"].iloc[t - window + 1 : t + 1].to_numpy())
+                for t in range(window - 1, len(histories[s]))
+            ]
+        )
+        err = np.abs(refs - vec[window - 1 :, j])
+        err = err[np.isfinite(refs) & np.isfinite(vec[window - 1 :, j])]
+        max_err = max(max_err, err.max())
+    return float(max_err)
+
+
+def simulate(
+    histories: dict[str, pd.DataFrame],
+    symbols: list[str],
+    params: SimParams = SimParams(),
+    benchmark_symbol: str = DEFAULT_BENCHMARK_SYMBOL,
+) -> tuple[pd.DataFrame, list[dict], dict[str, Any]]:
+    """向量化模拟：全仓持有当日分数第一的标的（现金符号登顶时持现金），
+    支持冷静期 N / 分差阈值 ε 防抖（互斥，不可同时设定）。
+
+    histories: {symbol: OHLCV DataFrame}，须含 benchmark_symbol（基准可为全文
+    历史、无需参与对齐，_statistics 会自行 reindex 到策略日期）。
+    返回 (daily_frame, trades, statistics)。
+    """
+    if params.gap_eps > 0 and params.cooldown > 0:
+        raise ValueError("gap_eps 与 cooldown 为互斥防抖机制，请只设置其一")
+    dates = histories[symbols[0]].index
+    n = len(dates)
+    k = len(symbols)
+    close = np.column_stack([histories[s]["Close"].to_numpy(float) for s in symbols])
+    open_ = np.column_stack([histories[s]["Open"].to_numpy(float) for s in symbols])
+    low = np.column_stack([histories[s]["Low"].to_numpy(float) for s in symbols])
+    high = np.column_stack([histories[s]["High"].to_numpy(float) for s in symbols])
+    scores = vectorized_momentum_scores(close, params.window)
+    decision_start = max(params.window + params.warmup_extra, 10) - 1
+
+    is_cash = np.array([s in params.cash_symbols for s in symbols])
+    positions = np.zeros(k, dtype=np.int64)
+    targets = positions.copy()
+    cash = float(params.capital)
+    last_price = np.zeros(k)
+    orders: list[tuple[int, int, float, int]] = []  # (idx, sign, limit, vol)
+    last_rotation_date = pd.Timestamp.min
+    daily = np.zeros(
+        n,
+        dtype=[
+            ("trade_count", "i4"), ("turnover", "f8"), ("commission", "f8"),
+            ("slippage", "f8"), ("trading_pnl", "f8"), ("holding_pnl", "f8"),
+            ("net_pnl", "f8"),
+        ],
+    )
+    trades: list[dict] = []
+    prev_close = close[0].copy()
+
+    for t in range(n):
+        start_positions = positions.copy()
+        if t:
+            holding_pnl = trading_pnl = turnover = slip_cost = commission = 0.0
+            trade_count = 0
+            filled: list[tuple[int, int, float, int]] = []
+            for order in orders:
+                i, sign, limit, vol = order
+                fill = None
+                if sign > 0 and limit >= low[t, i] > 0:
+                    fill = min(limit, float(open_[t, i]))
+                elif sign < 0 and limit <= high[t, i] and high[t, i] > 0:
+                    fill = max(limit, float(open_[t, i]))
+                if fill is None:
+                    filled.append(order)
+                    continue
+                positions[i] += sign * vol
+                cash -= sign * vol * fill * params.size
+                trade_count += 1
+                trading_pnl += sign * vol * (close[t, i] - fill) * params.size
+                turnover += vol * fill * params.size
+                slip_cost += vol * params.slippage * params.size
+                trades.append(
+                    {
+                        "datetime": dates[t],
+                        "vt_symbol": symbols[i],
+                        "direction": "long" if sign > 0 else "short",
+                        "volume": vol,
+                        "price": fill,
+                    }
+                )
+            orders = filled
+            for i in range(k):
+                holding_pnl += start_positions[i] * (close[t, i] - prev_close[i]) * params.size
+            commission = turnover * params.rate
+            daily[t] = (
+                trade_count, turnover, commission, slip_cost,
+                trading_pnl, holding_pnl,
+                trading_pnl + holding_pnl - commission - slip_cost,
+            )
+            prev_close = close[t].copy()
+
+        last_price = close[t]
+
+        if t >= decision_start and not np.isnan(scores[t]).any():
+            selected = int(np.nanargmax(scores[t]))
+            new_targets = np.zeros(k, dtype=np.int64)
+            if not is_cash[selected]:
+                value = cash + np.dot(positions, last_price) * params.size
+                new_targets[selected] = max(
+                    int(max(value, 0) / (last_price[selected] * params.size)), 0
+                )
+            cur_hold = [i for i in range(k) if positions[i] > 0]
+            cur_hold = cur_hold[0] if cur_hold else None
+            new_hold = selected if new_targets[selected] > 0 else None
+            changed = not np.array_equal(new_targets, targets)
+            if changed:
+                blocked = False
+                if new_hold is not None and cur_hold is not None and new_hold != cur_hold:
+                    if params.gap_eps > 0:
+                        blocked = scores[t, selected] - scores[t, cur_hold] <= params.gap_eps
+                    else:
+                        blocked = (dates[t] - last_rotation_date).days <= params.cooldown
+                if not blocked:
+                    targets = new_targets
+                    orders = []
+                    for i in range(k):
+                        change = targets[i] - positions[i]
+                        if not change:
+                            continue
+                        sign = 1 if change > 0 else -1
+                        limit = round(float(close[t, i]) / params.pricetick) * params.pricetick
+                        orders.append((i, sign, limit, abs(int(change))))
+                    last_rotation_date = dates[t]
+
+    frame = pd.DataFrame(daily, index=dates)
+    frame["balance"] = params.capital + frame["net_pnl"].cumsum()
     frame["return"] = np.log(frame["balance"] / frame["balance"].shift()).fillna(0)
     frame["highlevel"] = frame["balance"].cummax()
     frame["drawdown"] = frame["balance"] - frame["highlevel"]
     frame["ddpercent"] = frame["drawdown"] / frame["highlevel"] * 100
+
+    config = BacktestConfig(
+        symbols=symbols,
+        start=str(dates[0].date()),
+        end=str(dates[-1].date()),
+        window=params.window,
+        capital=params.capital,
+        rate=params.rate,
+        slippage=params.slippage,
+        size=params.size,
+        pricetick=params.pricetick,
+    )
+    frame, statistics = _statistics(frame, config, histories)
+    return frame, trades, statistics
+
+
+def _grid_worker(args: dict) -> dict[str, Any]:
+    histories, symbols, params, benchmark_symbol, uname = (
+        args["histories"], args["symbols"], args["params"], args["benchmark"], args["uname"]
+    )
+    frame, _, stats = simulate(histories, symbols, params, benchmark_symbol)
+    return {
+        "universe": uname,
+        "window": params.window,
+        "cooldown": params.cooldown,
+        "eps": round(params.gap_eps, 4),
+        "total%": round(stats["total_return"], 1),
+        "maxDD%": round(stats["max_ddpercent"], 1),
+        "sortino": round(stats["sortino_ratio"], 3),
+        "calmar": round(stats["calmar_ratio"], 2),
+        "sharpe": round(stats["sharpe_ratio"], 3),
+        "rotDays": int((frame["trade_count"] > 0).sum()),
+        "commission_w": round(stats["total_commission"] / 1e4, 1),
+    }
+
+
+def run_grid(
+    histories: dict[str, pd.DataFrame],
+    universes: Iterable[list[str]],
+    windows: Iterable[int] = range(20, 31),
+    cooldowns: Iterable[int] = (),
+    epsilons: Iterable[float] = (),
+    cash_symbols: tuple[str, ...] = (),
+    slippage: float = DEFAULT_SLIPPAGE_US,
+    benchmark_symbol: str = DEFAULT_BENCHMARK_SYMBOL,
+    workers: int = 8,
+) -> pd.DataFrame:
+    """网格优化: universe × window × (cooldown 或 epsilon 网格)。
+
+    cooldowns 与 epsilons 至少给一个；二者同时给出时分别生成任务。
+    返回 DataFrame，可直接按 sortino/calmar/total% 排序。
+    """
+    tasks = []
+    for uni in universes:
+        uname = " ".join(s.split(".")[1] for s in uni)
+        for w in windows:
+            for n in cooldowns:
+                tasks.append(
+                    {
+                        "histories": histories,
+                        "symbols": list(uni),
+                        "params": SimParams(window=w, cooldown=n, cash_symbols=cash_symbols, slippage=slippage),
+                        "benchmark": benchmark_symbol,
+                        "uname": uname,
+                    }
+                )
+            for e in epsilons:
+                tasks.append(
+                    {
+                        "histories": histories,
+                        "symbols": list(uni),
+                        "params": SimParams(window=w, gap_eps=e, cash_symbols=cash_symbols, slippage=slippage),
+                        "benchmark": benchmark_symbol,
+                        "uname": uname,
+                    }
+                )
+    # fork 上下文：worker 无需重导入主模块，任意调用方均可直接使用
+    ctx = multiprocessing.get_context("fork")
+    with ctx.Pool(workers) as pool:
+        rows = pool.map(_grid_worker, tasks)
+    return pd.DataFrame(rows)
+
+
+def make_universes(
+    candidates: list[str],
+    sizes: Iterable[int] = (4,),
+    must_include: tuple[str, ...] = (),
+) -> list[list[str]]:
+    """生成候选宇宙组合；must_include 的标的一定在组合中。"""
+    pool = [c for c in candidates if c not in must_include]
+    combos = []
+    for size in sizes:
+        pick = size - len(must_include)
+        for combo in combinations(pool, pick):
+            combos.append(list(must_include) + list(combo))
+    return combos
+
+
+def _simulate_config(
+    config: BacktestConfig,
+    histories: Optional[dict[str, pd.DataFrame]] = None,
+) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+    """以 BacktestConfig 驱动向量化 simulate（CLI 回测/优化内部助手）。
+
+    交易日历取 config.symbols 各标的数据交集（同市场 ETF 日历一致）；
+    基准单独全文传入 _statistics。跨市场场景（如 CN 池加 US.UUP）需调用方
+    先 ffill 对齐。现金符号以 config.cash_symbols 为准（默认空，不硬编码）。
+    """
+    loaded = histories or prepare_history(config)
+    symbols = list(config.symbols)
+    aligned = align_histories({symbol: loaded[symbol] for symbol in symbols})
+    full = {**aligned, DEFAULT_BENCHMARK_SYMBOL: loaded[DEFAULT_BENCHMARK_SYMBOL]}
+    params = SimParams(
+        window=config.window,
+        cooldown=config.cooldown,
+        gap_eps=config.gap_eps,
+        cash_symbols=tuple(config.cash_symbols),
+        slippage=config.slippage,
+        rate=config.rate,
+        pricetick=config.pricetick,
+        size=config.size,
+        capital=config.capital,
+    )
+    frame, trades, _ = simulate(full, symbols, params, DEFAULT_BENCHMARK_SYMBOL)
     return frame, trades
 
 
@@ -444,7 +758,7 @@ def _print_results(rows: list[dict[str, Any]], title: str, limit: int = 3) -> No
 
 def run_momentum_backtest(config: BacktestConfig) -> dict[str, Any]:
     histories = prepare_history(config)
-    frame, trades = _simulate_momentum(config, histories)
+    frame, trades = _simulate_config(config, histories)
     frame, statistics = _statistics(frame, config, histories)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     daily_path = OUTPUT_ROOT / f"momentumrotationstrategy_daily_{stamp}.csv"
@@ -465,7 +779,7 @@ def run_momentum_optimization(
     rows = []
     for window in OPTIMIZATION_WINDOWS:
         trial = replace(config, window=window)
-        frame, _ = _simulate_momentum(trial, histories)
+        frame, _ = _simulate_config(trial, histories)
         _, statistics = _statistics(frame, trial, histories)
         rows.append(_result_row(trial, statistics))
     rows.sort(key=lambda row: row["target"], reverse=True)
@@ -618,14 +932,6 @@ def write_json_atomic(path: Path, payload: Any) -> None:
     os.replace(temporary, path)
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def score_live_pairs(
     pairs: list[tuple[str, int]],
     closes: dict[str, list[float] | np.ndarray],
@@ -644,69 +950,102 @@ def score_live_pairs(
     return scores
 
 
-def select_live_symbol(
+def live_leg_decision(
+    leg: LiveLeg,
     scores: dict[str, float],
-    min_score: float,
-) -> Optional[str]:
-    if not scores:
-        return None
-    symbol = max(scores, key=scores.get)
-    return symbol if scores[symbol] >= min_score else None
-
-
-def live_transition_action(
-    previous_symbol: Optional[str],
-    selected_symbol: Optional[str],
-    cash_symbols: set[str],
+    previous_hold: Optional[str],
+    last_rotation_date: Optional[str],
+    today: date,
+    min_score: float = float("-inf"),
 ) -> str:
-    if previous_symbol == selected_symbol:
+    """单腿决策，镜像 simulate 的轮动语义：
+
+    - 分数第一（含现金符号）登顶；现金符号登顶或分数低于 min_score → 持现金
+    - 现金->资产 / 资产->现金 不受冷却限制；资产->资产轮动受 cooldown/ε 限制
+    - 返回 INITIAL（首次）/ BUY / SELL / ROTATE / NONE
+    """
+    top = max(scores, key=scores.get)
+    if scores[top] < min_score or top in leg.cash_symbols:
+        top = None
+    holding = previous_hold if previous_hold not in leg.cash_symbols else None
+    if top is None:
+        return "INITIAL" if holding is None and previous_hold is None else (
+            "SELL" if holding is not None else "NONE"
+        )
+    if holding is None:
+        return "INITIAL" if previous_hold is None else "BUY"
+    if top == holding:
         return "NONE"
-    if previous_symbol is None:
-        return "INITIAL"
-    if selected_symbol is None or selected_symbol in cash_symbols:
-        return "SELL"
-    if previous_symbol in cash_symbols:
-        return "BUY"
-    return "ROTATE"
+    if leg.gap_eps > 0:
+        blocked = scores[top] - scores[holding] <= leg.gap_eps
+    else:
+        rotated_at = (
+            date.fromisoformat(last_rotation_date)
+            if last_rotation_date
+            else today
+        )
+        blocked = (today - rotated_at).days <= leg.cooldown
+    return "NONE" if blocked else "ROTATE"
 
 
 class LiveState:
-    def __init__(self, path: Path, pairs: list[tuple[str, int]]) -> None:
+    """live 状态：每腿独立持有（持仓、上次轮动日、上次评估日）。
+
+    腿之间零交互，状态天然按腿隔离。
+    """
+
+    @staticmethod
+    def _leg_descriptor(leg: LiveLeg) -> dict[str, Any]:
+        return {
+            "name": leg.name,
+            "market": leg.market,
+            "symbols": list(leg.symbols),
+            "window": leg.window,
+            "cooldown": leg.cooldown,
+            "gap_eps": leg.gap_eps,
+            "cash_symbols": list(leg.cash_symbols),
+            "slippage": leg.slippage,
+        }
+
+    def __init__(self, path: Path, legs: tuple[LiveLeg, ...]) -> None:
         self.path = path
-        expected_pairs = [
-            {"symbol": symbol, "window": window} for symbol, window in pairs
-        ]
+        self.legs = legs
+        expected = [self._leg_descriptor(leg) for leg in legs]
         if path.exists():
             payload = json.loads(path.read_text(encoding="utf-8"))
             if (
                 payload.get("strategy") != LIVE_STRATEGY
-                or payload.get("pairs") != expected_pairs
+                or payload.get("legs") != expected
             ):
-                raise ValueError("实时状态文件与当前 ETF/窗口配置不匹配")
-            self.selected_symbol = payload.get("selected_symbol")
-            self.last_evaluation_date = payload.get("last_evaluation_date")
+                raise ValueError("实时状态文件与当前腿配置不匹配")
+            self.leg_states = payload.get("leg_states") or {}
             self.last_snapshot = payload.get("last_snapshot")
             self.last_error = payload.get("last_error")
         else:
-            self.selected_symbol = None
-            self.last_evaluation_date = None
+            self.leg_states = {
+                leg.name: {
+                    "selected_symbol": None,
+                    "last_rotation_date": None,
+                    "last_evaluation_date": None,
+                }
+                for leg in legs
+            }
             self.last_snapshot = None
             self.last_error = None
-            self.save(pairs)
+            self.save()
 
-    def save(self, pairs: list[tuple[str, int]]) -> None:
+    def leg_state(self, name: str) -> dict[str, Any]:
+        return self.leg_states[name]
+
+    def save(self) -> None:
         write_json_atomic(
             self.path,
             {
                 "schema_version": LIVE_SCHEMA_VERSION,
                 "strategy": LIVE_STRATEGY,
                 "version": LIVE_VERSION,
-                "pairs": [
-                    {"symbol": symbol, "window": window}
-                    for symbol, window in pairs
-                ],
-                "selected_symbol": self.selected_symbol,
-                "last_evaluation_date": self.last_evaluation_date,
+                "legs": [self._leg_descriptor(leg) for leg in self.legs],
+                "leg_states": self.leg_states,
                 "updated_at": datetime.now().astimezone().isoformat(
                     timespec="seconds"
                 ),
@@ -715,26 +1054,18 @@ class LiveState:
             },
         )
 
-    def record_snapshot(
-        self,
-        pairs: list[tuple[str, int]],
-        event: dict[str, Any],
-    ) -> None:
+    def record_snapshot(self, event: dict[str, Any]) -> None:
         self.last_snapshot = event
         self.last_error = None
-        self.save(pairs)
+        self.save()
 
-    def record_error(
-        self,
-        pairs: list[tuple[str, int]],
-        event: dict[str, Any],
-    ) -> None:
+    def record_error(self, event: dict[str, Any]) -> None:
         self.last_error = event
-        self.save(pairs)
+        self.save()
 
 
 class LiveNotifier:
-    """Send notifications outside the market-data polling thread."""
+    """后台线程发送通知"""
 
     def __init__(self, engine: Any, maxsize: int = 100) -> None:
         self.engine = engine
@@ -752,7 +1083,7 @@ class LiveNotifier:
     def notify(self, event: dict[str, Any]) -> None:
         key = "|".join(
             str(event.get(name, ""))
-            for name in ("type", "action", "selected_symbol", "message")
+            for name in ("type", "action", "market", "leg", "selected_symbol", "message")
         )
         now = time.monotonic()
         if now - self.recent.get(key, -1e12) < 300:
@@ -773,7 +1104,7 @@ class LiveNotifier:
         target = event.get("target_symbol") or "CASH"
         lines = [
             f"动量轮动 {event['action']}",
-            f"模式: {event['mode']}",
+            f"市场: {event['market']} 腿: {event['leg']}",
             f"交易日: {event['evaluation_date']}",
             f"提示时间: {event['notification_time']} {event['timezone']}",
             f"目标: {target}",
@@ -848,32 +1179,6 @@ def resolve_live_connection(
     if not host or not 1 <= port <= 65535:
         raise ValueError("配置文件必须提供有效的 FUTU_HOST 和 FUTU_PORT")
     return host, port
-
-
-@contextmanager
-def stop_event() -> Iterator[threading.Event]:
-    stopped = threading.Event()
-    old_handlers = {
-        sig: signal.signal(sig, lambda *_: stopped.set())
-        for sig in (signal.SIGINT, signal.SIGTERM)
-    }
-    try:
-        yield stopped
-    finally:
-        for sig, handler in old_handlers.items():
-            signal.signal(sig, handler)
-
-
-def daily_evaluation_ready(
-    now: datetime,
-    notification_time: datetime_time,
-    market_timezone: ZoneInfo,
-) -> bool:
-    """Return true after the configured market close buffer on weekdays."""
-    local = now.astimezone(market_timezone)
-    if local.weekday() >= 5:
-        return False
-    return local.time().replace(tzinfo=None) >= notification_time
 
 
 def parse_futu_quote_time(
@@ -988,179 +1293,155 @@ def close_futu_context(context: Any) -> None:
         eprint(f"警告: 关闭 Futu context 失败: {exc}")
 
 
+def market_union_pairs(legs: tuple[LiveLeg, ...]) -> list[tuple[str, int]]:
+    """市场内全部符号的 (symbol, 该市场最大所需窗口)：一次拉取、按腿切片。"""
+    windows: dict[str, int] = {}
+    for leg in legs:
+        for symbol in leg.symbols:
+            windows[symbol] = max(windows.get(symbol, 0), leg.window)
+    return list(windows.items())
+
+
 def run_live(args: argparse.Namespace) -> int:
+    """live（cron_restart 定时触发）：对指定市场做一次即时评估并通知。
+
+    触发时机由 PM2 ecosystem 的 cron 表达式保证，脚本只做：
+    交易日守卫（非交易日发 IDLE 不通知）、对最近收盘的即时评估、通知。
+    --markets 限定本次评估的市场（cron 分市场触发的必要条件，默认全部）。
+    """
     try:
         from futu import AuType, OpenQuoteContext, RET_OK, SubType
     except ImportError as exc:
         raise RuntimeError("live 模式需要 futu-api") from exc
 
-    preset = LIVE_PRESETS[args.mode]
-    pairs = list(preset["pairs"])
-    cash_symbols = set(preset["cash_symbols"])
-    market_timezone = preset["timezone"]
-    notification_time = preset["notification_time"]
-    symbols = [symbol for symbol, _window in pairs]
+    legs_by_market: dict[str, list[LiveLeg]] = {}
+    for leg in LIVE_LEGS:
+        legs_by_market.setdefault(leg.market, []).append(leg)
+    if args.markets:
+        requested = {
+            market.strip().upper()
+            for market in str(args.markets).split(",")
+            if market.strip()
+        }
+        unknown = requested - set(MARKET_SPECS)
+        if unknown:
+            raise ValueError(f"未知市场: {sorted(unknown)}（可选: {sorted(MARKET_SPECS)}）")
+        markets = tuple(m for m in legs_by_market if m in requested)
+    else:
+        markets = tuple(legs_by_market)
 
-    runtime = LiveRuntimePaths.from_argument(args.runtime_dir, args.mode)
+    runtime = LiveRuntimePaths.from_argument(args.runtime_dir, "live")
     runtime.prepare()
-    state = LiveState(runtime.state_file, pairs)
-    host, port = resolve_live_connection(args.config, symbols)
+    state = LiveState(runtime.state_file, LIVE_LEGS)
+    market_symbols = [
+        symbol
+        for market in markets
+        for leg in legs_by_market[market]
+        for symbol in leg.symbols
+    ]
+    host, port = resolve_live_connection(args.config, market_symbols)
     notifier = build_live_notifier(args.config)
-    started = time.monotonic()
     context = None
-    subscribed = False
-    consecutive_errors = 0
-    last_idle_log = -1e12
-    running_script_hash = sha256_file(Path(__file__).resolve())
+    subscribed_markets: set[str] = set()
 
     try:
-        with stop_event() as stopped:
-            with RuntimeFileLock(runtime.lock_file):
-                while not stopped.is_set():
-                    now_monotonic = time.monotonic()
-                    if args.duration and now_monotonic - started >= args.duration:
-                        break
-                    if sha256_file(Path(__file__).resolve()) != running_script_hash:
-                        raise RuntimeError(
-                            "脚本文件在 live 运行期间发生变化；退出并由PM2重启"
-                        )
-
-                    now = datetime.now(market_timezone)
-                    today = now.date().isoformat()
-                    if not args.once and (
-                        not daily_evaluation_ready(
-                            now, notification_time, market_timezone
-                        )
-                        or state.last_evaluation_date == today
+        with RuntimeFileLock(runtime.lock_file):
+            for market in markets:
+                spec = MARKET_SPECS[market]
+                market_timezone = spec["timezone"]
+                now = datetime.now(market_timezone)
+                today = now.date().isoformat()
+                market_legs = legs_by_market[market]
+                try:
+                    if context is None:
+                        context = OpenQuoteContext(host=host, port=port)
+                        subscribed_markets.clear()
+                    if not is_live_trading_day(
+                        context, spec["trading_symbol"], today, RET_OK
                     ):
-                        stopped.wait(min(args.interval, 60.0))
+                        event = {
+                            "type": "IDLE",
+                            "strategy": LIVE_STRATEGY,
+                            "market": market,
+                            "message": "今日为非交易日，跳过信号计算",
+                            "evaluation_date": today,
+                            "emitted_at": now.isoformat(timespec="seconds"),
+                        }
+                        for leg in market_legs:
+                            state.leg_state(leg.name)[
+                                "last_evaluation_date"
+                            ] = today
+                        state.record_snapshot(event)
+                        print(json.dumps(event, ensure_ascii=False), flush=True)
                         continue
-
-                    try:
-                        if context is None:
-                            context = OpenQuoteContext(host=host, port=port)
-                            subscribed = False
-                        if not args.once and not is_live_trading_day(
-                            context, symbols[0], today, RET_OK
-                        ):
-                            event = {
-                                "type": "IDLE",
-                                "strategy": LIVE_STRATEGY,
-                                "mode": args.mode,
-                                "message": "今日为非交易日，跳过信号计算",
-                                "evaluation_date": today,
-                                "emitted_at": now.isoformat(timespec="seconds"),
-                            }
-                            state.last_evaluation_date = today
-                            state.record_snapshot(pairs, event)
-                            print(json.dumps(event, ensure_ascii=False), flush=True)
-                            consecutive_errors = 0
-                            continue
-                        if not subscribed:
-                            subscribe_live_klines(
-                                context,
-                                symbols,
-                                RET_OK,
-                                SubType,
-                            )
-                            subscribed = True
-
-                        closes, snapshots = fetch_live_market_data(
+                    pairs = market_union_pairs(market_legs)
+                    if market not in subscribed_markets:
+                        subscribe_live_klines(
                             context,
-                            pairs,
+                            [symbol for symbol, _window in pairs],
                             RET_OK,
                             SubType,
-                            AuType,
                         )
-                        bar_dates = {
-                            snapshot["bar_date"] for snapshot in snapshots.values()
-                        }
-                        if len(bar_dates) != 1:
-                            raise RuntimeError(
-                                "ETF 最新日K日期不一致: "
-                                + ", ".join(
-                                    f"{symbol}={snapshot['bar_date']}"
-                                    for symbol, snapshot in snapshots.items()
-                                )
-                            )
-                        trading_date = next(iter(bar_dates))
-                        if not args.once:
-                            if trading_date != today:
-                                if now_monotonic - last_idle_log >= 300:
-                                    idle = {
-                                        "type": "IDLE",
-                                        "message": "今日无已完成日K，跳过信号计算",
-                                        "latest_bar_date": trading_date,
-                                        "emitted_at": now.isoformat(
-                                            timespec="seconds"
-                                        ),
-                                    }
-                                    print(
-                                        json.dumps(idle, ensure_ascii=False),
-                                        flush=True,
-                                    )
-                                    last_idle_log = now_monotonic
-                                consecutive_errors = 0
-                                stopped.wait(300.0)
-                                continue
-                            stale_symbols = []
-                            for symbol, snapshot in snapshots.items():
-                                quote_time = parse_futu_quote_time(
-                                    snapshot["quote_time"], market_timezone
-                                )
-                                quote_age = (
-                                    (now - quote_time).total_seconds()
-                                    if quote_time is not None
-                                    else math.inf
-                                )
-                                if (
-                                    quote_time is None
-                                    or quote_age < -60
-                                    or quote_age > args.max_quote_age
-                                ):
-                                    stale_symbols.append(symbol)
-                            if stale_symbols:
-                                if now_monotonic - last_idle_log >= 300:
-                                    idle = {
-                                        "type": "IDLE",
-                                        "message": "Futu 行情未更新，跳过信号计算",
-                                        "symbols": stale_symbols,
-                                        "emitted_at": now.isoformat(
-                                            timespec="seconds"
-                                        ),
-                                    }
-                                    print(
-                                        json.dumps(idle, ensure_ascii=False),
-                                        flush=True,
-                                    )
-                                    last_idle_log = now_monotonic
-                                consecutive_errors = 0
-                                stopped.wait(args.interval)
-                                continue
+                        subscribed_markets.add(market)
 
-                        scores = score_live_pairs(pairs, closes)
-                        selected_symbol = select_live_symbol(
-                            scores, args.min_score
+                    closes, snapshots = fetch_live_market_data(
+                        context,
+                        pairs,
+                        RET_OK,
+                        SubType,
+                        AuType,
+                    )
+                    bar_dates = {
+                        snapshot["bar_date"]
+                        for snapshot in snapshots.values()
+                    }
+                    if len(bar_dates) != 1:
+                        raise RuntimeError(
+                            "ETF 最新日K日期不一致: "
+                            + ", ".join(
+                                f"{symbol}={snapshot['bar_date']}"
+                                for symbol, snapshot in snapshots.items()
+                            )
                         )
-                        previous_symbol = state.selected_symbol
-                        action = live_transition_action(
-                            previous_symbol,
-                            selected_symbol,
-                            cash_symbols,
+                    trading_date = next(iter(bar_dates))
+
+                    for leg in market_legs:
+                        leg_pairs = [
+                            (symbol, leg.window)
+                            for symbol in leg.symbols
+                        ]
+                        scores = score_live_pairs(leg_pairs, closes)
+                        top = max(scores, key=scores.get)
+                        selected_symbol = (
+                            top
+                            if scores[top] >= args.min_score
+                            else None
+                        )
+                        lst = state.leg_state(leg.name)
+                        action = live_leg_decision(
+                            leg,
+                            scores,
+                            lst["selected_symbol"],
+                            lst["last_rotation_date"],
+                            today,
+                            args.min_score,
                         )
                         target_symbol = (
                             selected_symbol
-                            if selected_symbol not in cash_symbols
+                            if selected_symbol
+                            not in leg.cash_symbols
                             else None
                         )
-                        windows = dict(pairs)
+                        windows = dict(leg_pairs)
                         ranking = [
                             {
                                 "symbol": symbol,
                                 "window": windows[symbol],
                                 "score": score,
                                 "price": snapshots[symbol]["price"],
-                                "quote_time": snapshots[symbol]["quote_time"],
+                                "quote_time": snapshots[symbol][
+                                    "quote_time"
+                                ],
                                 "bar_date": snapshots[symbol]["bar_date"],
                             }
                             for symbol, score in sorted(
@@ -1172,17 +1453,20 @@ def run_live(args: argparse.Namespace) -> int:
                         event = {
                             "type": "SIGNAL",
                             "strategy": LIVE_STRATEGY,
-                            "mode": args.mode,
+                            "market": market,
+                            "leg": leg.name,
                             "evaluation_date": trading_date,
-                            "notification_time": notification_time.strftime("%H:%M"),
+                            "notification_time": spec[
+                                "notification_time"
+                            ].strftime("%H:%M"),
                             "timezone": str(market_timezone),
                             "action": action,
-                            "previous_symbol": previous_symbol,
+                            "previous_symbol": lst["selected_symbol"],
                             "selected_symbol": selected_symbol,
                             "target_symbol": target_symbol,
                             "cash_signal": (
                                 selected_symbol is None
-                                or selected_symbol in cash_symbols
+                                or selected_symbol in leg.cash_symbols
                             ),
                             "min_score": (
                                 args.min_score
@@ -1190,43 +1474,37 @@ def run_live(args: argparse.Namespace) -> int:
                                 else None
                             ),
                             "ranking": ranking,
-                            "emitted_at": now.isoformat(timespec="seconds"),
+                            "emitted_at": now.isoformat(
+                                timespec="seconds"
+                            ),
                         }
-                        state.selected_symbol = selected_symbol
-                        state.last_evaluation_date = trading_date
-                        state.record_snapshot(pairs, event)
-                        print(json.dumps(event, ensure_ascii=False), flush=True)
-                        if notifier is not None:
-                            notifier.notify(event)
-                        consecutive_errors = 0
-                    except Exception as exc:
-                        close_futu_context(context)
-                        context = None
-                        subscribed = False
-                        consecutive_errors += 1
-                        event = {
-                            "type": "ERROR",
-                            "strategy": LIVE_STRATEGY,
-                            "message": str(exc),
-                            "consecutive_errors": consecutive_errors,
-                            "emitted_at": now.isoformat(timespec="seconds"),
-                        }
-                        state.record_error(pairs, event)
-                        eprint(json.dumps(event, ensure_ascii=False))
-                        if notifier is not None:
-                            notifier.notify(event)
-                        if args.once or consecutive_errors >= args.max_errors:
-                            raise
-
-                    if args.once:
-                        break
-                    delay = args.interval
-                    if consecutive_errors:
-                        delay = min(
-                            args.interval * (2 ** (consecutive_errors - 1)),
-                            300.0,
+                        lst["selected_symbol"] = selected_symbol
+                        if action == "ROTATE":
+                            lst["last_rotation_date"] = trading_date
+                        lst["last_evaluation_date"] = trading_date
+                        state.record_snapshot(event)
+                        print(
+                            json.dumps(event, ensure_ascii=False),
+                            flush=True,
                         )
-                    stopped.wait(delay)
+                        if notifier is not None:
+                            notifier.notify(event)
+                except Exception as exc:
+                    close_futu_context(context)
+                    context = None
+                    subscribed_markets.clear()
+                    event = {
+                        "type": "ERROR",
+                        "strategy": LIVE_STRATEGY,
+                        "market": market,
+                        "message": str(exc),
+                        "emitted_at": now.isoformat(timespec="seconds"),
+                    }
+                    state.record_error(event)
+                    eprint(json.dumps(event, ensure_ascii=False))
+                    if notifier is not None:
+                        notifier.notify(event)
+                    raise
     finally:
         close_futu_context(context)
         if notifier is not None:
@@ -1234,71 +1512,53 @@ def run_live(args: argparse.Namespace) -> int:
     return 0
 
 
-def positive_float(value: str) -> float:
-    parsed = float(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("必须大于0")
-    return parsed
-
-
-def positive_int(value: str) -> int:
-    parsed = int(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("必须是正整数")
-    return parsed
-
-
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Momentum rotation native backtest and Futu live monitor"
+        description="Momentum rotation backtest/optimize and Futu live signal evaluation"
     )
     parser.add_argument(
         "mode",
         nargs="?",
-        choices=["backtest", "optimize", "optimize-universe", *LIVE_PRESETS],
+        choices=["backtest", "optimize", "optimize-universe", "live"],
         default=DEFAULT_MODE,
-        help="live-us: 美东16:10；live-cn: 北京15:10",
+        help="live: 各腿动量信号（cron_restart 定时触发）",
     )
     parser.add_argument("--start", default=DEFAULT_START)
     parser.add_argument("--end", default=DEFAULT_END)
     parser.add_argument("--config", default=None)
+    parser.add_argument("--window", type=int, default=21, help="动量窗口（回测/优化）")
+    parser.add_argument("--cooldown", type=int, default=0, help="资产->资产冷静期（日历天）")
+    parser.add_argument("--eps", type=float, default=0.0, help="决策日分差阈值（与 --cooldown 互斥）")
+    parser.add_argument("--cash-symbols", default=None, help="现金符号（逗号分隔，如 US.UUP；默认空）")
+    parser.add_argument("--slippage", type=float, default=DEFAULT_SLIPPAGE_US, help="每份单边滑点（CN 用 0.002）")
+    parser.add_argument("--symbols", default=None, help="回测/优化标的（逗号分隔，覆盖预设；含 US.SPY 作为基准）")
     parser.add_argument("--min-score", type=float, default=float("-inf"))
+    parser.add_argument("--markets", default=None, help="live 限定市场（逗号分隔，如 CN,US；默认全部）")
     parser.add_argument("--runtime-dir")
-    parser.add_argument("--interval", type=positive_float, default=60.0)
-    parser.add_argument(
-        "--max-quote-age",
-        type=positive_float,
-        default=LIVE_MAX_QUOTE_AGE_SECONDS,
-    )
-    parser.add_argument(
-        "--max-errors",
-        type=positive_int,
-        default=LIVE_MAX_CONSECUTIVE_ERRORS,
-    )
-    parser.add_argument("--duration", type=float, default=0)
-    parser.add_argument("--once", action="store_true")
     return parser.parse_args(argv)
 
 
 def main() -> int:
     args = parse_args()
-    if args.duration < 0:
-        raise ValueError("--duration 不能为负")
     if math.isnan(args.min_score):
         raise ValueError("--min-score 不能是 NaN")
-    if args.mode in LIVE_PRESETS:
+    if args.mode == "live":
         if not args.runtime_dir:
             raise ValueError("live 模式必须指定 --runtime-dir")
         if not args.config:
             raise ValueError("live 模式必须指定 --config")
         return run_live(args)
 
+    if args.symbols:
+        symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+    else:
+        symbols = DEFAULT_BACKTEST_SYMBOLS
     if args.mode == "optimize-universe":
         run_universe_optimization(args)
     elif args.mode == "optimize":
-        run_momentum_optimization(make_backtest_config(args, DEFAULT_BACKTEST_SYMBOLS))
+        run_momentum_optimization(make_backtest_config(args, symbols))
     else:
-        run_momentum_backtest(make_backtest_config(args, DEFAULT_BACKTEST_SYMBOLS))
+        run_momentum_backtest(make_backtest_config(args, symbols))
     return 0
 
 

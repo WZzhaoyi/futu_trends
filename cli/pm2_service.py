@@ -89,10 +89,13 @@ def build_service_spec(
     max_nav_age: int = 14,
     max_quote_age: float | None = None,
     max_errors: int = 5,
-    live_mode: str = "live-us",
+    live_mode: str = "live",
     platform: str = sys.platform,
-) -> ServiceSpec:
-    """Resolve one PM2 instance exactly as its ecosystem file does."""
+) -> ServiceSpec | list[ServiceSpec]:
+    """Resolve one PM2 instance exactly as its ecosystem file does.
+
+    momentum-rotation 返回两个实例（CN/US 各一个 cron_restart 定时 app）。
+    """
     config_path = _resolved_config(config)
     identity = _identity_path(config_path, platform)
     slug = _config_slug(config_path)
@@ -228,39 +231,37 @@ def build_service_spec(
         if not runtime_dir:
             raise PM2ConfigError("momentum-rotation 必须指定 --runtime-dir")
         runtime_path = _resolved_runtime_dir(runtime_dir)
-        if live_mode not in {"live-us", "live-cn"}:
-            raise PM2ConfigError("mode 只能是 live-us 或 live-cn")
-        quote_age = 14400.0 if max_quote_age is None else max_quote_age
-        if min(interval, quote_age) <= 0 or max_errors <= 0:
-            raise PM2ConfigError(
-                "interval、max-quote-age 和 max-errors 必须大于0"
+        if live_mode != "live":
+            raise PM2ConfigError("mode 只能是 live（cron_restart 定时触发）")
+        specs = []
+        for market in ("CN", "US"):
+            digest = hashlib.sha256(
+                "\0".join(
+                    (
+                        identity,
+                        _identity_path(runtime_path, platform),
+                        market,
+                    )
+                ).encode()
+            ).hexdigest()[:8]
+            specs.append(
+                ServiceSpec(
+                    service=service,
+                    config_path=config_path,
+                    instance_name=f"futu-momentum-rotation-{market.lower()}-{digest}",
+                    ecosystem_path=(
+                        PROJECT_ROOT
+                        / "market_analysis"
+                        / "ecosystem.momentum-rotation.config.js"
+                    ),
+                    environment={
+                        "MOMENTUM_ROTATION_CONFIG": str(config_path),
+                        "MOMENTUM_ROTATION_RUNTIME_DIR": str(runtime_path),
+                        "MOMENTUM_ROTATION_MODE": live_mode,
+                    },
+                )
             )
-        digest_input = "\0".join(
-            (
-                identity,
-                _identity_path(runtime_path, platform),
-                live_mode,
-            )
-        )
-        digest = hashlib.sha256(digest_input.encode()).hexdigest()[:8]
-        return ServiceSpec(
-            service=service,
-            config_path=config_path,
-            instance_name=f"futu-momentum-rotation-{digest}",
-            ecosystem_path=(
-                PROJECT_ROOT
-                / "market_analysis"
-                / "ecosystem.momentum-rotation.config.js"
-            ),
-            environment={
-                "MOMENTUM_ROTATION_CONFIG": str(config_path),
-                "MOMENTUM_ROTATION_RUNTIME_DIR": str(runtime_path),
-                "MOMENTUM_ROTATION_MODE": live_mode,
-                "MOMENTUM_ROTATION_INTERVAL": str(interval),
-                "MOMENTUM_ROTATION_MAX_QUOTE_AGE": str(quote_age),
-                "MOMENTUM_ROTATION_MAX_ERRORS": str(max_errors),
-            },
-        )
+        return specs
 
     raise PM2ConfigError(f"不支持的 PM2 服务: {service}")
 
@@ -400,16 +401,10 @@ def _build_parser() -> argparse.ArgumentParser:
     momentum_rotation.add_argument("--runtime-dir", required=True)
     momentum_rotation.add_argument(
         "--mode",
-        choices=("live-us", "live-cn"),
-        default="live-us",
+        choices=("live",),
+        default="live",
+        help="管理 momentum-rotation 定时通知服务（CN/US 两个 cron_restart 实例）",
     )
-    momentum_rotation.add_argument("--interval", type=float, default=60.0)
-    momentum_rotation.add_argument(
-        "--max-quote-age",
-        type=float,
-        default=14400.0,
-    )
-    momentum_rotation.add_argument("--max-errors", type=int, default=5)
 
     targets.add_parser("save", help="保存当前 PM2 进程列表")
     return parser
@@ -420,7 +415,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.target == "save":
         return run_pm2(["save"])
     try:
-        spec = build_service_spec(
+        specs = build_service_spec(
             args.target,
             args.config,
             port=getattr(args, "port", 8001),
@@ -442,13 +437,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_nav_age=getattr(args, "max_nav_age", 14),
             max_quote_age=getattr(args, "max_quote_age", None),
             max_errors=getattr(args, "max_errors", 5),
-            live_mode=getattr(args, "mode", "live-us"),
+            live_mode=getattr(args, "mode", "live"),
         )
-        pm2_args = build_pm2_args(args.action, spec)
+        if isinstance(specs, list):
+            if args.action in {"start", "restart"}:
+                pm2_args = [
+                    "start",
+                    str(specs[0].ecosystem_path),
+                    "--only",
+                    ",".join(spec.instance_name for spec in specs),
+                    "--update-env",
+                ]
+                return run_pm2(pm2_args, specs[0].environment)
+            return max(
+                run_pm2(build_pm2_args(args.action, spec), spec.environment)
+                for spec in specs
+            )
+        pm2_args = build_pm2_args(args.action, specs)
     except PM2ConfigError as exc:
         print(str(exc), file=sys.stderr)
         return 2
-    return run_pm2(pm2_args, spec.environment)
+    return run_pm2(pm2_args, specs.environment)
 
 
 if __name__ == "__main__":

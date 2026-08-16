@@ -162,3 +162,4 @@ gui/electron/dist/
 gui/electron/.vite/
 gui/electron/electron/*.js
 gui/electron/*.log
+.alma-snapshots

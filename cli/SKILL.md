@@ -29,7 +29,7 @@ PM2 管理命令的配置参数属于具体服务子命令：
 <PYTHON> <REPO>/cli/main.py pm2 signal-api <ACTION> --config <ABS_CONFIG> [--port 8001]
 <PYTHON> <REPO>/cli/main.py pm2 csi-flow <ACTION> --config <ABS_CONFIG> --runtime-dir <ABS_RUNTIME>
 <PYTHON> <REPO>/cli/main.py pm2 etf-premium <ACTION> --config <ABS_CONFIG> --runtime-dir <ABS_RUNTIME>
-<PYTHON> <REPO>/cli/main.py pm2 momentum-rotation <ACTION> --mode live-us|live-cn \
+<PYTHON> <REPO>/cli/main.py pm2 momentum-rotation <ACTION> --mode live \
   --config <ABS_CONFIG> --runtime-dir <ABS_RUNTIME>
 <PYTHON> <REPO>/cli/main.py pm2 save
 ```
@@ -234,7 +234,7 @@ pm2 order-engine start|restart|stop|delete|logs|status --config <ABS_CONFIG>
 pm2 signal-api start|restart|stop|delete|logs|status --config <ABS_CONFIG> [--port <PORT>]
 pm2 csi-flow start|restart|stop|delete|logs|status --config <ABS_CONFIG> --runtime-dir <ABS_RUNTIME>
 pm2 etf-premium start|restart|stop|delete|logs|status --config <ABS_CONFIG> --runtime-dir <ABS_RUNTIME>
-pm2 momentum-rotation start|restart|stop|delete|logs|status --mode live-us|live-cn \
+pm2 momentum-rotation start|restart|stop|delete|logs|status --mode live \
   --config <ABS_CONFIG> --runtime-dir <ABS_RUNTIME>
 pm2 save
 ```
@@ -245,14 +245,10 @@ pm2 save
 - `csi-flow` 还必须传绝对 `--runtime-dir`；`live` 在其中自动维护行情、阈值、状态和实例锁。
 - `etf-premium` 也必须传绝对 `--runtime-dir`；默认标的 `159941`。交易信号只使用 T-1
   单位净值溢价，Futu IOPV 溢价只写入快照和通知作为盘中提示。
-- `momentum-rotation` 必须传绝对 `--runtime-dir`，只通知、不下单。`--mode` 只选择完整预设，
-  不再接受自定义 ETF 或窗口：
-  - `live-us`：`US.QQQ/US.SPY/US.FXI/US.UUP`，窗口均为 21；美东交易日 16:10 检测，
-    `US.UUP` 排名第一表示持有现金。
-  - `live-cn`：`SZ.159941/SZ.159949/SH.510300/SH.510880`，窗口均为 28；
-    北京交易日 15:10 检测。
-  两种模式每天最多通知一次，节假日由 Futu 交易日历跳过；`FUTU_HOST`、`FUTU_PORT` 和
-  `DATA_SOURCE[_市场]` 均从 `--config` 读取，涉及市场的数据源必须为 `futu`。
+- `momentum-rotation` 也必须传绝对 `--runtime-dir`：PM2 `cron_restart` 定时触发
+  （CN 北京 15:30 周一~五、US 北京 05:30 周一~六，`autorestart: false` 跑完即退），
+  `pm2 momentum-rotation start` 一次管理 CN/US 两个实例
+  （系统时区须为北京时区 UTC+8，否则报错并提示 `pm2 kill && TZ=Asia/Shanghai pm2 resurrect`）。
 - `ORDER_ENGINE_PYTHON` / `SIGNAL_API_PYTHON` / `CSI_FLOW_PYTHON` /
   `ETF_PREMIUM_PYTHON` / `MOMENTUM_ROTATION_PYTHON` 可分别指定解释器；否则优先使用当前
   `CONDA_PREFIX`。
@@ -272,9 +268,7 @@ SIGNAL_API_PYTHON=<API_PYTHON> <PYTHON> <REPO>/cli/main.py pm2 signal-api start 
 ETF_PREMIUM_PYTHON=<ENV_PYTHON> <PYTHON> <REPO>/cli/main.py pm2 etf-premium start \
   --config <ABS_CONFIG> --runtime-dir <ABS_RUNTIME>
 MOMENTUM_ROTATION_PYTHON=<ENV_PYTHON> <PYTHON> <REPO>/cli/main.py pm2 momentum-rotation start \
-  --mode live-us --config <ABS_CONFIG> --runtime-dir <ABS_US_RUNTIME>
-MOMENTUM_ROTATION_PYTHON=<ENV_PYTHON> <PYTHON> <REPO>/cli/main.py pm2 momentum-rotation start \
-  --mode live-cn --config <ABS_CONFIG> --runtime-dir <ABS_CN_RUNTIME>
+  --mode live --config <ABS_CONFIG> --runtime-dir <ABS_RUNTIME>
 <PYTHON> <REPO>/cli/main.py pm2 save
 ```
 

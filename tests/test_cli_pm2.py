@@ -114,38 +114,28 @@ class PM2ServiceTest(unittest.TestCase):
 
     def test_momentum_rotation_identity_and_environment(self):
         runtime = Path(self.temp_dir.name) / "momentum-runtime"
-        spec = build_service_spec(
+        specs = build_service_spec(
             "momentum-rotation",
             str(self.config),
             runtime_dir=str(runtime.absolute()),
-            live_mode="live-cn",
+            live_mode="live",
         )
-        identity = "\0".join(
-            (
-                str(self.config.absolute()),
+        self.assertIsInstance(specs, list)
+        self.assertEqual([spec.instance_name for spec in specs], [
+            f"futu-momentum-rotation-cn-{hashlib.sha256((str(self.config.absolute()) + chr(0) + str(runtime.absolute()) + chr(0) + 'CN').encode()).hexdigest()[:8]}",
+            f"futu-momentum-rotation-us-{hashlib.sha256((str(self.config.absolute()) + chr(0) + str(runtime.absolute()) + chr(0) + 'US').encode()).hexdigest()[:8]}",
+        ])
+        for spec in specs:
+            self.assertEqual(spec.environment["MOMENTUM_ROTATION_MODE"], "live")
+            self.assertEqual(
+                spec.environment["MOMENTUM_ROTATION_RUNTIME_DIR"],
                 str(runtime.absolute()),
-                "live-cn",
             )
-        )
-        digest = hashlib.sha256(identity.encode()).hexdigest()[:8]
-        self.assertEqual(
-            spec.instance_name,
-            f"futu-momentum-rotation-{digest}",
-        )
-        self.assertEqual(spec.environment["MOMENTUM_ROTATION_MODE"], "live-cn")
-        self.assertEqual(
-            spec.environment["MOMENTUM_ROTATION_RUNTIME_DIR"],
-            str(runtime.absolute()),
-        )
-        self.assertEqual(
-            spec.environment["MOMENTUM_ROTATION_MAX_QUOTE_AGE"],
-            "14400.0",
-        )
-        self.assertEqual(
-            spec.ecosystem_path.name,
-            "ecosystem.momentum-rotation.config.js",
-        )
-        self.assertTrue(spec.ecosystem_path.is_file())
+            self.assertEqual(
+                spec.ecosystem_path.name,
+                "ecosystem.momentum-rotation.config.js",
+            )
+            self.assertTrue(spec.ecosystem_path.is_file())
 
     def test_identity_does_not_dereference_config_symlink(self):
         link = Path(self.temp_dir.name) / "linked.ini"
@@ -300,14 +290,15 @@ class PM2ServiceTest(unittest.TestCase):
                 "--runtime-dir",
                 str(runtime.absolute()),
                 "--mode",
-                "live-cn",
+                "live",
             ]
         )
         self.assertEqual(rc, 0)
         args, env = run_pm2_mock.call_args.args
         self.assertEqual(args[0], "start")
-        self.assertEqual(env["MOMENTUM_ROTATION_MODE"], "live-cn")
-        self.assertEqual(env["MOMENTUM_ROTATION_INTERVAL"], "60.0")
+        self.assertIn("--only", args)
+        self.assertRegex(args[args.index("--only") + 1], r"futu-momentum-rotation-(cn|us)-[0-9a-f]{8},futu-momentum-rotation-(cn|us)-[0-9a-f]{8}")
+        self.assertEqual(env["MOMENTUM_ROTATION_MODE"], "live")
         self.assertEqual(
             env["MOMENTUM_ROTATION_RUNTIME_DIR"],
             str(runtime.absolute()),
