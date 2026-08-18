@@ -3,6 +3,7 @@ import sys
 import unittest
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 
@@ -18,25 +19,80 @@ sys.modules[SPEC.name] = momentum
 SPEC.loader.exec_module(momentum)
 
 
-class MomentumFillTest(unittest.TestCase):
-    def test_backtest_uses_futu_source_from_config(self):
-        config = momentum._futu_config(
-            str(momentum.PROJECT_ROOT / "config_template.ini"),
-            "US.QQQ",
+def _fake_histories(n_days: int = 40) -> dict[str, pd.DataFrame]:
+    """合成两标的 OHLCV：A 单边上涨（动量第一），B 横盘（动量≈0）。
+
+    40 交易日，足够 window=10 预热；A 的 open 故意在个别日偏离 close，
+    便于验证"次日开盘价成交"。
+    """
+    idx = pd.bdate_range("2026-01-01", periods=n_days)
+    frames = {}
+    for name, base in (("A", 100.0), ("B", 50.0), ("US.SPY", 400.0)):
+        close = base * np.linspace(1.0, 1.5, n_days) if name == "A" else np.full(n_days, base)
+        open_ = close.copy()
+        # 第 16 日开盘跳空 +2（验证买入按开盘价而非收盘价）
+        if name == "A":
+            open_[15] = close[15] + 2.0
+        high = np.maximum(open_, close) * 1.01
+        low = np.minimum(open_, close) * 0.99
+        frames[name] = pd.DataFrame(
+            {"Open": open_, "High": high, "Low": low, "Close": close, "Volume": 1e6},
+            index=idx,
+        )
+    return frames
+
+
+class MomentumOpenFillTest(unittest.TestCase):
+    def test_market_open_fills_at_next_day_open(self):
+        histories = _fake_histories()
+        frame, trades, stats = momentum.simulate(
+            histories,
+            ["A", "B"],
+            momentum.SimParams(window=10),
+            benchmark_symbol="B",
+        )
+        # 首次建仓发生在首个决策日的次日，成交价 = 当日开盘价（跳空 +2 亦按开盘价）
+        first = trades[0]
+        self.assertEqual(first["direction"], "long")
+        self.assertEqual(first["vt_symbol"], "A")
+        bar_date = pd.Timestamp(first["datetime"]).normalize()
+        open_on_bar = float(histories["A"].loc[bar_date, "Open"])
+        self.assertEqual(first["price"], open_on_bar)
+
+    def test_market_open_suspension_carries_over(self):
+        histories = _fake_histories()
+        # 首个决策日的次日（建仓执行日）A 停牌 open=0 → 顺延至再下一日成交
+        dates = histories["A"].index
+        decision_day = dates[momentum.SimParams(window=10).warmup_extra + 10 - 1]
+        suspended = dates[list(dates).index(decision_day) + 1]
+        histories["A"].loc[suspended, "Open"] = 0.0
+        histories["A"].loc[suspended, "High"] = 0.0
+        histories["A"].loc[suspended, "Low"] = 0.0
+
+        frame, trades, stats = momentum.simulate(
+            histories,
+            ["A", "B"],
+            momentum.SimParams(window=10),
+            benchmark_symbol="B",
+        )
+        first = trades[0]
+        self.assertNotEqual(pd.Timestamp(first["datetime"]).normalize(), suspended)
+        bar_date = pd.Timestamp(first["datetime"]).normalize()
+        self.assertEqual(
+            first["price"], float(histories["A"].loc[bar_date, "Open"])
         )
 
-        self.assertEqual(config.get("CONFIG", "DATA_SOURCE"), "futu")
-
-    def test_limit_order_uses_better_next_open(self):
-        bar = pd.Series({"Open": 9, "High": 11, "Low": 8, "Close": 10})
-
-        self.assertEqual(momentum._fill_price("long", 10, bar), 9)
-        self.assertEqual(momentum._fill_price("short", 8, bar), 9)
-
-    def test_unfilled_limit_order_remains_pending(self):
-        bar = pd.Series({"Open": 12, "High": 13, "Low": 11, "Close": 12})
-
-        self.assertIsNone(momentum._fill_price("long", 10, bar))
+    def test_no_limit_price_in_trades(self):
+        histories = _fake_histories()
+        frame, trades, stats = momentum.simulate(
+            histories,
+            ["A", "B"],
+            momentum.SimParams(window=10),
+            benchmark_symbol="B",
+        )
+        for trade in trades:
+            self.assertIn("price", trade)
+            self.assertGreater(trade["price"], 0)
 
 
 if __name__ == "__main__":

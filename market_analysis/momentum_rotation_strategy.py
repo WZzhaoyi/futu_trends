@@ -1,11 +1,10 @@
-"""动量轮动：向量化回测/优化引擎与 Futu 实时信号监控。
+"""动量轮动：回测/优化引擎与 Futu 实时信号监控。
 
-回测核心为向量化模拟器（`simulate`），支撑大规模网格优化
-（universe × window × 防抖参数）。扩展：
+网格优化（universe × window × 防抖参数）。扩展：
 - 冷静期 N（`cooldown`）：资产->资产轮动的日历天冷却（SELL->现金 / 现金->资产 不受限）
 - 分差阈值 ε（`gap_eps`）：决策日 score(新第一)-score(当前持仓) > ε 才轮动（与 N 互斥）
 - 现金符号（`cash_symbols`）：登顶时全部平仓持现金（默认无）
-- 滑点参数化：US $0.01/份（`DEFAULT_SLIPPAGE_US`）、CN ¥0.002/份（`DEFAULT_SLIPPAGE_CN`）
+- 滑点：US $0.01/份（`DEFAULT_SLIPPAGE_US`）、CN ¥0.002/份（`DEFAULT_SLIPPAGE_CN`）
 
 live 示例（每个交易日收盘后检测并通知一次；不下单）：
     python market_analysis/momentum_rotation_strategy.py live \
@@ -54,24 +53,18 @@ def calculate_momentum_score(data: np.ndarray) -> float:
     )
 
 
-# 全时段最优配置（滑点 CN ¥0.002 / US $0.01）：
-# US: QQQ SPY FXI GLD w22 N13 = 753.9% / -23.4% / Sortino 4.82（无现金符号）
-# US: UUP QQQ FXI GLD w20 ε0.32 = 692.3% / -24.8% / Sortino 4.58（UUP 现金）
-# CN: 159941 159949 510300 518880 w26 N10 = 1675.9% / -30.7% / Sortino 8.40
 
 LIVE_STRATEGY = "momentum-rotation"
-LIVE_VERSION = "momentum-rotation-live-v4"
+LIVE_VERSION = "momentum-rotation-live-v7"
 LIVE_SCHEMA_VERSION = 2
 US_MARKET_TIMEZONE = ZoneInfo("America/New_York")
 CN_MARKET_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
-DEFAULT_MODE = "optimize-universe"
+DEFAULT_MODE = "backtest"
 DEFAULT_START = "2016-06-12"
 DEFAULT_END = date.today().isoformat()
 DEFAULT_CAPITAL = 1_000_000
 DEFAULT_OPTIMIZATION_TARGET = "sortino_ratio"
-DEFAULT_CANDIDATE_SYMBOLS = ["US.QQQ", "US.GLD", "US.SPY", "US.UUP", "US.FXI", "US.TLT"]
-# DEFAULT_CANDIDATE_SYMBOLS = ["SZ.159941", "SH.518880", "SZ.159949", "SH.510300", "SH.510880"]
 DEFAULT_SLIPPAGE_US = 0.01   # USD/份，美股口径
 DEFAULT_SLIPPAGE_CN = 0.002  # CNY/份，A股 ETF 合理值（2 个最小报价单位）
 
@@ -92,32 +85,30 @@ class LiveLeg:
     slippage: float = DEFAULT_SLIPPAGE_US
 
 
-# 最终 live 组合
-# CN = N10 w26 沪深300 + N16 w21 沪深300红利
-# US = N13 w22 无UUP + ε32 w20 含UUP
+# 最终 live 组合（market_open 口径优选，4 腿）
 LIVE_LEGS: tuple[LiveLeg, ...] = (
     LiveLeg(
         name="US-A", market="US",
-        symbols=("US.QQQ", "US.SPY", "US.FXI", "US.GLD"),
-        window=22, cooldown=13,
+        symbols=("US.QQQ", "US.FXI", "US.GLD", "US.UUP"),
+        window=22, gap_eps=0.49, cash_symbols=("US.UUP",),
         slippage=DEFAULT_SLIPPAGE_US,
     ),
     LiveLeg(
         name="US-B", market="US",
-        symbols=("US.UUP", "US.QQQ", "US.FXI", "US.GLD"),
-        window=20, gap_eps=0.32, cash_symbols=("US.UUP",),
+        symbols=("US.QQQ", "US.SPY", "US.FXI", "US.GLD", "US.UUP"),
+        window=22, gap_eps=0.30, cash_symbols=("US.UUP",),
         slippage=DEFAULT_SLIPPAGE_US,
     ),
     LiveLeg(
         name="CN-A", market="CN",
         symbols=("SZ.159941", "SZ.159949", "SH.510300", "SH.518880"),
-        window=26, cooldown=10,
+        window=26, cooldown=3,
         slippage=DEFAULT_SLIPPAGE_CN,
     ),
     LiveLeg(
         name="CN-B", market="CN",
-        symbols=("SZ.159941", "SZ.159949", "SH.510300", "SH.510880"),
-        window=21, cooldown=16,
+        symbols=("SZ.159941", "SZ.159949", "SH.510300", "SH.518880"),
+        window=24, gap_eps=0.34,
         slippage=DEFAULT_SLIPPAGE_CN,
     ),
 )
@@ -136,7 +127,6 @@ MARKET_SPECS: dict[str, dict[str, Any]] = {
 }
 
 DEFAULT_BACKTEST_SYMBOLS = list(LIVE_LEGS[0].symbols)
-DEFAULT_UNIVERSE_SIZE = 4
 DEFAULT_BENCHMARK_SYMBOL = "US.SPY"
 DEFAULT_RATE = 0.001         # 佣金费率（单边）
 OPTIMIZATION_WINDOWS = range(20, 31)
@@ -262,14 +252,6 @@ def prepare_history(config: BacktestConfig) -> dict[str, pd.DataFrame]:
             raise RuntimeError(f"No history data for {symbol} in {config.start} to {config.end}")
         histories[symbol] = frame
     return histories
-
-
-def _fill_price(side: str, limit: float, bar: pd.Series) -> Optional[float]:
-    if side == "long" and limit >= bar["Low"] > 0:
-        return min(limit, float(bar["Open"]))
-    if side == "short" and limit <= bar["High"] and bar["High"] > 0:
-        return max(limit, float(bar["Open"]))
-    return None
 
 
 @dataclass(frozen=True)
@@ -410,6 +392,10 @@ def simulate(
     """向量化模拟：全仓持有当日分数第一的标的（现金符号登顶时持现金），
     支持冷静期 N / 分差阈值 ε 防抖（互斥，不可同时设定）。
 
+    成交价假设（唯一口径）：D 日收盘信号 → D+1 开盘市价成交，无条件按
+    open_[t,i] 撮合（仅停牌日 open<=0 不成交并顺延）。开盘价是收盘信号后
+    唯一稳定可实现的价格，不使用任何日内的限价/极值假设。
+
     histories: {symbol: OHLCV DataFrame}，须含 benchmark_symbol（基准可为全文
     历史、无需参与对齐，_statistics 会自行 reindex 到策略日期）。
     返回 (daily_frame, trades, statistics)。
@@ -421,8 +407,6 @@ def simulate(
     k = len(symbols)
     close = np.column_stack([histories[s]["Close"].to_numpy(float) for s in symbols])
     open_ = np.column_stack([histories[s]["Open"].to_numpy(float) for s in symbols])
-    low = np.column_stack([histories[s]["Low"].to_numpy(float) for s in symbols])
-    high = np.column_stack([histories[s]["High"].to_numpy(float) for s in symbols])
     scores = vectorized_momentum_scores(close, params.window)
     decision_start = max(params.window + params.warmup_extra, 10) - 1
 
@@ -431,7 +415,7 @@ def simulate(
     targets = positions.copy()
     cash = float(params.capital)
     last_price = np.zeros(k)
-    orders: list[tuple[int, int, float, int]] = []  # (idx, sign, limit, vol)
+    orders: list[tuple[int, int, int]] = []  # (idx, sign, vol)
     last_rotation_date = pd.Timestamp.min
     daily = np.zeros(
         n,
@@ -449,22 +433,19 @@ def simulate(
         if t:
             holding_pnl = trading_pnl = turnover = slip_cost = commission = 0.0
             trade_count = 0
-            filled: list[tuple[int, int, float, int]] = []
+            filled: list[tuple[int, int, int]] = []
             for order in orders:
-                i, sign, limit, vol = order
-                fill = None
-                if sign > 0 and limit >= low[t, i] > 0:
-                    fill = min(limit, float(open_[t, i]))
-                elif sign < 0 and limit <= high[t, i] and high[t, i] > 0:
-                    fill = max(limit, float(open_[t, i]))
-                if fill is None:
+                i, sign, vol = order
+                op = float(open_[t, i])
+                if op <= 0:
+                    # 停牌无有效开盘价：顺延至下一交易日
                     filled.append(order)
                     continue
                 positions[i] += sign * vol
-                cash -= sign * vol * fill * params.size
+                cash -= sign * vol * op * params.size
                 trade_count += 1
-                trading_pnl += sign * vol * (close[t, i] - fill) * params.size
-                turnover += vol * fill * params.size
+                trading_pnl += sign * vol * (close[t, i] - op) * params.size
+                turnover += vol * op * params.size
                 slip_cost += vol * params.slippage * params.size
                 trades.append(
                     {
@@ -472,7 +453,7 @@ def simulate(
                         "vt_symbol": symbols[i],
                         "direction": "long" if sign > 0 else "short",
                         "volume": vol,
-                        "price": fill,
+                        "price": op,
                     }
                 )
             orders = filled
@@ -515,8 +496,7 @@ def simulate(
                         if not change:
                             continue
                         sign = 1 if change > 0 else -1
-                        limit = round(float(close[t, i]) / params.pricetick) * params.pricetick
-                        orders.append((i, sign, limit, abs(int(change))))
+                        orders.append((i, sign, abs(int(change))))
                     last_rotation_date = dates[t]
 
     frame = pd.DataFrame(daily, index=dates)
@@ -580,11 +560,16 @@ def run_grid(
     tasks = []
     for uni in universes:
         uname = " ".join(s.split(".")[1] for s in uni)
+        # 对齐宇宙内各标的到共同交易日历
+        aligned = align_histories({s: histories[s] for s in uni})
+        uni_hist = dict(aligned)
+        if benchmark_symbol in histories:
+            uni_hist[benchmark_symbol] = histories[benchmark_symbol]
         for w in windows:
             for n in cooldowns:
                 tasks.append(
                     {
-                        "histories": histories,
+                        "histories": uni_hist,
                         "symbols": list(uni),
                         "params": SimParams(window=w, cooldown=n, cash_symbols=cash_symbols, slippage=slippage),
                         "benchmark": benchmark_symbol,
@@ -594,7 +579,7 @@ def run_grid(
             for e in epsilons:
                 tasks.append(
                     {
-                        "histories": histories,
+                        "histories": uni_hist,
                         "symbols": list(uni),
                         "params": SimParams(window=w, gap_eps=e, cash_symbols=cash_symbols, slippage=slippage),
                         "benchmark": benchmark_symbol,
@@ -621,6 +606,130 @@ def make_universes(
         for combo in combinations(pool, pick):
             combos.append(list(must_include) + list(combo))
     return combos
+
+
+# ---- 完整搜索协议（季度复核重跑使用；与全时段/稳健性研究报告一致） ----------
+SEARCH_WINDOWS = range(20, 31)
+SEARCH_N_GRID = range(0, 31)
+SEARCH_EPS_GRID = tuple(round(0.01 * i, 2) for i in range(51))
+US_CANDIDATES = ("US.QQQ", "US.SPY", "US.FXI", "US.GLD", "US.TLT", "US.UUP")
+CN_CANDIDATES = ("SZ.159941", "SZ.159949", "SH.510300", "SH.510880", "SH.518880")
+
+
+def drawdown_events(
+    balance: pd.Series, min_depth: float = 5.0
+) -> list[dict[str, Any]]:
+    """回撤事件：净值从峰值回落 min_depth% 至恢复前峰。
+
+    返回事件列表，每项含 start（峰值日）/ trough（谷底日）/ end（恢复日，
+    未恢复为 None）/ depth%（谷底相对峰值跌幅）/ recover_days（恢复天数，
+    未恢复为 None）/ drawdown_days（谷底至事件末天数）。
+    """
+    peak = float(balance.iloc[0])
+    peak_date = balance.index[0]
+    trough = peak
+    trough_date = peak_date
+    in_dd = False
+    events: list[dict[str, Any]] = []
+    for date, value in balance.items():
+        value = float(value)
+        if value > peak:
+            if in_dd:
+                events.append(
+                    {
+                        "start": peak_date,
+                        "trough": trough_date,
+                        "end": date,
+                        "depth%": round((trough / peak - 1) * 100, 1),
+                        "recover_days": (date - peak_date).days,
+                        "drawdown_days": (date - trough_date).days,
+                    }
+                )
+                in_dd = False
+            peak = value
+            peak_date = date
+            trough = value
+            trough_date = date
+        else:
+            if value < trough:
+                trough = value
+                trough_date = date
+            if (trough / peak - 1) * 100 <= -min_depth:
+                in_dd = True
+    if in_dd and balance.iloc[-1] < peak:
+        events.append(
+            {
+                "start": peak_date,
+                "trough": trough_date,
+                "end": None,
+                "depth%": round((trough / peak - 1) * 100, 1),
+                "recover_days": None,
+                "drawdown_days": (balance.index[-1] - trough_date).days,
+            }
+        )
+    return events
+
+
+def combo_metrics(
+    balance: pd.Series, capital: float = DEFAULT_CAPITAL
+) -> dict[str, float]:
+    """净值曲线指标（与 _statistics 同口径）。
+
+    用于 50/50 双腿组合（组合净值 = (b1 + b2) / 2，初始各半、零交互）
+    等任意净值序列的指标计算。
+    """
+    days = len(balance)
+    total_return = (balance.iloc[-1] / capital - 1) * 100
+    annual_return = total_return / days * 250
+    daily_return = balance.pct_change().fillna(0) * 100
+    max_ddpercent = float((balance / balance.cummax() - 1).min() * 100)
+    downside = balance.pct_change().fillna(0).clip(upper=0)
+    downside_deviation = math.sqrt(float(downside.pow(2).mean())) * math.sqrt(250)
+    sortino = annual_return / 100 / downside_deviation if downside_deviation else 0
+    sharpe = (
+        daily_return.mean() / daily_return.std() * math.sqrt(250)
+        if daily_return.std()
+        else 0
+    )
+    calmar = annual_return / abs(max_ddpercent) if max_ddpercent else 0
+    return {
+        "total%": float(round(total_return, 1)),
+        "maxDD%": float(round(max_ddpercent, 1)),
+        "sortino": float(round(sortino, 3)),
+        "calmar": float(round(calmar, 2)),
+        "sharpe": float(round(sharpe, 3)),
+    }
+
+
+def benchmark_compare(
+    balance: pd.Series,
+    bench_close: pd.Series,
+    capital: float = DEFAULT_CAPITAL,
+) -> dict[str, Any]:
+    """组合 vs 买入持有基准对比：收益/年化/回撤/跑赢日占比。"""
+    bench = bench_close.loc[balance.index]
+    bench_equity = bench / bench.iloc[0] * capital
+    combo_total = (balance.iloc[-1] / capital - 1) * 100
+    bench_total = (bench_equity.iloc[-1] / capital - 1) * 100
+    combo_daily = balance.pct_change().fillna(0)
+    bench_daily = bench_equity.pct_change().fillna(0)
+    days = len(balance)
+    combo_annual = ((balance.iloc[-1] / capital) ** (365 / days) - 1) * 100
+    bench_annual = ((bench_equity.iloc[-1] / capital) ** (365 / days) - 1) * 100
+    return {
+        "combo_total%": float(round(combo_total, 1)),
+        "bench_total%": float(round(bench_total, 1)),
+        "excess_pp": float(round(combo_total - bench_total, 1)),
+        "combo_annual%": float(round(combo_annual, 1)),
+        "bench_annual%": float(round(bench_annual, 1)),
+        "combo_maxDD%": round(
+            float((balance / balance.cummax() - 1).min() * 100), 1
+        ),
+        "bench_maxDD%": round(
+            float((bench_equity / bench_equity.cummax() - 1).min() * 100), 1
+        ),
+        "win_days%": round((combo_daily > bench_daily).mean() * 100, 1),
+    }
 
 
 def _simulate_config(
@@ -799,52 +908,6 @@ def format_elapsed(seconds: float) -> str:
     if minutes:
         return f"{minutes}m{seconds:02d}s"
     return f"{seconds}s"
-
-
-def run_universe_optimization(args: argparse.Namespace) -> list[dict[str, Any]]:
-    candidates = DEFAULT_CANDIDATE_SYMBOLS
-    rows: list[dict[str, Any]] = []
-    combos = list(combinations(candidates, DEFAULT_UNIVERSE_SIZE))
-    started_at = perf_counter()
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-    progress_path = OUTPUT_ROOT / f"momentumrotationstrategy_universe_progress_{stamp}.csv"
-
-    print(
-        "Universe optimization started: "
-        f"candidates={len(candidates)}, choose={DEFAULT_UNIVERSE_SIZE}, "
-        f"combos={len(combos)}, target={DEFAULT_OPTIMIZATION_TARGET}, "
-        f"progress={progress_path}",
-        flush=True,
-    )
-
-    print(f"Preparing history data for candidate universe: {' '.join(candidates)}", flush=True)
-    histories = prepare_history(make_backtest_config(args, candidates))
-
-    for index, combo in enumerate(combos, start=1):
-        symbols = list(combo)
-        combo_started_at = perf_counter()
-        print(f"Universe {index}/{len(combos)} started: {' '.join(symbols)}", flush=True)
-        row = run_momentum_optimization(make_backtest_config(args, symbols), histories)[0]
-        rows.append(row)
-        pd.DataFrame(rows).sort_values("target", ascending=False).to_csv(progress_path, index=False)
-        print(
-            f"Universe {index}/{len(combos)} done: "
-            f"target={row['target']:.6f}, elapsed={format_elapsed(perf_counter() - combo_started_at)}, "
-            f"total_elapsed={format_elapsed(perf_counter() - started_at)}",
-            flush=True,
-        )
-
-    path = OUTPUT_ROOT / f"momentumrotationstrategy_universe_optimization_{stamp}.csv"
-    rows.sort(key=lambda row: row["target"], reverse=True)
-    pd.DataFrame(rows).to_csv(path, index=False)
-    print(
-        f"Universe optimization result: {path} "
-        f"(elapsed={format_elapsed(perf_counter() - started_at)}, progress={progress_path})",
-        flush=True,
-    )
-    _print_results(rows, "Top 3 universe optimization results:")
-    return rows
 
 
 @dataclass(frozen=True)
@@ -1519,9 +1582,9 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "mode",
         nargs="?",
-        choices=["backtest", "optimize", "optimize-universe", "live"],
+        choices=["backtest", "optimize", "live"],
         default=DEFAULT_MODE,
-        help="live: 各腿动量信号（cron_restart 定时触发）",
+        help="backtest: 单配置回测; optimize: 单宇宙窗口扫描; live: 各腿动量信号（cron_restart 定时触发）",
     )
     parser.add_argument("--start", default=DEFAULT_START)
     parser.add_argument("--end", default=DEFAULT_END)
@@ -1553,9 +1616,7 @@ def main() -> int:
         symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
     else:
         symbols = DEFAULT_BACKTEST_SYMBOLS
-    if args.mode == "optimize-universe":
-        run_universe_optimization(args)
-    elif args.mode == "optimize":
+    if args.mode == "optimize":
         run_momentum_optimization(make_backtest_config(args, symbols))
     else:
         run_momentum_backtest(make_backtest_config(args, symbols))

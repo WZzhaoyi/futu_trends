@@ -41,23 +41,23 @@ class LiveConfigurationTest(unittest.TestCase):
         self.assertEqual(us_a.market, "US")
         self.assertEqual(
             us_a.symbols,
-            ("US.QQQ", "US.SPY", "US.FXI", "US.GLD"),
+            ("US.QQQ", "US.FXI", "US.GLD", "US.UUP"),
         )
         self.assertEqual(us_a.window, 22)
-        self.assertEqual(us_a.cooldown, 13)
-        self.assertEqual(us_a.gap_eps, 0.0)
-        self.assertEqual(us_a.cash_symbols, ())
+        self.assertEqual(us_a.cooldown, 0)
+        self.assertEqual(us_a.gap_eps, 0.49)
+        self.assertEqual(us_a.cash_symbols, ("US.UUP",))
         self.assertEqual(us_a.slippage, momentum.DEFAULT_SLIPPAGE_US)
 
         us_b = find_leg("US-B")
         self.assertEqual(us_b.market, "US")
         self.assertEqual(
             us_b.symbols,
-            ("US.UUP", "US.QQQ", "US.FXI", "US.GLD"),
+            ("US.QQQ", "US.SPY", "US.FXI", "US.GLD", "US.UUP"),
         )
-        self.assertEqual(us_b.window, 20)
+        self.assertEqual(us_b.window, 22)
         self.assertEqual(us_b.cooldown, 0)
-        self.assertEqual(us_b.gap_eps, 0.32)
+        self.assertEqual(us_b.gap_eps, 0.30)
         self.assertEqual(us_b.cash_symbols, ("US.UUP",))
         self.assertEqual(us_b.slippage, momentum.DEFAULT_SLIPPAGE_US)
 
@@ -68,17 +68,19 @@ class LiveConfigurationTest(unittest.TestCase):
             ("SZ.159941", "SZ.159949", "SH.510300", "SH.518880"),
         )
         self.assertEqual(cn_a.window, 26)
-        self.assertEqual(cn_a.cooldown, 10)
+        self.assertEqual(cn_a.cooldown, 3)
+        self.assertEqual(cn_a.gap_eps, 0.0)
         self.assertEqual(cn_a.slippage, momentum.DEFAULT_SLIPPAGE_CN)
 
         cn_b = find_leg("CN-B")
         self.assertEqual(cn_b.market, "CN")
         self.assertEqual(
             cn_b.symbols,
-            ("SZ.159941", "SZ.159949", "SH.510300", "SH.510880"),
+            ("SZ.159941", "SZ.159949", "SH.510300", "SH.518880"),
         )
-        self.assertEqual(cn_b.window, 21)
-        self.assertEqual(cn_b.cooldown, 16)
+        self.assertEqual(cn_b.window, 24)
+        self.assertEqual(cn_b.cooldown, 0)
+        self.assertEqual(cn_b.gap_eps, 0.34)
         self.assertEqual(cn_b.slippage, momentum.DEFAULT_SLIPPAGE_CN)
 
     def test_market_specs_have_staggered_notification_times(self):
@@ -177,8 +179,14 @@ class LiveSignalTest(unittest.TestCase):
         )
 
     def test_leg_decision_initial_none_and_cooldown(self):
-        leg = find_leg("US-A")
-        scores = {"US.QQQ": 0.8, "US.SPY": 0.6, "US.FXI": 0.5, "US.GLD": 0.2}
+        # CN-A 为 cooldown 机制（N=3）；US-A 现为 ε 机制（见 epsilon 测试）
+        leg = find_leg("CN-A")
+        scores = {
+            "SZ.159941": 0.8,
+            "SZ.159949": 0.6,
+            "SH.510300": 0.5,
+            "SH.518880": 0.2,
+        }
         today = date(2026, 8, 14)
 
         self.assertEqual(
@@ -187,22 +195,22 @@ class LiveSignalTest(unittest.TestCase):
         )
         self.assertEqual(
             momentum.live_leg_decision(
-                leg, scores, "US.QQQ", "2026-08-13", today
+                leg, scores, "SZ.159941", "2026-08-13", today
             ),
             "NONE",
         )
         self.assertEqual(
             momentum.live_leg_decision(
-                leg, scores, "US.SPY", "2026-08-13", today
+                leg, scores, "SH.510300", "2026-08-13", today
             ),
             "NONE",
         )
         cooldown_expired = momentum.live_leg_decision(
-            leg, scores, "US.SPY", "2026-07-31", today
+            leg, scores, "SH.510300", "2026-07-31", today
         )
         self.assertEqual(cooldown_expired, "ROTATE")
         cooldown_blocked = momentum.live_leg_decision(
-            leg, scores, "US.SPY", "2026-08-10", today
+            leg, scores, "SH.510300", "2026-08-12", today
         )
         self.assertEqual(cooldown_blocked, "NONE")
 
@@ -538,7 +546,6 @@ class LiveEndToEndTest(unittest.TestCase):
                 "SZ.159941",
                 "SZ.159949",
                 "SH.510300",
-                "SH.510880",
                 "SH.518880",
             },
         )
