@@ -222,7 +222,7 @@ class NotificationTest(unittest.TestCase):
         self.assertEqual(len(engine.emails), 1)
         self.assertIn("SELL", engine.webhooks[0])
         self.assertIn("滞后2天", engine.webhooks[0])
-        self.assertIn("仅提示", engine.webhooks[0])
+        self.assertIn("估算IOPV", engine.webhooks[0])
 
 
 class CliTest(unittest.TestCase):
