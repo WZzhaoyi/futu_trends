@@ -214,9 +214,11 @@ def run_l1(strategy, market: str, config) -> list[dict[str, Any]]:
                         continue
                     seen.add(row.stock_code)
                     if hasattr(strategy, "candidate_from_filter_row"):
-                        out.append(strategy.candidate_from_filter_row(row, market))
+                        candidate = strategy.candidate_from_filter_row(row, market)
                     else:
-                        out.append(_candidate_from_filter_row(row, market))
+                        candidate = _candidate_from_filter_row(row, market)
+                    if candidate is not None:
+                        out.append(candidate)
                 begin += len(rows)
                 if last_page or not rows or begin >= all_count:
                     break

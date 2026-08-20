@@ -157,14 +157,15 @@ kline --code US.AAPL --count 400 [--ktype K_DAY]
 
 ### 2) `screen` — 条件选股（策略条件 + L1 服务端首筛 + snapshot 排序 + 可选 L2）
 ```bash
-screen --market US|HK|A [--strategy sepa|growth_value|quality|deep_value] [--limit N] [--refine]
+screen --market US|HK|A [--strategy sepa|pr|growth_value|quality|deep_value] [--limit N] [--refine]
 ```
-- `--strategy`：默认 `sepa`；也可选 `growth_value`、`quality`、`deep_value`。
+- `--strategy`：默认 `sepa`；也可选 `pr`、`growth_value`、`quality`、`deep_value`。
 - `--limit`：按 `snapshot_score` 排序后只返回前 N 只。
 - `--no-snapshot`：只跑 `get_stock_filter`，不做 snapshot 富集/排序。
 - `--refine`：对候选运行 yfinance L2 精算；**定义了 L2 门槛的策略会在此步直接按门槛过滤**：
   - `quality` / `growth_value`：Piotroski 式质量分 ≥ 4；
   - `deep_value`：剔除报表币种≠交易币种的美股中概/ADR，并仅保留 `市值 < NCAV`(流动资产−总负债) 的 Graham 烟蒂；
+  - `pr`：无 L2 门槛，仅附注不过滤；
   - `sepa`：无 L2 门槛，仅注释不过滤。
   仅精算前 `--refine-limit` 只，未精算的会被剔除（打 warning），需要全量请调大该值。
 - `--refine-limit`：最多精算前多少只，默认 30；不截断最终返回列表。
@@ -189,6 +190,11 @@ screen --market US|HK|A [--strategy sepa|growth_value|quality|deep_value] [--lim
 - **sepa** — Minervini 趋势模板：价 > EMA50 > EMA150 > EMA200（日K）；
   距52周低点 ≥ +30%、距52周高点 ≥ -30%；市值 ≥ 150亿；
   EPS 增速 ≥ 20%、营收增速 ≥ 15%。排序=成交额。
+- **pr** — 市赚率 PR=PE/ROE/100，PR≤0.5（**筛选全部在 L1 完成**）：市值 ≥ 100亿（本位币）、PB>0、PE_TTM∈(0,30]；
+  ROE≥8%、ROA_TTM≥1%、净利润>0、经营现金流TTM>0、资产负债率≤65%；
+  权益乘数∈[1,4]（净资产≥总资产25%，L1 剔除高杠杆/低基数的假高 ROE，银行/保险等多在此出局）；
+  Python 精确算 PR≤0.5；`cash_coverage`(经营现金流TTM/净利润) 作为一次性收益提示字段（不硬过滤）。
+  停牌股由快照阶段剔除。排序=PR 主导+账面折价+股息+流动性。
 - **growth_value** — 成长价值：市值下限按市场 US ≥ $20亿 / HK ≥ HK$50亿 / A ≥ ¥50亿；PE_TTM ∈ (0, 35]、PB ∈ (0, 5]；
   ROE ≥ 8%；营收增速 ≥ 0、净利增速 ≥ 0；经营现金流 TTM ≥ 0；资产负债率 ≤ 60%。
   排序=ROE+盈利收益率+账面折价+股息+流动性加权。
