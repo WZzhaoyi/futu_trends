@@ -388,6 +388,7 @@ def simulate(
     symbols: list[str],
     params: SimParams = SimParams(),
     benchmark_symbol: str = DEFAULT_BENCHMARK_SYMBOL,
+    rebalance: bool = True,
 ) -> tuple[pd.DataFrame, list[dict], dict[str, Any]]:
     """向量化模拟：全仓持有当日分数第一的标的（现金符号登顶时持现金），
     支持冷静期 N / 分差阈值 ε 防抖（互斥，不可同时设定）。
@@ -395,6 +396,9 @@ def simulate(
     成交价假设（唯一口径）：D 日收盘信号 → D+1 开盘市价成交，无条件按
     open_[t,i] 撮合（仅停牌日 open<=0 不成交并顺延）。开盘价是收盘信号后
     唯一稳定可实现的价格，不使用任何日内的限价/极值假设。
+
+    rebalance=False：仅换标（或现金↔资产）时交易；忽略同标的股数微调
+    （整数取整的零钱再投资），余钱留在现金，换标时重新全仓投入。
 
     histories: {symbol: OHLCV DataFrame}，须含 benchmark_symbol（基准可为全文
     历史、无需参与对齐，_statistics 会自行 reindex 到策略日期）。
@@ -488,7 +492,8 @@ def simulate(
                         blocked = scores[t, selected] - scores[t, cur_hold] <= params.gap_eps
                     else:
                         blocked = (dates[t] - last_rotation_date).days <= params.cooldown
-                if not blocked:
+                same_hold = cur_hold is not None and new_hold == cur_hold
+                if not blocked and not (same_hold and not rebalance):
                     targets = new_targets
                     orders = []
                     for i in range(k):
