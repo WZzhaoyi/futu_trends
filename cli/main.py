@@ -80,7 +80,6 @@ import futu_fundamental_screener as fs  # noqa: E402
 import deep_value_screener as deep_value_strategy  # noqa: E402
 import growth_value_screener as growth_value_strategy  # noqa: E402
 import indicator_service as isvc  # noqa: E402
-import quality_screener as quality_strategy  # noqa: E402
 import pr_screener as pr_strategy  # noqa: E402
 import sepa_screener as sepa_strategy  # noqa: E402
 
@@ -97,7 +96,6 @@ _SCREEN_STRATEGIES = {
     "sepa": sepa_strategy,
     "pr": pr_strategy,
     "growth_value": growth_value_strategy,
-    "quality": quality_strategy,
     "deep_value": deep_value_strategy,
 }
 

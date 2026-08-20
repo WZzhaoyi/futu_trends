@@ -92,7 +92,8 @@ def accumulate_filter(field, min_: float | None = None, max_: float | None = Non
 
 
 def financial_filter(field, min_: float | None = None, max_: float | None = None,
-                     quarter=ft.FinancialQuarter.ANNUAL, sort=None):
+                     quarter=ft.FinancialQuarter.ANNUAL, sort=None,
+                     is_no_filter: bool = False):
     f = ft.FinancialFilter()
     f.stock_field = field
     f.quarter = quarter
@@ -102,7 +103,7 @@ def financial_filter(field, min_: float | None = None, max_: float | None = None
         f.filter_max = max_
     if sort is not None:
         f.sort = sort
-    f.is_no_filter = False
+    f.is_no_filter = is_no_filter
     return f
 
 

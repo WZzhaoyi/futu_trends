@@ -2,7 +2,7 @@
 name: futu-trends-cli
 description: >
   futu_trends 统一功能导出与本地进程管理 CLI 的调用契约。行情命令只读并输出严格 JSON 到 stdout。
-  当需要读取股票 K 线、做条件选股（SEPA/quality/growth_value/deep_value）、或计算单只标的的技术指标与
+  当需要读取股票 K 线、做条件选股（SEPA/PR/growth_value/deep_value）、或计算单只标的的技术指标与
   趋势信号（MACD/KD/RSI/trend-template/RS/VCP），以及管理 order-engine / signal-api /
   csi-flow / etf-premium / momentum-rotation PM2 进程时调用。
 ---
@@ -157,13 +157,13 @@ kline --code US.AAPL --count 400 [--ktype K_DAY]
 
 ### 2) `screen` — 条件选股（策略条件 + L1 服务端首筛 + snapshot 排序 + 可选 L2）
 ```bash
-screen --market US|HK|A [--strategy sepa|pr|growth_value|quality|deep_value] [--limit N] [--refine]
+screen --market US|HK|A [--strategy sepa|pr|growth_value|deep_value] [--limit N] [--refine]
 ```
-- `--strategy`：默认 `sepa`；也可选 `pr`、`growth_value`、`quality`、`deep_value`。
+- `--strategy`：默认 `sepa`；也可选 `pr`、`growth_value`、`deep_value`。
 - `--limit`：按 `snapshot_score` 排序后只返回前 N 只。
 - `--no-snapshot`：只跑 `get_stock_filter`，不做 snapshot 富集/排序。
 - `--refine`：对候选运行 yfinance L2 精算；**定义了 L2 门槛的策略会在此步直接按门槛过滤**：
-  - `quality` / `growth_value`：Piotroski 式质量分 ≥ 4；
+  - `growth_value`：Piotroski 式质量分 ≥ 4；
   - `deep_value`：剔除报表币种≠交易币种的美股中概/ADR，并仅保留 `市值 < NCAV`(流动资产−总负债) 的 Graham 烟蒂；
   - `pr`：无 L2 门槛，仅附注不过滤；
   - `sepa`：无 L2 门槛，仅注释不过滤。
@@ -198,9 +198,6 @@ screen --market US|HK|A [--strategy sepa|pr|growth_value|quality|deep_value] [--
 - **growth_value** — 成长价值：市值下限按市场 US ≥ $20亿 / HK ≥ HK$50亿 / A ≥ ¥50亿；PE_TTM ∈ (0, 35]、PB ∈ (0, 5]；
   ROE ≥ 8%；营收增速 ≥ 0、净利增速 ≥ 0；经营现金流 TTM ≥ 0；资产负债率 ≤ 60%。
   排序=ROE+盈利收益率+账面折价+股息+流动性加权。
-- **quality** — 质量：市值下限按市场 US ≥ $20亿 / HK ≥ HK$50亿 / A ≥ ¥50亿；ROE ≥ 8%、ROA_TTM ≥ 1%；净利润 ≥ 0；
-  经营现金流 TTM ≥ 0；毛利率 ≥ 0；资产负债率 ≤ 60%。
-  排序=ROE 主导的质量/收益/流动性加权。
 - **deep_value** — 深度价值/烟蒂：市值 ≥ 10亿；PE_TTM ∈ (0, 13]、PB ∈ (0, 1]；
   净利润 ≥ 0；资产负债率 ≤ 50%；流动比率 ≥ 1.5。排序=账面折价主导；
   `--refine` 精算 NCAV=流动资产−总负债、净现金等，并剔除中概/ADR、只留 `市值 < NCAV`。
@@ -281,7 +278,7 @@ MOMENTUM_ROTATION_PYTHON=<ENV_PYTHON> <PYTHON> <REPO>/cli/main.py pm2 momentum-r
 ## L2 信号块
 
 `signals` 的 L2 是趋势模板/RS/VCP 信号；`screen --refine` 的 L2 则由策略决定：
-`deep_value` 输出现金/负债精算，`growth_value` / `quality` 默认输出 yfinance 质量与
+`deep_value` 输出现金/负债精算，`growth_value` 默认输出 yfinance 质量与
 Piotroski-like 精算。
 
 ### `signals` L2 趋势信号

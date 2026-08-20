@@ -31,6 +31,49 @@ if TYPE_CHECKING:
 
 FUTU_MARKET_PREFIXES = ("US", "HK", "SH", "SZ")
 
+CONSTITUENT_ALIASES = {
+    "A500": "SH.000510",
+    "HS300": "SH.000300",
+    "ZZ500": "SH.000905",
+    "KC50": "SH.000688",
+    "HSI": "HK.800000",
+    "HKTECH": "HK.800700",
+    "SP500": "US..SPX",
+    "NASDAQ100": "US..NDX",
+    "GGT": "HK.LIST1922",
+    "HK_ALL": "HK.LIST1910",
+}
+
+
+def get_constituents(
+    index: str,
+    host: str = "127.0.0.1",
+    port: int = 11111,
+    quote_ctx=None,
+) -> list[str]:
+    """Return Futu codes for an index or plate's constituents.
+
+    ``index`` accepts either a Futu index/plate code or a key from
+    ``CONSTITUENT_ALIASES``. A supplied quote context is reused and left open.
+    """
+    index_code = CONSTITUENT_ALIASES.get(index.strip().upper(), index.strip())
+    owns_context = quote_ctx is None
+    if owns_context:
+        quote_ctx = ft.OpenQuoteContext(host=host, port=port)
+
+    try:
+        ret, data = quote_ctx.get_plate_stock(index_code)
+    finally:
+        if owns_context:
+            quote_ctx.close()
+
+    if ret != ft.RET_OK:
+        raise RuntimeError(f"Failed to get constituents for {index_code}: {data}")
+    if not isinstance(data, pd.DataFrame) or "code" not in data.columns:
+        raise RuntimeError(f"Invalid constituent response for {index_code}")
+
+    return data["code"].dropna().astype(str).tolist()
+
 
 def get_kline_seconds(k_type:str): #根据K_1M,K_5M,K_15M,K_30M,K_60M时间含义输出秒数
     if k_type == 'K_DAY':

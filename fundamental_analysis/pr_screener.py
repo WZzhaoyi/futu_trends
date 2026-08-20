@@ -56,6 +56,8 @@ PE_MAX = 30.0
 ROE_MIN = 8.0
 ROA_MIN = 1.0
 DEBT_ASSET_MAX = 65.0
+# Futu 的区间下限是闭区间；用极小正数表达严格 >0。
+FINANCIAL_POSITIVE_MIN = 1e-12
 
 # ---- PR 与假高 ROE 剔除 ----
 PR_MAX = 0.5
@@ -76,9 +78,11 @@ def build_filters(market: str, ft):
         financial_filter(sf.ROA_TTM, ROA_MIN, quarter=q),
         financial_filter(sf.EQUITY_MULTIPLIER,
                          EQUITY_MULTIPLIER_MIN, EQUITY_MULTIPLIER_MAX, quarter=q),
-        financial_filter(sf.NET_PROFIT, 0, quarter=q),
-        financial_filter(sf.OPERATING_CASH_FLOW_TTM, 0, quarter=q),
+        financial_filter(sf.NET_PROFIT, FINANCIAL_POSITIVE_MIN, quarter=q),
+        financial_filter(sf.OPERATING_CASH_FLOW_TTM, FINANCIAL_POSITIVE_MIN, quarter=q),
         financial_filter(sf.DEBT_ASSET_RATE, max_=DEBT_ASSET_MAX, quarter=q),
+        # 仅请求返回字段，不参与服务端筛选。
+        financial_filter(sf.NET_PROFIX_GROWTH, quarter=q, is_no_filter=True),
     ]
 
 
@@ -105,13 +109,17 @@ def candidate_from_filter_row(row, market):
     cand["equity_multiplier"] = round(equity_multiplier, 4)
 
     # 一次性/纸面利润提示：经营现金流/净利润（不硬过滤，详见模块 docstring）
-    cand["cash_coverage"] = round(ratio(cand.get("operating_cash_flow_ttm"),
-                                        cand.get("net_profit")), 4)
+    cash_coverage = ratio(cand.get("operating_cash_flow_ttm"), cand.get("net_profit"))
+    cand["cash_coverage"] = (
+        round(cash_coverage, 4) if cash_coverage is not None else None
+    )
 
     # 盈利增速修正 PR（仅提示，不参与过滤）
     growth = num(cand.get("net_profix_growth"))
     cand["pr_growth_adjusted"] = (
-        round(pr / (1 + growth / 100), 4) if growth is not None else None
+        round(pr / (1 + growth / 100), 4)
+        if growth is not None and growth > -100
+        else None
     )
     return cand
 
