@@ -15,6 +15,7 @@ MODULE_PATH = (
     / "market_analysis"
     / "csi_flow_timing.py"
 )
+sys.path.insert(0, str(MODULE_PATH.parent))
 SPEC = importlib.util.spec_from_file_location("csi_flow_timing_tested", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 timing = importlib.util.module_from_spec(SPEC)
@@ -680,11 +681,11 @@ class LiveRuntimeTest(unittest.TestCase):
     def test_runtime_lock_rejects_a_second_live_instance(self):
         with tempfile.TemporaryDirectory() as raw_dir:
             path = Path(raw_dir) / "live.lock"
-            with timing.RuntimeFileLock(path):
+            with timing.runtime_file_lock(path):
                 with self.assertRaisesRegex(RuntimeError, "已有 live 实例"):
-                    with timing.RuntimeFileLock(path):
+                    with timing.runtime_file_lock(path):
                         self.fail("second lock unexpectedly acquired")
-            with timing.RuntimeFileLock(path):
+            with timing.runtime_file_lock(path):
                 pass
 
     def test_market_month_uses_china_timezone(self):

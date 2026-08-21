@@ -37,6 +37,7 @@ from futu_group import sync_futu_group
 from .webhook import WebhookNotifier, HookResult
 
 logger = logging.getLogger(__name__)
+NOTIFICATION_NETWORK_TIMEOUT = 10.0
 
 
 def _column_letter_to_index(column_letter):
@@ -222,12 +223,16 @@ class NotificationEngine:
         message['Subject'] = f"Trends - {datetime.today().strftime('%Y-%m-%d')} - {subject}"
 
         try:
-            smtpObj = smtplib.SMTP_SSL(self.mail_host, self.mail_port) #建立smtp连接，ssl 465端口
+            smtpObj = smtplib.SMTP_SSL(
+                self.mail_host,
+                self.mail_port,
+                timeout=NOTIFICATION_NETWORK_TIMEOUT,
+            )
             smtpObj.login(self.sender, self.mail_pass)  #登陆
             smtpObj.sendmail(self.sender, self.receivers, message.as_string())  #发送
             smtpObj.quit()
             logger.info('Email Sent: %s', self.receivers)
-        except (gaierror, ConnectionRefusedError):
+        except (gaierror, ConnectionRefusedError, TimeoutError):
             logger.error('Failed to connect to the server. Bad connection settings?')
         except smtplib.SMTPServerDisconnected:
             logger.error('Failed to connect to the server. Wrong user/password?')
@@ -253,7 +258,13 @@ class NotificationEngine:
         }
         url = f'https://api.telegram.org/bot{self.TELEGRAM_BOT_TOKEN}/sendMessage'
         try:
-            self.SESSION.post(url, headers=headers, json=data, proxies=self.PROXIES)
+            self.SESSION.post(
+                url,
+                headers=headers,
+                json=data,
+                proxies=self.PROXIES,
+                timeout=NOTIFICATION_NETWORK_TIMEOUT,
+            )
             logger.info('Telegram Sent: %s', self.TELEGRAM_CHAT_ID)
         except:
             logger.error('网络代理错误，请检查确认后关闭本程序重试')
@@ -270,7 +281,12 @@ class NotificationEngine:
         url = f'https://api.telegram.org/bot{self.TELEGRAM_BOT_TOKEN}/sendPhoto'
         data = dict(chat_id=f"{self.TELEGRAM_CHAT_ID}&", photo=img_url)
 
-        self.SESSION.post(url, data=data, proxies=self.PROXIES)
+        self.SESSION.post(
+            url,
+            data=data,
+            proxies=self.PROXIES,
+            timeout=NOTIFICATION_NETWORK_TIMEOUT,
+        )
         self.plog(f'Telegram Sent: {self.TELEGRAM_CHAT_ID}')
 
     def send_telegram_photos(self, pic_urls):
@@ -290,7 +306,12 @@ class NotificationEngine:
         for pic in pic_urls:
             params['media'].append({'type': 'photo', 'media': pic})
         params['media'] = json.dumps(params['media'])
-        result = self.SESSION.post(url, data=params, proxies=self.PROXIES)
+        result = self.SESSION.post(
+            url,
+            data=params,
+            proxies=self.PROXIES,
+            timeout=NOTIFICATION_NETWORK_TIMEOUT,
+        )
         if result.status_code != 200: # 如果分组发送失败 则单独发送图片
             for pic in pic_urls:
                 self.send_telegram_photo(pic)

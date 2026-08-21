@@ -9,7 +9,7 @@
 //       周六触发覆盖纽约周五收盘；周末/假期由脚本交易日检查跳过（发 IDLE，不通知）
 //
 // autorestart: false —— 脚本评估完即退出，PM2 保持停止直到下次 cron_restart 拉起；
-// 两个 app 共享 runtime 目录（state-live.json 持有 4 腿状态）。
+// 两个 app 共享 runtime 目录，但各自持有分市场的状态文件和锁。
 
 const crypto = require("node:crypto");
 const fs = require("node:fs");

@@ -25,7 +25,6 @@ import json
 import math
 import os
 import queue
-import signal
 import statistics
 import sys
 import threading
@@ -35,6 +34,14 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Optional
+
+from live_runtime import (
+    BackgroundWorker,
+    close_futu_context,
+    graceful_stop_event,
+    runtime_file_lock,
+    write_json_atomic,
+)
 
 try:
     import numpy as np
@@ -191,46 +198,6 @@ class LiveRuntimePaths:
         self.thresholds_dir.mkdir(parents=True, exist_ok=True)
 
 
-@contextmanager
-def runtime_file_lock(path: Path) -> Iterator[None]:
-    """Hold one OS-released lock for the lifetime of a live instance."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+b") as handle:
-        try:
-            if os.name == "nt":
-                import msvcrt
-
-                handle.seek(0, os.SEEK_END)
-                if handle.tell() == 0:
-                    handle.write(b"\0")
-                    handle.flush()
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except (OSError, BlockingIOError) as exc:
-            raise RuntimeError(
-                f"已有 live 实例占用运行目录: {path.parent}"
-            ) from exc
-        try:
-            yield
-        finally:
-            if os.name == "nt":
-                import msvcrt
-
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-
-RuntimeFileLock = runtime_file_lock
-
-
 def eprint(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
@@ -245,33 +212,10 @@ def managed_futu_context(
     """Close one Futu context on every Python exit path without masking errors."""
     context = factory(host=host, port=port)
 
-    def close() -> None:
-        try:
-            context.close()
-        except Exception as exc:
-            eprint(f"警告: 关闭 Futu context 失败: {exc}")
-
     try:
         yield context
     finally:
-        close()
-
-
-@contextmanager
-def graceful_stop_event() -> Iterator[threading.Event]:
-    """Convert SIGINT/SIGTERM into a cooperative stop so contexts can close."""
-    stopped = threading.Event()
-
-    def stop_handler(_signum: int, _frame: Any) -> None:
-        stopped.set()
-
-    old_sigint = signal.signal(signal.SIGINT, stop_handler)
-    old_sigterm = signal.signal(signal.SIGTERM, stop_handler)
-    try:
-        yield stopped
-    finally:
-        signal.signal(signal.SIGINT, old_sigint)
-        signal.signal(signal.SIGTERM, old_sigterm)
+        close_futu_context(context)
 
 
 def sha256_file(path: Path) -> str:
@@ -292,16 +236,6 @@ def sha256_bars(bars: list[Bar]) -> str:
         )
         digest.update(row.encode("utf-8"))
     return digest.hexdigest()
-
-
-def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
 
 
 def normalize_symbol(value: str) -> str:
@@ -2164,16 +2098,13 @@ class LiveEventNotifier:
     ) -> None:
         self.engine = notification_engine
         self.notify_lifecycle = notify_lifecycle
-        self.queue: queue.Queue[Optional[dict[str, Any]]] = queue.Queue(
-            maxsize=maxsize
-        )
         self.last_enqueued: dict[str, float] = {}
-        self.thread = threading.Thread(
-            target=self._run,
+        self.worker = BackgroundWorker[dict[str, Any]](
+            self._deliver,
             name="m1-live-notifier",
-            daemon=True,
+            maxsize=maxsize,
+            on_error=lambda exc: eprint(f"通知处理失败: {exc}"),
         )
-        self.thread.start()
 
     def notify(self, event: dict[str, Any]) -> None:
         event_type = event.get("type")
@@ -2193,9 +2124,7 @@ class LiveEventNotifier:
         if now - self.last_enqueued.get(key, -math.inf) < 300:
             return
         self.last_enqueued[key] = now
-        try:
-            self.queue.put_nowait(dict(event))
-        except queue.Full:
+        if not self.worker.submit(dict(event)):
             eprint(f"通知队列已满，丢弃事件: {key}")
 
     def format_event(self, event: dict[str, Any]) -> tuple[str, str]:
@@ -2235,18 +2164,9 @@ class LiveEventNotifier:
             )
         return subject, message
 
-    def _run(self) -> None:
-        while True:
-            event = self.queue.get()
-            if event is None:
-                self.queue.task_done()
-                return
-            try:
-                subject, message = self.format_event(event)
-                self._send(subject, message)
-            except Exception as exc:
-                eprint(f"通知处理失败: {exc}")
-            self.queue.task_done()
+    def _deliver(self, event: dict[str, Any]) -> None:
+        subject, message = self.format_event(event)
+        self._send(subject, message)
 
     def _send(self, subject: str, message: str) -> None:
         senders = (
@@ -2263,12 +2183,8 @@ class LiveEventNotifier:
                 eprint(f"通知发送失败: {exc}")
 
     def close(self, timeout: float = 10.0) -> None:
-        try:
-            self.queue.put_nowait(None)
-        except queue.Full:
+        if not self.worker.close(timeout):
             eprint("通知队列未清空，退出时无法等待全部通知")
-            return
-        self.thread.join(timeout=timeout)
 
 
 def build_live_notifier(
@@ -2837,7 +2753,7 @@ def run_live(args: argparse.Namespace) -> int:
     try:
         runtime = LiveRuntimePaths.from_argument(args.runtime_dir)
         runtime.prepare()
-        with graceful_stop_event() as stopped, RuntimeFileLock(
+        with graceful_stop_event() as stopped, runtime_file_lock(
             runtime.lock_file
         ):
             running_script_sha256 = sha256_file(Path(__file__).resolve())

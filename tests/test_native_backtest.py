@@ -2,6 +2,7 @@ import importlib.util
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -12,6 +13,7 @@ MODULE_PATH = (
     / "market_analysis"
     / "momentum_rotation_strategy.py"
 )
+sys.path.insert(0, str(MODULE_PATH.parent))
 SPEC = importlib.util.spec_from_file_location("momentum_backtest_tested", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 momentum = importlib.util.module_from_spec(SPEC)
@@ -43,6 +45,52 @@ def _fake_histories(n_days: int = 40) -> dict[str, pd.DataFrame]:
 
 
 class MomentumOpenFillTest(unittest.TestCase):
+    def test_grid_worker_uses_symbol_changes_without_share_rebalancing(self):
+        frame = pd.DataFrame({"trade_count": [0]})
+        stats = {
+            "total_return": 1.0,
+            "max_ddpercent": -1.0,
+            "sortino_ratio": 1.0,
+            "calmar_ratio": 1.0,
+            "sharpe_ratio": 1.0,
+            "total_commission": 0.0,
+        }
+        params = momentum.SimParams(window=10, cooldown=3)
+        with patch.object(
+            momentum,
+            "simulate",
+            return_value=(frame, [], stats),
+        ) as simulate:
+            momentum._grid_worker(
+                {
+                    "histories": {},
+                    "symbols": ["A", "B"],
+                    "params": params,
+                    "benchmark": "B",
+                    "uname": "A B",
+                }
+            )
+
+        self.assertFalse(simulate.call_args.kwargs["rebalance"])
+
+    def test_formal_backtest_uses_the_same_no_rebalance_policy(self):
+        histories = _fake_histories()
+        config = momentum.BacktestConfig(
+            symbols=["A", "B"],
+            start="2026-01-01",
+            end="2026-03-01",
+            window=10,
+        )
+        result_frame = pd.DataFrame({"trade_count": [0]})
+        with patch.object(
+            momentum,
+            "simulate",
+            return_value=(result_frame, [], {}),
+        ) as simulate:
+            momentum._simulate_config(config, histories)
+
+        self.assertFalse(simulate.call_args.kwargs["rebalance"])
+
     def test_market_open_fills_at_next_day_open(self):
         histories = _fake_histories()
         frame, trades, stats = momentum.simulate(

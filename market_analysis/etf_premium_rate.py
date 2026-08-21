@@ -18,17 +18,21 @@ import hashlib
 import json
 import math
 import os
-import queue
-import signal
 import sys
-import threading
 import time
-from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, time as datetime_time, timedelta
 from pathlib import Path
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable, Optional
 from zoneinfo import ZoneInfo
+
+from live_runtime import (
+    BackgroundWorker,
+    close_futu_context,
+    graceful_stop_event as stop_event,
+    runtime_file_lock,
+    write_json_atomic,
+)
 
 import numpy as np
 import pandas as pd
@@ -89,59 +93,6 @@ class LiveRuntimePaths:
         self.root.mkdir(parents=True, exist_ok=True)
 
 
-class RuntimeFileLock:
-    """防止同一运行目录启动多个 live 实例；进程退出时由 OS 释放。"""
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.handle: Any = None
-
-    def __enter__(self) -> "RuntimeFileLock":
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.handle = self.path.open("a+b")
-        try:
-            if os.name == "nt":
-                import msvcrt
-
-                self.handle.seek(0, os.SEEK_END)
-                if self.handle.tell() == 0:
-                    self.handle.write(b"\0")
-                    self.handle.flush()
-                self.handle.seek(0)
-                msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(
-                    self.handle.fileno(),
-                    fcntl.LOCK_EX | fcntl.LOCK_NB,
-                )
-        except (OSError, BlockingIOError) as exc:
-            self.handle.close()
-            self.handle = None
-            raise RuntimeError(
-                f"已有 live 实例占用运行目录: {self.path.parent}"
-            ) from exc
-        return self
-
-    def __exit__(self, _exc_type: Any, _exc: Any, _tb: Any) -> None:
-        if self.handle is None:
-            return
-        try:
-            if os.name == "nt":
-                import msvcrt
-
-                self.handle.seek(0)
-                msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
-        finally:
-            self.handle.close()
-            self.handle = None
-
-
 def eprint(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
@@ -165,16 +116,6 @@ def retry(operation: Callable[[], Any], attempts: int = 3) -> Any:
                 time.sleep(2**attempt)
     assert last_error is not None
     raise last_error
-
-
-def write_json_atomic(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
 
 
 def write_csv_atomic(path: Path, frame: pd.DataFrame) -> None:
@@ -380,18 +321,30 @@ def build_signal_frame(
     return frame.dropna(subset=["premium", "ret"]).reset_index(drop=True)
 
 
+def decide_position(
+    current_position: str,
+    premium: float,
+    params: StrategyParams,
+) -> tuple[str, str]:
+    """Return one hysteresis transition shared by backtest and live."""
+    if premium > params.sell_threshold and current_position != "low":
+        return "low", "SELL"
+    if premium < params.buy_threshold and current_position != "base":
+        return "base", "BUY"
+    return current_position, "NONE"
+
+
 def positions_for_premium(
     premiums: np.ndarray,
     params: StrategyParams,
 ) -> np.ndarray:
-    current = params.base_position
+    current = "base"
     positions = np.empty(len(premiums), dtype=float)
     for index, premium in enumerate(premiums):
-        if premium > params.sell_threshold:
-            current = params.low_position
-        elif premium < params.buy_threshold:
-            current = params.base_position
-        positions[index] = current
+        current, _action = decide_position(current, float(premium), params)
+        positions[index] = (
+            params.base_position if current == "base" else params.low_position
+        )
     return positions
 
 
@@ -592,11 +545,7 @@ def apply_live_signal(
     t1_premium: float,
     params: StrategyParams,
 ) -> tuple[str, str]:
-    if t1_premium > params.sell_threshold and current_position != "low":
-        return "low", "SELL"
-    if t1_premium < params.buy_threshold and current_position != "base":
-        return "base", "BUY"
-    return current_position, "NONE"
+    return decide_position(current_position, t1_premium, params)
 
 
 class LiveNotifier:
@@ -605,15 +554,12 @@ class LiveNotifier:
     def __init__(self, engine: Any, maxsize: int = 100) -> None:
         self.engine = engine
         self.recent: dict[str, float] = {}
-        self.queue: queue.Queue[Optional[dict[str, Any]]] = queue.Queue(
-            maxsize=maxsize
-        )
-        self.thread = threading.Thread(
-            target=self._run,
+        self.worker = BackgroundWorker[dict[str, Any]](
+            self._deliver,
             name="etf-premium-notifier",
-            daemon=True,
+            maxsize=maxsize,
+            on_error=lambda exc: eprint(f"通知处理失败: {exc}"),
         )
-        self.thread.start()
 
     def notify(self, event: dict[str, Any]) -> None:
         key = "|".join(
@@ -624,9 +570,7 @@ class LiveNotifier:
         if now - self.recent.get(key, -1e12) < 300:
             return
         self.recent[key] = now
-        try:
-            self.queue.put_nowait(dict(event))
-        except queue.Full:
+        if not self.worker.submit(dict(event)):
             eprint(f"通知队列已满，丢弃事件: {key}")
 
     def format_event(self, event: dict[str, Any]) -> tuple[str, str]:
@@ -653,18 +597,9 @@ class LiveNotifier:
             message = f"[{event.get('symbol', '')}] {event['type']}\n{event.get('message', '')}"
         return subject, message
 
-    def _run(self) -> None:
-        while True:
-            event = self.queue.get()
-            try:
-                if event is None:
-                    return
-                subject, message = self.format_event(event)
-                self._send(subject, message)
-            except Exception as exc:
-                eprint(f"通知处理失败: {exc}")
-            finally:
-                self.queue.task_done()
+    def _deliver(self, event: dict[str, Any]) -> None:
+        subject, message = self.format_event(event)
+        self._send(subject, message)
 
     def _send(self, subject: str, message: str) -> None:
         for send in (
@@ -680,12 +615,8 @@ class LiveNotifier:
                 eprint(f"通知发送失败: {exc}")
 
     def close(self, timeout: float = 10.0) -> None:
-        try:
-            self.queue.put_nowait(None)
-        except queue.Full:
+        if not self.worker.close(timeout):
             eprint("通知队列未清空，退出时无法等待全部通知")
-            return
-        self.thread.join(timeout=timeout)
 
 
 def build_notifier(config_path: Optional[str]) -> Optional[LiveNotifier]:
@@ -709,20 +640,6 @@ def live_connection(args: argparse.Namespace) -> tuple[str, int]:
         host = host or config.get("CONFIG", "FUTU_HOST", fallback="127.0.0.1")
         port = port or config.getint("CONFIG", "FUTU_PORT", fallback=11111)
     return host or "127.0.0.1", port or 11111
-
-
-@contextmanager
-def stop_event() -> Iterator[threading.Event]:
-    stopped = threading.Event()
-    old_handlers = {
-        sig: signal.signal(sig, lambda *_: stopped.set())
-        for sig in (signal.SIGINT, signal.SIGTERM)
-    }
-    try:
-        yield stopped
-    finally:
-        for sig, handler in old_handlers.items():
-            signal.signal(sig, handler)
 
 
 def latest_prior_nav(
@@ -782,15 +699,6 @@ def parse_futu_snapshot(row: Any) -> dict[str, Any]:
     }
 
 
-def close_futu_context(context: Any) -> None:
-    if context is None:
-        return
-    try:
-        context.close()
-    except Exception as exc:
-        eprint(f"警告: 关闭 Futu context 失败: {exc}")
-
-
 def run_live(args: argparse.Namespace) -> int:
     try:
         from futu import OpenQuoteContext, RET_OK
@@ -819,7 +727,7 @@ def run_live(args: argparse.Namespace) -> int:
     running_script_hash = sha256_file(Path(__file__).resolve())
     try:
         with stop_event() as stopped:
-            with RuntimeFileLock(runtime.lock_file):
+            with runtime_file_lock(runtime.lock_file):
                 while not stopped.is_set():
                     now_monotonic = time.monotonic()
                     if args.duration and now_monotonic - started >= args.duration:

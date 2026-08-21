@@ -5,7 +5,7 @@ import tempfile
 import types
 import unittest
 from contextlib import redirect_stdout
-from datetime import date, datetime, time
+from datetime import date, time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,6 +18,7 @@ MODULE_PATH = (
     / "market_analysis"
     / "momentum_rotation_strategy.py"
 )
+sys.path.insert(0, str(MODULE_PATH.parent))
 SPEC = importlib.util.spec_from_file_location(
     "momentum_rotation_strategy_tested",
     MODULE_PATH,
@@ -33,6 +34,10 @@ def find_leg(name: str):
         if leg.name == name:
             return leg
     raise AssertionError(f"LIVE_LEGS 缺少 {name}")
+
+
+def market_legs(market: str):
+    return tuple(leg for leg in momentum.LIVE_LEGS if leg.market == market)
 
 
 class LiveConfigurationTest(unittest.TestCase):
@@ -300,6 +305,38 @@ class LiveSignalTest(unittest.TestCase):
         )
         self.assertEqual(reentry_from_cash_not_blocked, "BUY")
 
+    def test_shared_decision_keeps_current_holding_when_rotation_is_blocked(self):
+        decision = momentum.decide_rotation(
+            {
+                "SZ.159941": 0.8,
+                "SH.510300": 0.5,
+            },
+            previous_state_symbol="SH.510300",
+            last_change_date=date(2026, 8, 12),
+            decision_date=date(2026, 8, 14),
+            cooldown=3,
+        )
+
+        self.assertEqual(decision.action, "NONE")
+        self.assertTrue(decision.blocked)
+        self.assertEqual(decision.selected_symbol, "SZ.159941")
+        self.assertEqual(decision.target_symbol, "SH.510300")
+
+    def test_shared_decision_allows_first_asset_rotation_without_anchor(self):
+        decision = momentum.decide_rotation(
+            {
+                "SZ.159941": 0.8,
+                "SH.510300": 0.5,
+            },
+            previous_state_symbol="SH.510300",
+            decision_date=date(2026, 8, 14),
+            cooldown=3,
+        )
+
+        self.assertEqual(decision.action, "ROTATE")
+        self.assertFalse(decision.blocked)
+        self.assertEqual(decision.target_symbol, "SZ.159941")
+
     def test_futu_trading_calendar_distinguishes_holiday(self):
         trading = types.SimpleNamespace(
             request_trading_days=lambda **_kwargs: (
@@ -360,13 +397,30 @@ class LiveRuntimeTest(unittest.TestCase):
 
     def test_runtime_directory_must_be_absolute(self):
         with self.assertRaisesRegex(ValueError, "绝对路径"):
-            momentum.LiveRuntimePaths.from_argument("relative/runtime", "live")
+            momentum.LiveRuntimePaths.from_argument("relative/runtime", "CN")
 
-    def test_runtime_uses_single_state_and_lock_files(self):
-        runtime = momentum.LiveRuntimePaths.from_argument("/tmp/runtime", "live")
+    def test_runtime_uses_market_owned_state_and_lock_files(self):
+        cn_runtime = momentum.LiveRuntimePaths.from_argument("/tmp/runtime", "CN")
+        us_runtime = momentum.LiveRuntimePaths.from_argument("/tmp/runtime", "US")
 
-        self.assertEqual(runtime.state_file.name, "state-live.json")
-        self.assertEqual(runtime.lock_file.name, "live.lock")
+        self.assertEqual(cn_runtime.state_file.name, "state-live-cn.json")
+        self.assertEqual(cn_runtime.lock_file.name, "live-cn.lock")
+        self.assertEqual(us_runtime.state_file.name, "state-live-us.json")
+        self.assertEqual(us_runtime.lock_file.name, "live-us.lock")
+
+    def test_state_drops_legacy_last_evaluation_date(self):
+        with tempfile.TemporaryDirectory() as raw_dir:
+            path = Path(raw_dir) / "state.json"
+            state = momentum.LiveState(path, market_legs("CN"))
+            state.leg_state("CN-A")["last_evaluation_date"] = "2026-08-14"
+            state.save()
+
+            restarted = momentum.LiveState(path, market_legs("CN"))
+
+        self.assertNotIn(
+            "last_evaluation_date",
+            restarted.leg_state("CN-A"),
+        )
 
 
 class FakeQuoteContext:
@@ -444,6 +498,56 @@ class RecordingNotifier:
         self.closed = True
 
 
+class CompletingBarQuoteContext:
+    def __init__(self):
+        self.requested_counts = []
+
+    def get_market_snapshot(self, symbols):
+        return 0, pd.DataFrame(
+            [
+                {
+                    "code": symbol,
+                    "last_price": 123.0,
+                    "update_time": "2026-08-14 14:00:00",
+                }
+                for symbol in symbols
+            ]
+        )
+
+    def get_cur_kline(self, symbol, count, _subtype, _adjustment):
+        self.requested_counts.append(count)
+        return 0, pd.DataFrame(
+            {
+                "time_key": [
+                    "2026-08-11 16:00:00",
+                    "2026-08-12 16:00:00",
+                    "2026-08-13 16:00:00",
+                    "2026-08-14 16:00:00",
+                ],
+                "close": [10.0, 11.0, 12.0, 99.0],
+            }
+        )
+
+
+class LiveMarketDataTest(unittest.TestCase):
+    def test_scores_use_only_complete_daily_closes(self):
+        context = CompletingBarQuoteContext()
+
+        closes, snapshots = momentum.fetch_live_market_data(
+            context,
+            [("US.QQQ", 3)],
+            0,
+            types.SimpleNamespace(K_DAY="K_DAY"),
+            types.SimpleNamespace(QFQ="QFQ"),
+            date(2026, 8, 13),
+        )
+
+        self.assertEqual(context.requested_counts, [4])
+        self.assertEqual(closes["US.QQQ"], [10.0, 11.0, 12.0])
+        self.assertEqual(snapshots["US.QQQ"]["price"], 123.0)
+        self.assertEqual(snapshots["US.QQQ"]["bar_date"], "2026-08-13")
+
+
 class HolidayQuoteContext(FakeQuoteContext):
     instances = []
 
@@ -507,10 +611,13 @@ class LiveEndToEndTest(unittest.TestCase):
             ):
                 self.assertEqual(momentum.run_live(args), 0)
 
-            state = momentum.LiveState(
-                Path(raw_dir) / "state-live.json",
-                momentum.LIVE_LEGS,
-            )
+            states = {
+                market: momentum.LiveState(
+                    Path(raw_dir) / f"state-live-{market.lower()}.json",
+                    market_legs(market),
+                )
+                for market in ("US", "CN")
+            }
             context = FakeQuoteContext.instances[0]
 
         self.assertEqual(len(notifier.events), 4)
@@ -529,12 +636,19 @@ class LiveEndToEndTest(unittest.TestCase):
             self.assertEqual(event["evaluation_date"], "2026-08-14")
             self.assertEqual(event["market"], leg.split("-")[0])
             self.assertEqual(
-                state.leg_state(leg)["selected_symbol"], expected
+                states[event["market"]].leg_state(leg)["selected_symbol"],
+                expected,
             )
             self.assertEqual(
-                state.leg_state(leg)["last_evaluation_date"], "2026-08-14"
+                states[event["market"]].leg_state(leg)["last_rotation_date"],
+                "2026-08-14",
             )
-        self.assertEqual(state.last_snapshot["type"], "SIGNAL")
+            self.assertNotIn(
+                "last_evaluation_date",
+                states[event["market"]].leg_state(leg),
+            )
+        self.assertEqual(states["US"].last_snapshot["type"], "SIGNAL")
+        self.assertEqual(states["CN"].last_snapshot["type"], "SIGNAL")
         self.assertEqual(len(context.subscriptions), 2)
         self.assertEqual(
             set(context.subscriptions[0][0]),
@@ -587,18 +701,24 @@ class LiveEndToEndTest(unittest.TestCase):
             ):
                 self.assertEqual(momentum.run_live(args), 0)
 
-            state = momentum.LiveState(
-                Path(raw_dir) / "state-live.json",
-                momentum.LIVE_LEGS,
-            )
+            states = {
+                market: momentum.LiveState(
+                    Path(raw_dir) / f"state-live-{market.lower()}.json",
+                    market_legs(market),
+                )
+                for market in ("US", "CN")
+            }
 
         self.assertEqual(notifier.events, [])
-        self.assertEqual(state.last_snapshot["type"], "IDLE")
-        for leg in momentum.LIVE_LEGS:
-            self.assertEqual(
-                state.leg_state(leg.name)["last_evaluation_date"],
-                date.today().isoformat(),
-            )
+        self.assertEqual(states["US"].last_snapshot["type"], "IDLE")
+        self.assertEqual(states["CN"].last_snapshot["type"], "IDLE")
+        for market, state in states.items():
+            self.assertEqual(state.last_snapshot["market"], market)
+            for leg in market_legs(market):
+                self.assertNotIn(
+                    "last_evaluation_date",
+                    state.leg_state(leg.name),
+                )
 
     def test_with_markets_filter_evaluates_only_requested_market(self):
         fake_futu = types.ModuleType("futu")
@@ -638,22 +758,20 @@ class LiveEndToEndTest(unittest.TestCase):
                 self.assertEqual(momentum.run_live(args), 0)
 
             state = momentum.LiveState(
-                Path(raw_dir) / "state-live.json",
-                momentum.LIVE_LEGS,
+                Path(raw_dir) / "state-live-cn.json",
+                market_legs("CN"),
             )
             context = FakeQuoteContext.instances[0]
+            us_state_exists = (Path(raw_dir) / "state-live-us.json").exists()
 
         self.assertEqual(
             {event["leg"] for event in notifier.events},
             {"CN-A", "CN-B"},
         )
         self.assertEqual(len(context.subscriptions), 1)
-        self.assertEqual(
-            state.leg_state("US-A")["last_evaluation_date"], None
-        )
-        self.assertEqual(
-            state.leg_state("CN-A")["last_evaluation_date"], "2026-08-14"
-        )
+        self.assertFalse(us_state_exists)
+        self.assertEqual(state.leg_state("CN-A")["selected_symbol"], "SZ.159941")
+        self.assertNotIn("last_evaluation_date", state.leg_state("CN-A"))
 
 
 if __name__ == "__main__":

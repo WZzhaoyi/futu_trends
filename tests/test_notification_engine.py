@@ -1,6 +1,7 @@
 import sys
 import types
 import unittest
+from unittest import mock
 
 
 def _install_import_stubs():
@@ -42,7 +43,8 @@ def _install_import_stubs():
 
 _install_import_stubs()
 
-from notification_engine.engine import _feishu_cell_value_to_text
+import notification_engine.engine as engine_module
+from notification_engine.engine import NotificationEngine, _feishu_cell_value_to_text
 
 
 class FeishuCellValueToTextTest(unittest.TestCase):
@@ -56,6 +58,77 @@ class FeishuCellValueToTextTest(unittest.TestCase):
     def test_non_empty_cell_is_text(self):
         self.assertEqual(_feishu_cell_value_to_text([["existing"]]), "existing")
         self.assertEqual(_feishu_cell_value_to_text([[123]]), "123")
+
+
+class NotificationTimeoutTest(unittest.TestCase):
+    def test_email_uses_network_timeout(self):
+        engine = NotificationEngine.__new__(NotificationEngine)
+        engine.mail_port = 465
+        engine.mail_host = "smtp.example.com"
+        engine.sender = "sender@example.com"
+        engine.mail_pass = "secret"
+        engine.receivers = ["receiver@example.com"]
+
+        with mock.patch.object(engine_module.smtplib, "SMTP_SSL") as smtp_ssl:
+            engine.send_email("subject", "message")
+
+        smtp_ssl.assert_called_once_with(
+            "smtp.example.com",
+            465,
+            timeout=engine_module.NOTIFICATION_NETWORK_TIMEOUT,
+        )
+
+    def test_email_timeout_is_best_effort(self):
+        engine = NotificationEngine.__new__(NotificationEngine)
+        engine.mail_port = 465
+        engine.mail_host = "smtp.example.com"
+        engine.sender = "sender@example.com"
+        engine.mail_pass = "secret"
+        engine.receivers = ["receiver@example.com"]
+
+        with mock.patch.object(
+            engine_module.smtplib,
+            "SMTP_SSL",
+            side_effect=TimeoutError,
+        ), self.assertLogs(engine_module.logger, level="ERROR") as logs:
+            engine.send_email("subject", "message")
+
+        self.assertIn("Failed to connect", logs.output[0])
+
+    def test_telegram_uses_network_timeout(self):
+        engine = NotificationEngine.__new__(NotificationEngine)
+        engine.TELEGRAM_BOT_TOKEN = "token"
+        engine.TELEGRAM_CHAT_ID = "chat"
+        engine.PROXIES = {}
+        engine.SESSION = mock.Mock()
+
+        engine.send_telegram_message("message", "https://example.com")
+
+        self.assertEqual(
+            engine.SESSION.post.call_args.kwargs["timeout"],
+            engine_module.NOTIFICATION_NETWORK_TIMEOUT,
+        )
+
+    def test_telegram_photo_requests_use_network_timeout(self):
+        engine = NotificationEngine.__new__(NotificationEngine)
+        engine.TELEGRAM_BOT_TOKEN = "token"
+        engine.TELEGRAM_CHAT_ID = "chat"
+        engine.PROXIES = {}
+        engine.SESSION = mock.Mock()
+        engine.SESSION.post.return_value.status_code = 200
+        engine.plog = mock.Mock()
+
+        engine.send_telegram_photo("https://example.com/image.jpg")
+        self.assertEqual(
+            engine.SESSION.post.call_args.kwargs["timeout"],
+            engine_module.NOTIFICATION_NETWORK_TIMEOUT,
+        )
+
+        engine.send_telegram_photos(["https://example.com/image.jpg"])
+        self.assertEqual(
+            engine.SESSION.post.call_args.kwargs["timeout"],
+            engine_module.NOTIFICATION_NETWORK_TIMEOUT,
+        )
 
 
 if __name__ == "__main__":

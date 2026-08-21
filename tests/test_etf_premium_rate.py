@@ -13,6 +13,7 @@ MODULE_PATH = (
     / "market_analysis"
     / "etf_premium_rate.py"
 )
+sys.path.insert(0, str(MODULE_PATH.parent))
 SPEC = importlib.util.spec_from_file_location("etf_premium_rate_tested", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 premium = importlib.util.module_from_spec(SPEC)
@@ -138,6 +139,28 @@ class StrategyStateTest(unittest.TestCase):
             ("base", "BUY"),
         )
 
+    def test_backtest_and_live_follow_the_same_transition_sequence(self):
+        premiums = np.array([0.04, 0.02, -0.01, 0.02, 0.04])
+        backtest_positions = premium.positions_for_premium(
+            premiums,
+            self.params,
+        )
+        state = "base"
+        live_positions = []
+        for value in premiums:
+            state, _action = premium.apply_live_signal(
+                state,
+                float(value),
+                self.params,
+            )
+            live_positions.append(
+                self.params.base_position
+                if state == "base"
+                else self.params.low_position
+            )
+
+        np.testing.assert_allclose(backtest_positions, live_positions)
+
 
 class LiveRuntimeTest(unittest.TestCase):
     def test_runtime_dir_must_be_absolute_and_is_single_instance(self):
@@ -146,9 +169,9 @@ class LiveRuntimeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw_dir:
             runtime = premium.LiveRuntimePaths.from_argument(raw_dir)
             runtime.prepare()
-            with premium.RuntimeFileLock(runtime.lock_file):
+            with premium.runtime_file_lock(runtime.lock_file):
                 with self.assertRaises(RuntimeError):
-                    with premium.RuntimeFileLock(runtime.lock_file):
+                    with premium.runtime_file_lock(runtime.lock_file):
                         pass
 
     def test_futu_fund_premium_is_hint_only(self):

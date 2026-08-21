@@ -20,17 +20,22 @@ import json
 import math
 import multiprocessing
 import os
-import queue
 import sys
-import threading
 import time
 from dataclasses import dataclass, replace
-from datetime import date, datetime, time as datetime_time
+from datetime import date, datetime, time as datetime_time, timedelta
 from itertools import combinations
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Iterable, Optional
 from zoneinfo import ZoneInfo
+
+from live_runtime import (
+    BackgroundWorker,
+    close_futu_context,
+    runtime_file_lock,
+    write_json_atomic,
+)
 
 import pandas as pd
 
@@ -55,8 +60,8 @@ def calculate_momentum_score(data: np.ndarray) -> float:
 
 
 LIVE_STRATEGY = "momentum-rotation"
-LIVE_VERSION = "momentum-rotation-live-v7"
-LIVE_SCHEMA_VERSION = 2
+LIVE_VERSION = "momentum-rotation-live-v8"
+LIVE_SCHEMA_VERSION = 3
 US_MARKET_TIMEZONE = ZoneInfo("America/New_York")
 CN_MARKET_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
@@ -269,6 +274,85 @@ class SimParams:
     warmup_extra: int = 5      # warmup = window + warmup_extra
 
 
+@dataclass(frozen=True)
+class RotationDecision:
+    """One symbol-level decision shared by backtest and live adapters."""
+
+    selected_symbol: Optional[str]
+    target_symbol: Optional[str]
+    action: str
+    blocked: bool = False
+
+
+def decide_rotation(
+    scores: dict[str, float],
+    *,
+    cash_symbols: tuple[str, ...] = (),
+    previous_state_symbol: Optional[str] = None,
+    last_change_date: Optional[date] = None,
+    decision_date: date,
+    cooldown: int = 0,
+    gap_eps: float = 0.0,
+    min_score: float = float("-inf"),
+    initialized: bool = True,
+) -> RotationDecision:
+    """Select the effective target using the strategy's shared debounce rules.
+
+    ``selected_symbol`` is the score leader after ``min_score`` filtering and
+    may be a cash proxy. ``target_symbol`` is the accepted effective holding;
+    cash is ``None`` and a blocked rotation keeps the previous holding.
+    """
+    if not scores:
+        raise ValueError("动量分数不能为空")
+    if cooldown > 0 and gap_eps > 0:
+        raise ValueError("gap_eps 与 cooldown 为互斥防抖机制，请只设置其一")
+
+    selected = max(scores, key=scores.get)
+    if scores[selected] < min_score:
+        selected = None
+    requested = selected if selected not in cash_symbols else None
+    previous_target = (
+        previous_state_symbol
+        if previous_state_symbol not in cash_symbols
+        else None
+    )
+
+    if requested == previous_target:
+        action = "INITIAL" if not initialized else "NONE"
+        return RotationDecision(
+            selected_symbol=selected,
+            target_symbol=requested,
+            action=action,
+        )
+
+    if previous_target is None:
+        action = "INITIAL" if not initialized else "BUY"
+    elif requested is None:
+        action = "SELL"
+    else:
+        if gap_eps > 0:
+            blocked = scores[requested] - scores[previous_target] <= gap_eps
+        else:
+            blocked = bool(
+                last_change_date is not None
+                and (decision_date - last_change_date).days <= cooldown
+            )
+        if blocked:
+            return RotationDecision(
+                selected_symbol=selected,
+                target_symbol=previous_target,
+                action="NONE",
+                blocked=True,
+            )
+        action = "ROTATE"
+
+    return RotationDecision(
+        selected_symbol=selected,
+        target_symbol=requested,
+        action=action,
+    )
+
+
 def load_cached_histories(
     symbols: list[str],
     cache_dir: Path = HISTORY_CACHE_DIR,
@@ -414,13 +498,12 @@ def simulate(
     scores = vectorized_momentum_scores(close, params.window)
     decision_start = max(params.window + params.warmup_extra, 10) - 1
 
-    is_cash = np.array([s in params.cash_symbols for s in symbols])
     positions = np.zeros(k, dtype=np.int64)
     targets = positions.copy()
     cash = float(params.capital)
     last_price = np.zeros(k)
     orders: list[tuple[int, int, int]] = []  # (idx, sign, vol)
-    last_rotation_date = pd.Timestamp.min
+    last_change_date: Optional[date] = None
     daily = np.zeros(
         n,
         dtype=[
@@ -474,26 +557,41 @@ def simulate(
         last_price = close[t]
 
         if t >= decision_start and not np.isnan(scores[t]).any():
-            selected = int(np.nanargmax(scores[t]))
+            score_by_symbol = {
+                symbol: float(scores[t, index])
+                for index, symbol in enumerate(symbols)
+            }
+            cur_hold = [i for i in range(k) if positions[i] > 0]
+            cur_hold = cur_hold[0] if cur_hold else None
+            decision_date = dates[t].date()
+            decision = decide_rotation(
+                score_by_symbol,
+                cash_symbols=params.cash_symbols,
+                previous_state_symbol=(
+                    symbols[cur_hold] if cur_hold is not None else None
+                ),
+                last_change_date=last_change_date,
+                decision_date=decision_date,
+                cooldown=params.cooldown,
+                gap_eps=params.gap_eps,
+                initialized=last_change_date is not None,
+            )
             new_targets = np.zeros(k, dtype=np.int64)
-            if not is_cash[selected]:
+            if decision.target_symbol is not None:
+                selected = symbols.index(decision.target_symbol)
                 value = cash + np.dot(positions, last_price) * params.size
                 new_targets[selected] = max(
                     int(max(value, 0) / (last_price[selected] * params.size)), 0
                 )
-            cur_hold = [i for i in range(k) if positions[i] > 0]
-            cur_hold = cur_hold[0] if cur_hold else None
-            new_hold = selected if new_targets[selected] > 0 else None
             changed = not np.array_equal(new_targets, targets)
-            if changed:
-                blocked = False
-                if new_hold is not None and cur_hold is not None and new_hold != cur_hold:
-                    if params.gap_eps > 0:
-                        blocked = scores[t, selected] - scores[t, cur_hold] <= params.gap_eps
-                    else:
-                        blocked = (dates[t] - last_rotation_date).days <= params.cooldown
+            if changed and not decision.blocked:
+                new_hold = (
+                    symbols.index(decision.target_symbol)
+                    if decision.target_symbol is not None
+                    else None
+                )
                 same_hold = cur_hold is not None and new_hold == cur_hold
-                if not blocked and not (same_hold and not rebalance):
+                if not (same_hold and not rebalance):
                     targets = new_targets
                     orders = []
                     for i in range(k):
@@ -502,7 +600,8 @@ def simulate(
                             continue
                         sign = 1 if change > 0 else -1
                         orders.append((i, sign, abs(int(change))))
-                    last_rotation_date = dates[t]
+                    if decision.action != "NONE":
+                        last_change_date = decision_date
 
     frame = pd.DataFrame(daily, index=dates)
     frame["balance"] = params.capital + frame["net_pnl"].cumsum()
@@ -530,7 +629,13 @@ def _grid_worker(args: dict) -> dict[str, Any]:
     histories, symbols, params, benchmark_symbol, uname = (
         args["histories"], args["symbols"], args["params"], args["benchmark"], args["uname"]
     )
-    frame, _, stats = simulate(histories, symbols, params, benchmark_symbol)
+    frame, _, stats = simulate(
+        histories,
+        symbols,
+        params,
+        benchmark_symbol,
+        rebalance=False,
+    )
     return {
         "universe": uname,
         "window": params.window,
@@ -560,6 +665,7 @@ def run_grid(
     """网格优化: universe × window × (cooldown 或 epsilon 网格)。
 
     cooldowns 与 epsilons 至少给一个；二者同时给出时分别生成任务。
+    与 live 一致，仅在目标标的/现金状态变化时交易，不做同标的份额再平衡。
     返回 DataFrame，可直接按 sortino/calmar/total% 排序。
     """
     tasks = []
@@ -762,7 +868,13 @@ def _simulate_config(
         size=config.size,
         capital=config.capital,
     )
-    frame, trades, _ = simulate(full, symbols, params, DEFAULT_BENCHMARK_SYMBOL)
+    frame, trades, _ = simulate(
+        full,
+        symbols,
+        params,
+        DEFAULT_BENCHMARK_SYMBOL,
+        rebalance=False,
+    )
     return frame, trades
 
 
@@ -922,82 +1034,24 @@ class LiveRuntimePaths:
     lock_file: Path
 
     @classmethod
-    def from_argument(cls, raw: str, mode: str) -> "LiveRuntimePaths":
+    def from_argument(cls, raw: str, market: str) -> "LiveRuntimePaths":
         root = Path(raw).expanduser()
         if not root.is_absolute():
             raise ValueError("--runtime-dir 必须使用绝对路径")
         root = Path(os.path.abspath(root))
-        return cls(root, root / f"state-{mode}.json", root / f"{mode}.lock")
+        owner = market.lower()
+        return cls(
+            root,
+            root / f"state-live-{owner}.json",
+            root / f"live-{owner}.lock",
+        )
 
     def prepare(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
 
 
-class RuntimeFileLock:
-    """Prevent two live processes from sharing one state directory."""
-
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.handle: Any = None
-
-    def __enter__(self) -> "RuntimeFileLock":
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.handle = self.path.open("a+b")
-        try:
-            if os.name == "nt":
-                import msvcrt
-
-                self.handle.seek(0, os.SEEK_END)
-                if self.handle.tell() == 0:
-                    self.handle.write(b"\0")
-                    self.handle.flush()
-                self.handle.seek(0)
-                msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(
-                    self.handle.fileno(),
-                    fcntl.LOCK_EX | fcntl.LOCK_NB,
-                )
-        except (OSError, BlockingIOError) as exc:
-            self.handle.close()
-            self.handle = None
-            raise RuntimeError(
-                f"已有 live 实例占用运行目录: {self.path.parent}"
-            ) from exc
-        return self
-
-    def __exit__(self, _exc_type: Any, _exc: Any, _tb: Any) -> None:
-        if self.handle is None:
-            return
-        try:
-            if os.name == "nt":
-                import msvcrt
-
-                self.handle.seek(0)
-                msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
-        finally:
-            self.handle.close()
-            self.handle = None
-
-
 def eprint(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
-
-
-def write_json_atomic(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
 
 
 def score_live_pairs(
@@ -1026,38 +1080,26 @@ def live_leg_decision(
     today: date,
     min_score: float = float("-inf"),
 ) -> str:
-    """单腿决策，镜像 simulate 的轮动语义：
-
-    - 分数第一（含现金符号）登顶；现金符号登顶或分数低于 min_score → 持现金
-    - 现金->资产 / 资产->现金 不受冷却限制；资产->资产轮动受 cooldown/ε 限制
-    - 返回 INITIAL（首次）/ BUY / SELL / ROTATE / NONE
-    """
-    top = max(scores, key=scores.get)
-    if scores[top] < min_score or top in leg.cash_symbols:
-        top = None
-    holding = previous_hold if previous_hold not in leg.cash_symbols else None
-    if top is None:
-        return "INITIAL" if holding is None and previous_hold is None else (
-            "SELL" if holding is not None else "NONE"
-        )
-    if holding is None:
-        return "INITIAL" if previous_hold is None else "BUY"
-    if top == holding:
-        return "NONE"
-    if leg.gap_eps > 0:
-        blocked = scores[top] - scores[holding] <= leg.gap_eps
-    else:
-        rotated_at = (
+    """Compatibility wrapper around the shared backtest/live decision."""
+    return decide_rotation(
+        scores,
+        cash_symbols=leg.cash_symbols,
+        previous_state_symbol=previous_hold,
+        last_change_date=(
             date.fromisoformat(last_rotation_date)
             if last_rotation_date
-            else today
-        )
-        blocked = (today - rotated_at).days <= leg.cooldown
-    return "NONE" if blocked else "ROTATE"
+            else None
+        ),
+        decision_date=today,
+        cooldown=leg.cooldown,
+        gap_eps=leg.gap_eps,
+        min_score=min_score,
+        initialized=(previous_hold is not None or last_rotation_date is not None),
+    ).action
 
 
 class LiveState:
-    """live 状态：每腿独立持有（持仓、上次轮动日、上次评估日）。
+    """单市场 live 状态：每腿独立持有目标和上次目标变更日。
 
     腿之间零交互，状态天然按腿隔离。
     """
@@ -1086,7 +1128,18 @@ class LiveState:
                 or payload.get("legs") != expected
             ):
                 raise ValueError("实时状态文件与当前腿配置不匹配")
-            self.leg_states = payload.get("leg_states") or {}
+            stored_states = payload.get("leg_states") or {}
+            self.leg_states = {
+                leg.name: {
+                    "selected_symbol": stored_states.get(leg.name, {}).get(
+                        "selected_symbol"
+                    ),
+                    "last_rotation_date": stored_states.get(leg.name, {}).get(
+                        "last_rotation_date"
+                    ),
+                }
+                for leg in legs
+            }
             self.last_snapshot = payload.get("last_snapshot")
             self.last_error = payload.get("last_error")
         else:
@@ -1094,7 +1147,6 @@ class LiveState:
                 leg.name: {
                     "selected_symbol": None,
                     "last_rotation_date": None,
-                    "last_evaluation_date": None,
                 }
                 for leg in legs
             }
@@ -1138,15 +1190,12 @@ class LiveNotifier:
     def __init__(self, engine: Any, maxsize: int = 100) -> None:
         self.engine = engine
         self.recent: dict[str, float] = {}
-        self.queue: queue.Queue[Optional[dict[str, Any]]] = queue.Queue(
-            maxsize=maxsize
-        )
-        self.thread = threading.Thread(
-            target=self._run,
+        self.worker = BackgroundWorker[dict[str, Any]](
+            self._deliver,
             name="momentum-rotation-notifier",
-            daemon=True,
+            maxsize=maxsize,
+            on_error=lambda exc: eprint(f"通知处理失败: {exc}"),
         )
-        self.thread.start()
 
     def notify(self, event: dict[str, Any]) -> None:
         key = "|".join(
@@ -1157,9 +1206,7 @@ class LiveNotifier:
         if now - self.recent.get(key, -1e12) < 300:
             return
         self.recent[key] = now
-        try:
-            self.queue.put_nowait(dict(event))
-        except queue.Full:
+        if not self.worker.submit(dict(event)):
             eprint(f"通知队列已满，丢弃事件: {key}")
 
     @staticmethod
@@ -1186,36 +1233,23 @@ class LiveNotifier:
             )
         return subject, "\n".join(lines)
 
-    def _run(self) -> None:
-        while True:
-            event = self.queue.get()
+    def _deliver(self, event: dict[str, Any]) -> None:
+        subject, message = self.format_event(event)
+        for send in (
+            self.engine.send_webhook,
+            lambda text: self.engine.send_telegram_message(
+                text, "https://www.futunn.com/"
+            ),
+            lambda text: self.engine.send_email(subject, text),
+        ):
             try:
-                if event is None:
-                    return
-                subject, message = self.format_event(event)
-                for send in (
-                    self.engine.send_webhook,
-                    lambda text: self.engine.send_telegram_message(
-                        text, "https://www.futunn.com/"
-                    ),
-                    lambda text: self.engine.send_email(subject, text),
-                ):
-                    try:
-                        send(message)
-                    except Exception as exc:
-                        eprint(f"通知发送失败: {exc}")
+                send(message)
             except Exception as exc:
-                eprint(f"通知处理失败: {exc}")
-            finally:
-                self.queue.task_done()
+                eprint(f"通知发送失败: {exc}")
 
     def close(self, timeout: float = 10.0) -> None:
-        try:
-            self.queue.put_nowait(None)
-        except queue.Full:
+        if not self.worker.close(timeout):
             eprint("通知队列未清空，退出时无法等待全部通知")
-            return
-        self.thread.join(timeout=timeout)
 
 
 def build_live_notifier(config_path: Optional[str]) -> Optional[LiveNotifier]:
@@ -1302,6 +1336,7 @@ def fetch_live_market_data(
     ret_ok: Any,
     kl_type: Any,
     au_type: Any,
+    completed_through: date,
 ) -> tuple[dict[str, list[float]], dict[str, dict[str, Any]]]:
     symbols = [symbol for symbol, _window in pairs]
     ret, snapshots = context.get_market_snapshot(symbols)
@@ -1325,7 +1360,7 @@ def fetch_live_market_data(
             raise RuntimeError(f"Futu 快照缺少 {symbol} 或价格无效")
         ret, frame = context.get_cur_kline(
             symbol,
-            window,
+            window + 1,
             kl_type.K_DAY,
             au_type.QFQ,
         )
@@ -1333,32 +1368,26 @@ def fetch_live_market_data(
             raise RuntimeError(f"Futu 日K失败 {symbol}: {frame}")
         if "time_key" not in frame.columns:
             raise RuntimeError(f"Futu 日K缺少 time_key: {symbol}")
-        bar_date = str(frame["time_key"].iloc[-1]).split(" ", 1)[0]
+        bar_dates = frame["time_key"].astype(str).str.split(" ", n=1).str[0]
         try:
-            date.fromisoformat(bar_date)
+            parsed_dates = bar_dates.map(date.fromisoformat)
         except ValueError as exc:
+            raise RuntimeError(f"Futu 日K日期无效 {symbol}") from exc
+        frame = frame.loc[parsed_dates <= completed_through]
+        if frame.empty:
             raise RuntimeError(
-                f"Futu 日K日期无效 {symbol}: {bar_date}"
-            ) from exc
+                f"{symbol} 没有 {completed_through.isoformat()} 及之前的完整日K"
+            )
+        bar_date = str(frame["time_key"].iloc[-1]).split(" ", 1)[0]
         values = pd.to_numeric(frame["close"], errors="coerce").dropna().tolist()
         if len(values) < window:
             raise RuntimeError(
                 f"{symbol} K线不足: 需要 {window} 根，实际 {len(values)} 根"
             )
         values = [float(value) for value in values[-window:]]
-        values[-1] = snapshot["price"]
         closes[symbol] = values
         snapshot["bar_date"] = bar_date
     return closes, snapshot_by_symbol
-
-
-def close_futu_context(context: Any) -> None:
-    if context is None:
-        return
-    try:
-        context.close()
-    except Exception as exc:
-        eprint(f"警告: 关闭 Futu context 失败: {exc}")
 
 
 def market_union_pairs(legs: tuple[LiveLeg, ...]) -> list[tuple[str, int]]:
@@ -1373,8 +1402,8 @@ def market_union_pairs(legs: tuple[LiveLeg, ...]) -> list[tuple[str, int]]:
 def run_live(args: argparse.Namespace) -> int:
     """live（cron_restart 定时触发）：对指定市场做一次即时评估并通知。
 
-    触发时机由 PM2 ecosystem 的 cron 表达式保证，脚本只做：
-    交易日守卫（非交易日发 IDLE 不通知）、对最近收盘的即时评估、通知。
+    PM2 ecosystem 的 cron 只负责唤醒；首次启动与定时启动走同一路径。
+    交易日内只使用最近完整收盘的日K，非交易日发 IDLE 不通知。
     --markets 限定本次评估的市场（cron 分市场触发的必要条件，默认全部）。
     """
     try:
@@ -1398,9 +1427,12 @@ def run_live(args: argparse.Namespace) -> int:
     else:
         markets = tuple(legs_by_market)
 
-    runtime = LiveRuntimePaths.from_argument(args.runtime_dir, "live")
-    runtime.prepare()
-    state = LiveState(runtime.state_file, LIVE_LEGS)
+    runtimes = {
+        market: LiveRuntimePaths.from_argument(args.runtime_dir, market)
+        for market in markets
+    }
+    for runtime in runtimes.values():
+        runtime.prepare()
     market_symbols = [
         symbol
         for market in markets
@@ -1413,14 +1445,17 @@ def run_live(args: argparse.Namespace) -> int:
     subscribed_markets: set[str] = set()
 
     try:
-        with RuntimeFileLock(runtime.lock_file):
-            for market in markets:
-                spec = MARKET_SPECS[market]
-                market_timezone = spec["timezone"]
-                now = datetime.now(market_timezone)
-                today = now.date().isoformat()
-                market_legs = legs_by_market[market]
-                try:
+        for market in markets:
+            runtime = runtimes[market]
+            spec = MARKET_SPECS[market]
+            market_timezone = spec["timezone"]
+            now = datetime.now(market_timezone)
+            today = now.date().isoformat()
+            market_legs = tuple(legs_by_market[market])
+            state = None
+            try:
+                with runtime_file_lock(runtime.lock_file):
+                    state = LiveState(runtime.state_file, market_legs)
                     if context is None:
                         context = OpenQuoteContext(host=host, port=port)
                         subscribed_markets.clear()
@@ -1435,10 +1470,6 @@ def run_live(args: argparse.Namespace) -> int:
                             "evaluation_date": today,
                             "emitted_at": now.isoformat(timespec="seconds"),
                         }
-                        for leg in market_legs:
-                            state.leg_state(leg.name)[
-                                "last_evaluation_date"
-                            ] = today
                         state.record_snapshot(event)
                         print(json.dumps(event, ensure_ascii=False), flush=True)
                         continue
@@ -1458,6 +1489,11 @@ def run_live(args: argparse.Namespace) -> int:
                         RET_OK,
                         SubType,
                         AuType,
+                        (
+                            now.date()
+                            if now.time() >= spec["notification_time"]
+                            else now.date() - timedelta(days=1)
+                        ),
                     )
                     bar_dates = {
                         snapshot["bar_date"]
@@ -1479,27 +1515,28 @@ def run_live(args: argparse.Namespace) -> int:
                             for symbol in leg.symbols
                         ]
                         scores = score_live_pairs(leg_pairs, closes)
-                        top = max(scores, key=scores.get)
-                        selected_symbol = (
-                            top
-                            if scores[top] >= args.min_score
-                            else None
-                        )
                         lst = state.leg_state(leg.name)
-                        action = live_leg_decision(
-                            leg,
+                        decision = decide_rotation(
                             scores,
-                            lst["selected_symbol"],
-                            lst["last_rotation_date"],
-                            today,
-                            args.min_score,
+                            cash_symbols=leg.cash_symbols,
+                            previous_state_symbol=lst["selected_symbol"],
+                            last_change_date=(
+                                date.fromisoformat(lst["last_rotation_date"])
+                                if lst["last_rotation_date"]
+                                else None
+                            ),
+                            decision_date=date.fromisoformat(trading_date),
+                            cooldown=leg.cooldown,
+                            gap_eps=leg.gap_eps,
+                            min_score=args.min_score,
+                            initialized=(
+                                lst["selected_symbol"] is not None
+                                or lst["last_rotation_date"] is not None
+                            ),
                         )
-                        target_symbol = (
-                            selected_symbol
-                            if selected_symbol
-                            not in leg.cash_symbols
-                            else None
-                        )
+                        action = decision.action
+                        selected_symbol = decision.selected_symbol
+                        target_symbol = decision.target_symbol
                         windows = dict(leg_pairs)
                         ranking = [
                             {
@@ -1546,10 +1583,9 @@ def run_live(args: argparse.Namespace) -> int:
                                 timespec="seconds"
                             ),
                         }
-                        lst["selected_symbol"] = selected_symbol
-                        if action == "ROTATE":
+                        lst["selected_symbol"] = decision.target_symbol
+                        if action != "NONE":
                             lst["last_rotation_date"] = trading_date
-                        lst["last_evaluation_date"] = trading_date
                         state.record_snapshot(event)
                         print(
                             json.dumps(event, ensure_ascii=False),
@@ -1557,22 +1593,23 @@ def run_live(args: argparse.Namespace) -> int:
                         )
                         if notifier is not None:
                             notifier.notify(event)
-                except Exception as exc:
-                    close_futu_context(context)
-                    context = None
-                    subscribed_markets.clear()
-                    event = {
-                        "type": "ERROR",
-                        "strategy": LIVE_STRATEGY,
-                        "market": market,
-                        "message": str(exc),
-                        "emitted_at": now.isoformat(timespec="seconds"),
-                    }
+            except Exception as exc:
+                close_futu_context(context)
+                context = None
+                subscribed_markets.clear()
+                event = {
+                    "type": "ERROR",
+                    "strategy": LIVE_STRATEGY,
+                    "market": market,
+                    "message": str(exc),
+                    "emitted_at": now.isoformat(timespec="seconds"),
+                }
+                if state is not None:
                     state.record_error(event)
-                    eprint(json.dumps(event, ensure_ascii=False))
-                    if notifier is not None:
-                        notifier.notify(event)
-                    raise
+                eprint(json.dumps(event, ensure_ascii=False))
+                if notifier is not None:
+                    notifier.notify(event)
+                raise
     finally:
         close_futu_context(context)
         if notifier is not None:
