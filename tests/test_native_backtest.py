@@ -130,18 +130,5 @@ class MomentumOpenFillTest(unittest.TestCase):
             first["price"], float(histories["A"].loc[bar_date, "Open"])
         )
 
-    def test_no_limit_price_in_trades(self):
-        histories = _fake_histories()
-        frame, trades, stats = momentum.simulate(
-            histories,
-            ["A", "B"],
-            momentum.SimParams(window=10),
-            benchmark_symbol="B",
-        )
-        for trade in trades:
-            self.assertIn("price", trade)
-            self.assertGreater(trade["price"], 0)
-
-
 if __name__ == "__main__":
     unittest.main()

@@ -1072,32 +1072,6 @@ def score_live_pairs(
     return scores
 
 
-def live_leg_decision(
-    leg: LiveLeg,
-    scores: dict[str, float],
-    previous_hold: Optional[str],
-    last_rotation_date: Optional[str],
-    today: date,
-    min_score: float = float("-inf"),
-) -> str:
-    """Compatibility wrapper around the shared backtest/live decision."""
-    return decide_rotation(
-        scores,
-        cash_symbols=leg.cash_symbols,
-        previous_state_symbol=previous_hold,
-        last_change_date=(
-            date.fromisoformat(last_rotation_date)
-            if last_rotation_date
-            else None
-        ),
-        decision_date=today,
-        cooldown=leg.cooldown,
-        gap_eps=leg.gap_eps,
-        min_score=min_score,
-        initialized=(previous_hold is not None or last_rotation_date is not None),
-    ).action
-
-
 class LiveState:
     """单市场 live 状态：每腿独立持有目标和上次目标变更日。
 

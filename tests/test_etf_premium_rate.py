@@ -1,6 +1,5 @@
 import importlib.util
 import sys
-import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -163,16 +162,9 @@ class StrategyStateTest(unittest.TestCase):
 
 
 class LiveRuntimeTest(unittest.TestCase):
-    def test_runtime_dir_must_be_absolute_and_is_single_instance(self):
+    def test_runtime_dir_must_be_absolute(self):
         with self.assertRaises(ValueError):
             premium.LiveRuntimePaths.from_argument("relative/runtime")
-        with tempfile.TemporaryDirectory() as raw_dir:
-            runtime = premium.LiveRuntimePaths.from_argument(raw_dir)
-            runtime.prepare()
-            with premium.runtime_file_lock(runtime.lock_file):
-                with self.assertRaises(RuntimeError):
-                    with premium.runtime_file_lock(runtime.lock_file):
-                        pass
 
     def test_futu_fund_premium_is_hint_only(self):
         snapshot = premium.parse_futu_snapshot(

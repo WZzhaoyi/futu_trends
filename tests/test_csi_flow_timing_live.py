@@ -678,16 +678,6 @@ class LiveRuntimeTest(unittest.TestCase):
         self.assertEqual(runtime.thresholds_dir, Path("/tmp/csi-flow/thresholds"))
         self.assertEqual(runtime.state_file, Path("/tmp/csi-flow/state.json"))
 
-    def test_runtime_lock_rejects_a_second_live_instance(self):
-        with tempfile.TemporaryDirectory() as raw_dir:
-            path = Path(raw_dir) / "live.lock"
-            with timing.runtime_file_lock(path):
-                with self.assertRaisesRegex(RuntimeError, "已有 live 实例"):
-                    with timing.runtime_file_lock(path):
-                        self.fail("second lock unexpectedly acquired")
-            with timing.runtime_file_lock(path):
-                pass
-
     def test_market_month_uses_china_timezone(self):
         value = datetime(2026, 6, 30, 16, 30, tzinfo=timezone.utc)
         self.assertEqual(

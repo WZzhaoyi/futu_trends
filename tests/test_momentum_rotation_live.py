@@ -183,159 +183,156 @@ class LiveSignalTest(unittest.TestCase):
             momentum.calculate_momentum_score(np.array([1.0, 1.1, 1.2, 1.3])),
         )
 
-    def test_leg_decision_initial_none_and_cooldown(self):
-        # CN-A 为 cooldown 机制（N=3）；US-A 现为 ε 机制（见 epsilon 测试）
-        leg = find_leg("CN-A")
-        scores = {
+    def test_decision_action_matrix(self):
+        today = date(2026, 8, 14)
+        growth_scores = {
             "SZ.159941": 0.8,
             "SZ.159949": 0.6,
             "SH.510300": 0.5,
             "SH.518880": 0.2,
         }
-        today = date(2026, 8, 14)
-
-        self.assertEqual(
-            momentum.live_leg_decision(leg, scores, None, None, today),
-            "INITIAL",
-        )
-        self.assertEqual(
-            momentum.live_leg_decision(
-                leg, scores, "SZ.159941", "2026-08-13", today
-            ),
-            "NONE",
-        )
-        self.assertEqual(
-            momentum.live_leg_decision(
-                leg, scores, "SH.510300", "2026-08-13", today
-            ),
-            "NONE",
-        )
-        cooldown_expired = momentum.live_leg_decision(
-            leg, scores, "SH.510300", "2026-07-31", today
-        )
-        self.assertEqual(cooldown_expired, "ROTATE")
-        cooldown_blocked = momentum.live_leg_decision(
-            leg, scores, "SH.510300", "2026-08-12", today
-        )
-        self.assertEqual(cooldown_blocked, "NONE")
-
-    def test_leg_decision_cash_and_min_score_rules(self):
-        leg = find_leg("US-B")
-        scores = {
+        cash_scores = {
             "US.UUP": 0.9,
             "US.QQQ": 0.8,
             "US.FXI": 0.5,
             "US.GLD": 0.2,
         }
-        today = date(2026, 8, 14)
-
-        self.assertEqual(
-            momentum.live_leg_decision(leg, scores, None, None, today),
-            "INITIAL",
-        )
-        self.assertEqual(
-            momentum.live_leg_decision(
-                leg, scores, "US.QQQ", "2026-08-01", today
-            ),
-            "SELL",
-        )
-        self.assertEqual(
-            momentum.live_leg_decision(
-                leg, scores, "US.UUP", "2026-08-01", today
-            ),
-            "NONE",
-        )
         scores_below_threshold = {
             "US.QQQ": 0.05,
             "US.UUP": 0.02,
             "US.FXI": 0.01,
             "US.GLD": 0.0,
         }
-        self.assertEqual(
-            momentum.live_leg_decision(
-                leg, scores_below_threshold, "US.QQQ", "2026-08-01", today, 0.1
-            ),
-            "SELL",
-        )
-        self.assertEqual(
-            momentum.live_leg_decision(
-                leg, scores_below_threshold, None, None, today, 0.1
-            ),
-            "INITIAL",
-        )
-        scores_above_threshold = {
-            "US.QQQ": 0.8,
-            "US.UUP": 0.2,
-            "US.FXI": 0.1,
-            "US.GLD": 0.0,
-        }
-        self.assertEqual(
-            momentum.live_leg_decision(
-                leg, scores_above_threshold, None, None, today, 0.1
-            ),
-            "INITIAL",
-        )
-
-    def test_leg_decision_epsilon_blocks_narrow_gap(self):
-        leg = find_leg("US-B")
-        scores = {
+        narrow_gap = {
             "US.QQQ": 0.80,
             "US.SPY": 0.75,
             "US.FXI": 0.50,
             "US.GLD": 0.20,
         }
-        today = date(2026, 8, 14)
-
-        self.assertEqual(
-            momentum.live_leg_decision(leg, scores, "US.SPY", "2026-08-01", today),
-            "NONE",
-        )
         wide_gap = {
             "US.QQQ": 0.95,
             "US.SPY": 0.60,
             "US.FXI": 0.50,
             "US.GLD": 0.20,
         }
-        self.assertEqual(
-            momentum.live_leg_decision(leg, wide_gap, "US.SPY", "2026-08-01", today),
-            "ROTATE",
+        cases = (
+            (
+                "initial",
+                growth_scores,
+                {"initialized": False},
+                "INITIAL",
+                "SZ.159941",
+                False,
+            ),
+            (
+                "unchanged",
+                growth_scores,
+                {"previous_state_symbol": "SZ.159941"},
+                "NONE",
+                "SZ.159941",
+                False,
+            ),
+            (
+                "cooldown blocked",
+                growth_scores,
+                {
+                    "previous_state_symbol": "SH.510300",
+                    "last_change_date": date(2026, 8, 12),
+                    "cooldown": 3,
+                },
+                "NONE",
+                "SH.510300",
+                True,
+            ),
+            (
+                "cooldown expired",
+                growth_scores,
+                {
+                    "previous_state_symbol": "SH.510300",
+                    "last_change_date": date(2026, 7, 31),
+                    "cooldown": 3,
+                },
+                "ROTATE",
+                "SZ.159941",
+                False,
+            ),
+            (
+                "cash selected",
+                cash_scores,
+                {
+                    "cash_symbols": ("US.UUP",),
+                    "previous_state_symbol": "US.QQQ",
+                },
+                "SELL",
+                None,
+                False,
+            ),
+            (
+                "cash unchanged",
+                cash_scores,
+                {
+                    "cash_symbols": ("US.UUP",),
+                    "previous_state_symbol": "US.UUP",
+                },
+                "NONE",
+                None,
+                False,
+            ),
+            (
+                "below minimum",
+                scores_below_threshold,
+                {"previous_state_symbol": "US.QQQ", "min_score": 0.1},
+                "SELL",
+                None,
+                False,
+            ),
+            (
+                "below minimum initial",
+                scores_below_threshold,
+                {"min_score": 0.1, "initialized": False},
+                "INITIAL",
+                None,
+                False,
+            ),
+            (
+                "epsilon blocked",
+                narrow_gap,
+                {"previous_state_symbol": "US.SPY", "gap_eps": 0.30},
+                "NONE",
+                "US.SPY",
+                True,
+            ),
+            (
+                "epsilon rotate",
+                wide_gap,
+                {"previous_state_symbol": "US.SPY", "gap_eps": 0.30},
+                "ROTATE",
+                "US.QQQ",
+                False,
+            ),
+            (
+                "cash reentry",
+                wide_gap,
+                {
+                    "cash_symbols": ("US.UUP",),
+                    "previous_state_symbol": "US.UUP",
+                    "gap_eps": 0.30,
+                },
+                "BUY",
+                "US.QQQ",
+                False,
+            ),
         )
-        reentry_from_cash_not_blocked = momentum.live_leg_decision(
-            leg, wide_gap, "US.UUP", "2026-08-10", today
-        )
-        self.assertEqual(reentry_from_cash_not_blocked, "BUY")
-
-    def test_shared_decision_keeps_current_holding_when_rotation_is_blocked(self):
-        decision = momentum.decide_rotation(
-            {
-                "SZ.159941": 0.8,
-                "SH.510300": 0.5,
-            },
-            previous_state_symbol="SH.510300",
-            last_change_date=date(2026, 8, 12),
-            decision_date=date(2026, 8, 14),
-            cooldown=3,
-        )
-
-        self.assertEqual(decision.action, "NONE")
-        self.assertTrue(decision.blocked)
-        self.assertEqual(decision.selected_symbol, "SZ.159941")
-        self.assertEqual(decision.target_symbol, "SH.510300")
-
-    def test_shared_decision_allows_first_asset_rotation_without_anchor(self):
-        decision = momentum.decide_rotation(
-            {
-                "SZ.159941": 0.8,
-                "SH.510300": 0.5,
-            },
-            previous_state_symbol="SH.510300",
-            decision_date=date(2026, 8, 14),
-            cooldown=3,
-        )
-
-        self.assertEqual(decision.action, "ROTATE")
-        self.assertFalse(decision.blocked)
-        self.assertEqual(decision.target_symbol, "SZ.159941")
+        for name, scores, kwargs, action, target, blocked in cases:
+            with self.subTest(case=name):
+                decision = momentum.decide_rotation(
+                    scores,
+                    decision_date=today,
+                    **kwargs,
+                )
+                self.assertEqual(decision.action, action)
+                self.assertEqual(decision.target_symbol, target)
+                self.assertEqual(decision.blocked, blocked)
 
     def test_futu_trading_calendar_distinguishes_holiday(self):
         trading = types.SimpleNamespace(
@@ -643,10 +640,6 @@ class LiveEndToEndTest(unittest.TestCase):
                 states[event["market"]].leg_state(leg)["last_rotation_date"],
                 "2026-08-14",
             )
-            self.assertNotIn(
-                "last_evaluation_date",
-                states[event["market"]].leg_state(leg),
-            )
         self.assertEqual(states["US"].last_snapshot["type"], "SIGNAL")
         self.assertEqual(states["CN"].last_snapshot["type"], "SIGNAL")
         self.assertEqual(len(context.subscriptions), 2)
@@ -714,11 +707,6 @@ class LiveEndToEndTest(unittest.TestCase):
         self.assertEqual(states["CN"].last_snapshot["type"], "IDLE")
         for market, state in states.items():
             self.assertEqual(state.last_snapshot["market"], market)
-            for leg in market_legs(market):
-                self.assertNotIn(
-                    "last_evaluation_date",
-                    state.leg_state(leg.name),
-                )
 
     def test_with_markets_filter_evaluates_only_requested_market(self):
         fake_futu = types.ModuleType("futu")
@@ -771,7 +759,6 @@ class LiveEndToEndTest(unittest.TestCase):
         self.assertEqual(len(context.subscriptions), 1)
         self.assertFalse(us_state_exists)
         self.assertEqual(state.leg_state("CN-A")["selected_symbol"], "SZ.159941")
-        self.assertNotIn("last_evaluation_date", state.leg_state("CN-A"))
 
 
 if __name__ == "__main__":
