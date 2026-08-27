@@ -125,6 +125,7 @@ module.exports = {
     env: {
       PYTHONUNBUFFERED: "1",
       PYTHONPATH: pythonPath,
+      MALLOC_ARENA_MAX: "2",
     },
   }],
 };

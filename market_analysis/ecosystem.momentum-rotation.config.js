@@ -112,6 +112,7 @@ const apps = markets.map((market) => {
     env: {
       PYTHONUNBUFFERED: "1",
       PYTHONPATH: pythonPath,
+      MALLOC_ARENA_MAX: "2",
     },
   };
 });
