@@ -22,7 +22,6 @@ import re
 import smtplib
 from email.mime.text import MIMEText
 from email.header import Header
-from socket import gaierror
 import time
 import os
 import json
@@ -31,9 +30,11 @@ from requests_html import HTMLSession
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 import httplib2
+import requests
 from google_auth_httplib2 import AuthorizedHttp
 from futu_group import sync_futu_group
 
+from .delivery_log import log_delivery, log_delivery_exception
 from .webhook import WebhookNotifier, HookResult
 
 logger = logging.getLogger(__name__)
@@ -158,8 +159,9 @@ class NotificationEngine:
         """
         if not self.futu_keyword:
             logger.warning('没有futu关键词，跳过存入futu group')
-            return
+            return False
 
+        results = []
         for keyword in self.futu_keyword:
             matched_codes = []
             matched_highs = []
@@ -174,15 +176,30 @@ class NotificationEngine:
                 matched_lows.append(recent_low)
 
             if matched_codes:
-                sync_futu_group(
-                    keyword,
-                    matched_codes,
-                    host=self.host,
-                    port=self.port,
-                    price_up_list=matched_highs,
-                    price_down_list=matched_lows,
-                    overwrite=False,
-                )
+                try:
+                    ok = bool(
+                        sync_futu_group(
+                            keyword,
+                            matched_codes,
+                            host=self.host,
+                            port=self.port,
+                            price_up_list=matched_highs,
+                            price_down_list=matched_lows,
+                            overwrite=False,
+                        )
+                    )
+                    log_delivery(
+                        'futu_group',
+                        'sync',
+                        ok=ok,
+                        group=keyword,
+                        symbol_count=len(matched_codes),
+                    )
+                except Exception as exc:
+                    ok = False
+                    log_delivery_exception('futu_group', 'sync', exc)
+                results.append(ok)
+        return all(results) if results else True
 
 
     def send_email(self, subject: str, message_html: str):
@@ -222,22 +239,81 @@ class NotificationEngine:
         message['To'] = ','.join(self.receivers)
         message['Subject'] = f"Trends - {datetime.today().strftime('%Y-%m-%d')} - {subject}"
 
+        smtp_obj = None
         try:
-            smtpObj = smtplib.SMTP_SSL(
+            smtp_obj = smtplib.SMTP_SSL(
                 self.mail_host,
                 self.mail_port,
                 timeout=NOTIFICATION_NETWORK_TIMEOUT,
             )
-            smtpObj.login(self.sender, self.mail_pass)  #登陆
-            smtpObj.sendmail(self.sender, self.receivers, message.as_string())  #发送
-            smtpObj.quit()
-            logger.info('Email Sent: %s', self.receivers)
-        except (gaierror, ConnectionRefusedError, TimeoutError):
-            logger.error('Failed to connect to the server. Bad connection settings?')
-        except smtplib.SMTPServerDisconnected:
-            logger.error('Failed to connect to the server. Wrong user/password?')
-        except smtplib.SMTPException as e:
-            logger.error('SMTP error occurred: %s', e)
+            smtp_obj.login(self.sender, self.mail_pass)
+            refused = smtp_obj.sendmail(
+                self.sender,
+                self.receivers,
+                message.as_string(),
+            )
+            refused_count = len(refused or {})
+            log_delivery(
+                'email',
+                'send',
+                ok=refused_count == 0,
+                recipient_count=len(self.receivers),
+                refused_count=refused_count,
+            )
+            return refused_count == 0
+        except Exception as exc:
+            log_delivery_exception('email', 'send', exc)
+            return False
+        finally:
+            if smtp_obj is not None:
+                try:
+                    smtp_obj.quit()
+                except (OSError, smtplib.SMTPException):
+                    pass
+
+    @staticmethod
+    def _log_telegram_response(operation, response):
+        """记录简洁、脱敏的 Telegram HTTP 响应，并返回是否发送成功。"""
+        try:
+            payload = response.json()
+        except (TypeError, ValueError):
+            payload = {}
+        if not isinstance(payload, dict):
+            payload = {}
+
+        status_code = getattr(response, 'status_code', None)
+        telegram_ok = payload.get('ok') is True
+        if status_code == 200 and telegram_ok:
+            result = payload.get('result')
+            if isinstance(result, list):
+                details = {'message_count': len(result)}
+            elif isinstance(result, dict):
+                details = {'message_id': result.get('message_id')}
+            else:
+                details = {}
+            log_delivery(
+                'telegram',
+                operation,
+                ok=True,
+                status=status_code,
+                **details,
+            )
+            return True
+
+        description = payload.get('description')
+        if isinstance(description, str):
+            description = ' '.join(description.split())[:160]
+        else:
+            description = 'non-JSON response'
+        log_delivery(
+            'telegram',
+            operation,
+            ok=False,
+            status=status_code,
+            error_code=payload.get('error_code'),
+            error=description,
+        )
+        return False
 
     def send_telegram_message(self, text, link='www.google.com'):
         """
@@ -258,16 +334,16 @@ class NotificationEngine:
         }
         url = f'https://api.telegram.org/bot{self.TELEGRAM_BOT_TOKEN}/sendMessage'
         try:
-            self.SESSION.post(
+            response = self.SESSION.post(
                 url,
                 headers=headers,
                 json=data,
                 proxies=self.PROXIES,
                 timeout=NOTIFICATION_NETWORK_TIMEOUT,
             )
-            logger.info('Telegram Sent: %s', self.TELEGRAM_CHAT_ID)
-        except:
-            logger.error('网络代理错误，请检查确认后关闭本程序重试')
+            self._log_telegram_response('sendMessage', response)
+        except Exception as exc:
+            log_delivery_exception('telegram', 'sendMessage', exc)
 
     def send_telegram_photo(self, img_url):
         """
@@ -279,15 +355,18 @@ class NotificationEngine:
             return
 
         url = f'https://api.telegram.org/bot{self.TELEGRAM_BOT_TOKEN}/sendPhoto'
-        data = dict(chat_id=f"{self.TELEGRAM_CHAT_ID}&", photo=img_url)
+        data = dict(chat_id=self.TELEGRAM_CHAT_ID, photo=img_url)
 
-        self.SESSION.post(
-            url,
-            data=data,
-            proxies=self.PROXIES,
-            timeout=NOTIFICATION_NETWORK_TIMEOUT,
-        )
-        self.plog(f'Telegram Sent: {self.TELEGRAM_CHAT_ID}')
+        try:
+            response = self.SESSION.post(
+                url,
+                data=data,
+                proxies=self.PROXIES,
+                timeout=NOTIFICATION_NETWORK_TIMEOUT,
+            )
+            self._log_telegram_response('sendPhoto', response)
+        except Exception as exc:
+            log_delivery_exception('telegram', 'sendPhoto', exc)
 
     def send_telegram_photos(self, pic_urls):
         """
@@ -306,26 +385,25 @@ class NotificationEngine:
         for pic in pic_urls:
             params['media'].append({'type': 'photo', 'media': pic})
         params['media'] = json.dumps(params['media'])
-        result = self.SESSION.post(
-            url,
-            data=params,
-            proxies=self.PROXIES,
-            timeout=NOTIFICATION_NETWORK_TIMEOUT,
-        )
-        if result.status_code != 200: # 如果分组发送失败 则单独发送图片
+        try:
+            response = self.SESSION.post(
+                url,
+                data=params,
+                proxies=self.PROXIES,
+                timeout=NOTIFICATION_NETWORK_TIMEOUT,
+            )
+            sent = self._log_telegram_response('sendMediaGroup', response)
+        except Exception as exc:
+            log_delivery_exception('telegram', 'sendMediaGroup', exc)
+            sent = False
+        if not sent: # 如果分组发送失败 则单独发送图片
             for pic in pic_urls:
                 self.send_telegram_photo(pic)
 
-    def _safe_execute(self, execute_func, *args, **kwargs):
-        """安全的执行函数，带重试机制"""
-        for attempt in range(3):
-            try:
-                return execute_func(*args, **kwargs).execute()
-            except Exception as e:
-                if attempt == 2:
-                    raise e
-                time.sleep(1)
-        return None
+    @staticmethod
+    def _execute_google_request(execute_func, *args, **kwargs):
+        """使用 Google 客户端内建的临时错误重试策略。"""
+        return execute_func(*args, **kwargs).execute(num_retries=2)
 
     def _safe_feishu_request(self, method, url, *, headers=None, **kwargs):
         """执行飞书 OpenAPI 请求，带重试和业务错误检查"""
@@ -340,16 +418,24 @@ class NotificationEngine:
                     timeout=30,
                     **kwargs,
                 )
+                if (
+                    response.status_code == 429
+                    or response.status_code >= 500
+                ) and attempt < 2:
+                    time.sleep(1)
+                    continue
                 response.raise_for_status()
                 data = response.json()
+                if not isinstance(data, dict):
+                    raise ValueError("Feishu API 返回非对象 JSON")
                 if data.get("code", 0) != 0:
                     raise RuntimeError(f"{data.get('code')}: {data.get('msg')}")
                 return data
-            except Exception as e:
+            except (requests.Timeout, requests.ConnectionError):
                 if attempt == 2:
-                    raise e
+                    raise
                 time.sleep(1)
-        return None
+        raise RuntimeError("Feishu API 请求重试耗尽")
 
     def _get_feishu_tenant_access_token(self):
         if self.feishu_static_tenant_access_token:
@@ -465,10 +551,16 @@ class NotificationEngine:
             existing_content = self._read_feishu_value(target_cell)
             updated_content = f"{existing_content}\n\n{message}" if existing_content else message
             self._write_feishu_values(target_cell, [[updated_content]])
-            logger.info('Feishu Sheet Updated: %s at %s (%s)', self.feishu_spreadsheet_token, target_cell, sheet_name)
+            log_delivery(
+                'feishu_sheet',
+                'update',
+                ok=True,
+                sheet=sheet_name,
+                cell=f'{position["target_col"]}{position["target_row"]}',
+            )
 
-        except Exception as e:
-            logger.error('飞书电子表格操作失败: %s', e)
+        except Exception as exc:
+            log_delivery_exception('feishu_sheet', 'update', exc)
 
     def send_google_sheet_message(self, message):
         """更新Google Sheet"""
@@ -509,10 +601,10 @@ class NotificationEngine:
             target_cell = f'{cell_sheet_name}!{target_col}{target_row}'
 
             # 确保工作表存在
-            sheet_metadata = self._safe_execute(service.spreadsheets().get, spreadsheetId=self.google_sheet_id)
+            sheet_metadata = self._execute_google_request(service.spreadsheets().get, spreadsheetId=self.google_sheet_id)
             if not any(sheet['properties']['title'] == cell_sheet_name for sheet in sheet_metadata.get('sheets', [])):
                 # 创建新工作表并初始化日历模板
-                self._safe_execute(
+                self._execute_google_request(
                     service.spreadsheets().batchUpdate,
                     spreadsheetId=self.google_sheet_id,
                     body={'requests': [{'addSheet': {'properties': {'title': cell_sheet_name}}}]}
@@ -520,7 +612,7 @@ class NotificationEngine:
 
                 # 设置表头
                 header_range = f'{cell_sheet_name}!{start_col_letter}{start_row}:{position["header_end_col"]}{start_row}'
-                self._safe_execute(
+                self._execute_google_request(
                     service.spreadsheets().values().update,
                     spreadsheetId=self.google_sheet_id,
                     range=header_range,
@@ -530,7 +622,7 @@ class NotificationEngine:
 
             # 读取现有内容
             existing_content = ""
-            existing_result = self._safe_execute(
+            existing_result = self._execute_google_request(
                 service.spreadsheets().values().get,
                 spreadsheetId=self.google_sheet_id,
                 range=target_cell
@@ -539,17 +631,29 @@ class NotificationEngine:
 
             # 更新单元格
             updated_content = f"{existing_content}\n\n{message}" if existing_content else message
-            self._safe_execute(
+            update_result = self._execute_google_request(
                 service.spreadsheets().values().update,
                 spreadsheetId=self.google_sheet_id,
                 range=target_cell,
                 valueInputOption='RAW',
                 body={'values': [[updated_content]]}
             )
-            logger.info('Google Sheet Updated: %s at %s', self.google_sheet_id, target_cell)
+            updated_cells = (
+                update_result.get('updatedCells')
+                if isinstance(update_result, dict)
+                else None
+            )
+            log_delivery(
+                'google_sheet',
+                'update',
+                ok=True,
+                sheet=cell_sheet_name,
+                cell=f'{target_col}{target_row}',
+                updated_cells=updated_cells,
+            )
 
-        except Exception as e:
-            logger.error('Google Sheet操作失败: %s', e)
+        except Exception as exc:
+            log_delivery_exception('google_sheet', 'update', exc)
 
     def send_webhook(self, content: str) -> HookResult:
         """通过 Webhook 发送"""

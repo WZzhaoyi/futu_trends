@@ -48,6 +48,8 @@ from dataclasses import dataclass, field
 
 import requests
 
+from .delivery_log import log_delivery, log_delivery_exception
+
 logger = logging.getLogger(__name__)
 
 _OK_FIELD = "ok"
@@ -84,36 +86,78 @@ class WebhookNotifier:
             return HookResult(ok=False, error="WEBHOOK_URL 未配置")
 
         payload = {**self._payload, self._content_field: content}
-        timeout = int(self._payload.get("timeoutseconds", 30)) + 10
-
-        logger.info("发送通知 → url=%s | 内容长度=%d", self._url, len(content))
         try:
-            resp = requests.post(self._url, headers=self._headers, json=payload,
-                                  timeout=timeout, proxies=self._proxies)
-            logger.debug("响应状态: %d", resp.status_code)
+            timeout = int(self._payload.get("timeoutseconds", 30)) + 10
+            if timeout <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            log_delivery(
+                'webhook',
+                'send',
+                ok=False,
+                error='invalid timeoutseconds',
+            )
+            return HookResult(ok=False, error="invalid timeoutseconds")
 
-            content_type = resp.headers.get("Content-Type", "")
-            if not content_type.startswith("application/json"):
-                body = resp.text[:500]
-                logger.error("非 JSON 响应 | status=%d | body=%s", resp.status_code, body)
-                return HookResult(ok=False, error=f"HTTP {resp.status_code}: {body}")
-
+        try:
+            resp = requests.post(
+                self._url,
+                headers=self._headers,
+                json=payload,
+                timeout=timeout,
+                proxies=self._proxies,
+            )
             if not resp.text.strip():
-                logger.error("空响应 | status=%d", resp.status_code)
+                log_delivery(
+                    'webhook',
+                    'send',
+                    ok=False,
+                    status=resp.status_code,
+                    error='empty response',
+                )
                 return HookResult(ok=False, error=f"HTTP {resp.status_code}: empty response")
 
-            data = resp.json()
+            try:
+                data = resp.json()
+            except ValueError:
+                log_delivery(
+                    'webhook',
+                    'send',
+                    ok=False,
+                    status=resp.status_code,
+                    error='non-JSON response',
+                )
+                return HookResult(
+                    ok=False,
+                    error=f"HTTP {resp.status_code}: non-JSON response",
+                )
+            if not isinstance(data, dict):
+                data = {}
+
             if resp.ok and data.get(_OK_FIELD):
-                logger.info("发送成功: id=%s", data.get(_ID_FIELD))
+                log_delivery(
+                    'webhook',
+                    'send',
+                    ok=True,
+                    status=resp.status_code,
+                    run_id=data.get(_ID_FIELD),
+                )
                 return HookResult(ok=True, run_id=data.get(_ID_FIELD), raw=data)
 
             err = data.get("error", f"HTTP {resp.status_code}")
-            logger.error("发送失败: %s | raw=%s", err, data)
+            log_delivery(
+                'webhook',
+                'send',
+                ok=False,
+                status=resp.status_code,
+                error=err,
+            )
             return HookResult(ok=False, error=err, raw=data)
 
         except requests.Timeout:
-            logger.error("请求超时")
+            log_delivery('webhook', 'send', ok=False, exception='Timeout')
             return HookResult(ok=False, error="request timeout")
-        except requests.RequestException as e:
-            logger.error("请求异常: %s", e)
-            return HookResult(ok=False, error=str(e))
+        except requests.RequestException as exc:
+            exception_name = type(exc).__name__
+            log_delivery_exception('webhook', 'send', exc)
+            return HookResult(ok=False, error=exception_name)

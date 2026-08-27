@@ -69,6 +69,7 @@ def sync_futu_group(
         records.append((code, price_up, price_down))
 
     quote_ctx = ft.OpenQuoteContext(host=host, port=port)
+    reminders_ok = True
     try:
         ret, data = quote_ctx.get_user_security(group_name)
         if ret != ft.RET_OK:
@@ -122,10 +123,11 @@ def sync_futu_group(
                 logger.info('%s 价格提醒 [%s,%s]', code, price_down, price_up)
             else:
                 logger.error('%s 价格提醒失败 %s %s %s', code, data_del, data_up, data_down)
+                reminders_ok = False
 
             if reminder_sleep_seconds > 0:
                 time.sleep(reminder_sleep_seconds)
 
-        return True
+        return reminders_ok
     finally:
         quote_ctx.close()
