@@ -57,15 +57,16 @@ td.dn { color: #00a843; }
 <script>
 // 列定义：get 取值，num 数值列（右对齐 + 数值排序）；candidate 为平铺结构
 const COLUMNS = [
-  { key: 'code',  label: '代码',   get: c => c.code },
-  { key: 'name',  label: '名称',   get: c => c.name },
+  { key: 'code',  label: '代码',   always: true, get: c => c.code },
+  { key: 'name',  label: '名称',   always: true, get: c => c.name },
   { key: 'price', label: '现价',   num: true, get: c => c.last_price },
   { key: 'chg',   label: '涨跌%',  num: true, get: c => c.change_pct, fmt: v => (v > 0 ? '+' : '') + v.toFixed(2) },
   { key: 'mcap',  label: '市值(亿)', num: true, get: c => c.total_market_val, fmt: v => (v / 1e8).toFixed(1) },
   { key: 'turnover', label: '成交额(亿)', num: true, get: c => c.turnover, fmt: v => (v / 1e8).toFixed(2) },
   { key: 'pe',    label: 'PE',     num: true, get: c => c.pe_ttm_ratio ?? c.pe_ratio },
   { key: 'pb',    label: 'PB',     num: true, get: c => c.pb_ratio },
-  { key: 'roe',   label: 'ROE%',   num: true, get: c => c.snapshot_roe },
+  { key: 'roe',   label: 'ROE%',   num: true, get: c => c.snapshot_roe ?? c.return_on_equity_rate },
+  { key: 'pr',    label: 'PR',     num: true, get: c => c.pr ?? c.snapshot_pr },
   { key: 'div',   label: '股息%',  num: true, get: c => c.dividend_ratio_ttm },
 ];
 
@@ -76,6 +77,10 @@ let sortKey = 'turnover', sortDesc = true;   // 默认按成交额降序；置�
 
 const $ = id => document.getElementById(id);
 
+function visibleColumns() {
+  return COLUMNS.filter(col => col.always || candidates.some(c => col.get(c) != null));
+}
+
 function fmtCell(col, c) {
   const v = col.get(c);
   if (v == null) return '-';
@@ -83,19 +88,27 @@ function fmtCell(col, c) {
   return col.num ? Number(v).toFixed(2) : v;
 }
 
-function syncSortControls() {
+function syncSortControls(columns = visibleColumns()) {
+  $('sort-field').innerHTML = '<option value="">策略排序</option>' +
+    columns.filter(c => c.num)
+      .map(c => `<option value="${c.key}">${c.label}</option>`).join('');
   $('sort-field').value = sortKey || '';
   $('sort-dir').textContent = sortDesc ? '↓' : '↑';
 }
 
 function applySort() {
-  syncSortControls();
-  renderHead();
-  renderRows();
+  const columns = visibleColumns();
+  if (sortKey && !columns.some(c => c.key === sortKey)) {
+    sortKey = columns.some(c => c.key === 'turnover') ? 'turnover' : null;
+    sortDesc = true;
+  }
+  syncSortControls(columns);
+  renderHead(columns);
+  renderRows(columns);
 }
 
-function renderHead() {
-  $('thead-row').innerHTML = COLUMNS.map(col => {
+function renderHead(columns = visibleColumns()) {
+  $('thead-row').innerHTML = columns.map(col => {
     const cls = [col.num ? 'num' : '', 'sortable',
                  col.key === sortKey ? 'sorted' : ''].join(' ').trim();
     const arrow = col.key === sortKey ? (sortDesc ? ' ↓' : ' ↑') : '';
@@ -103,13 +116,13 @@ function renderHead() {
   }).join('');
 }
 
-function renderRows() {
+function renderRows(columns = visibleColumns()) {
   const kw = $('search').value.trim().toLowerCase();
   let rows = candidates;
   if (kw) rows = rows.filter(c =>
     c.code.toLowerCase().includes(kw) || (c.name || '').toLowerCase().includes(kw));
 
-  const col = sortKey && COLUMNS.find(c => c.key === sortKey);
+  const col = sortKey && columns.find(c => c.key === sortKey);
   if (col && col.get) {
     rows = [...rows].sort((a, b) => {
       let va = col.get(a), vb = col.get(b);
@@ -118,7 +131,7 @@ function renderRows() {
     });
   }
 
-  $('tbody').innerHTML = rows.map(c => `<tr class="row" data-code="${c.code}">` + COLUMNS.map(col => {
+  $('tbody').innerHTML = rows.map(c => `<tr class="row" data-code="${c.code}">` + columns.map(col => {
     let cls = col.key === 'code' ? 'code head' : col.key === 'name' ? 'head' : col.num ? 'num' : '';
     if (col.key === 'chg') {
       const v = col.get(c);
@@ -179,8 +192,6 @@ async function init() {
 }
 
 // 移动端排序下拉（桌面端由表头点击代替，二者状态同步）
-$('sort-field').innerHTML = '<option value="">策略排序</option>' +
-  COLUMNS.filter(c => c.num).map(c => `<option value="${c.key}">${c.label}</option>`).join('');
 $('sort-field').addEventListener('change', e => {
   sortKey = e.target.value || null;
   sortDesc = true;
@@ -191,7 +202,7 @@ syncSortControls();
 
 $('strategy').addEventListener('change', onStrategyChange);
 $('market').addEventListener('change', loadResult);
-$('search').addEventListener('input', renderRows);
+$('search').addEventListener('input', () => renderRows());
 $('tbody').addEventListener('click', e => {
   const row = e.target.closest('tr.row');
   if (row) window.open(`/api/futu/quote/${encodeURIComponent(row.dataset.code)}`,
