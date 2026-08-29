@@ -7,7 +7,7 @@ PR ≤ 0.5 视为「半价买入优质公司」。
 L1 筛选 get_stock_filter 服务端首筛 + 返回字段的 Python 精确计算：
 
 服务端筛选（年报口径财务字段）：
-  - 市值 ≥ 100 亿（本位币）、PB > 0（净资产为正）、PE_TTM ∈ (0, 30]
+  - 市值 ≥ 100 亿（本位币）、20 日均成交额达到市场门槛、PB > 0、PE_TTM ∈ (0, 30]
   - ROE ≥ 8%、ROA_TTM ≥ 1%、权益乘数 ∈ [1, 4]（净资产 ≥ 总资产 25%）
   - 净利润 > 0、经营现金流 TTM > 0、资产负债率 ≤ 65%
 
@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from futu_fundamental_screener import (  # noqa: E402
     _candidate_from_filter_row,
+    accumulate_filter,
     financial_filter,
     main,
     num,
@@ -49,6 +50,8 @@ DESCRIPTION = "市赚率 (PR=PE/ROE/100, PR<=0.5) value screener — L1"
 # ---- L1 服务端筛选常量（年报口径） ----
 # 市值下限 100 亿（各市场本位币），剔除小盘股；停牌股由 snapshot 阶段剔除
 MARKET_CAP_MIN = 1e10
+TURNOVER_AVG_DAYS = 20
+TURNOVER_MIN = {"US": 50e6, "HK": 5e6, "A": 50e6}
 PE_MIN = 0.01
 # PR<=0.5 ⇔ PE <= ROE%*0.5；ROE>=8% 时 PE 上限本就很低。
 # 30 仅用于控制候选规模（ROE=60% 的极端高 ROE 才可能 PE=30 仍合格，会被权益乘数二次过滤）。
@@ -72,6 +75,9 @@ def build_filters(market: str, ft):
     q = ft.FinancialQuarter.ANNUAL
     return [
         simple_filter(sf.MARKET_VAL, MARKET_CAP_MIN),
+        accumulate_filter(
+            sf.TURNOVER, TURNOVER_MIN[market], days=TURNOVER_AVG_DAYS,
+        ),
         simple_filter(sf.PB_RATE, 0.01),  # PB<=0（净资产为负/失真）直接剔除
         simple_filter(sf.PE_TTM, PE_MIN, PE_MAX, sort=ft.SortDir.ASCEND),
         financial_filter(sf.RETURN_ON_EQUITY_RATE, ROE_MIN, quarter=q),

@@ -7,7 +7,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from futu_fundamental_screener import (  # noqa: E402
+    accumulate_filter,
     financial_filter,
+    generic_futu_refine,
     main,
     num,
     ratio,
@@ -18,7 +20,9 @@ from futu_fundamental_screener import (  # noqa: E402
 NAME = "growth_value"
 DESCRIPTION = "Growth-value fundamental screener"
 
-MARKET_CAP_MIN = {"US": 2e9, "HK": 5e9, "A": 5e9}
+MARKET_CAP_MIN = {"US": 10e9, "HK": 10e9, "A": 10e9}
+TURNOVER_AVG_DAYS = 20
+TURNOVER_MIN = {"US": 50e6, "HK": 5e6, "A": 50e6}
 PE_MIN = 0.01
 PE_MAX = 35.0
 PB_MAX = 5.0
@@ -33,6 +37,9 @@ def build_filters(market: str, ft):
     q = ft.FinancialQuarter.ANNUAL
     return [
         simple_filter(sf.MARKET_VAL, MARKET_CAP_MIN[market]),
+        accumulate_filter(
+            sf.TURNOVER, TURNOVER_MIN[market], days=TURNOVER_AVG_DAYS,
+        ),
         simple_filter(sf.PE_TTM, PE_MIN, PE_MAX),
         simple_filter(sf.PB_RATE, 0.01, PB_MAX),
         financial_filter(sf.RETURN_ON_EQUITY_RATE, ROE_MIN, quarter=q),
@@ -55,13 +62,19 @@ def score_snapshot(candidate, snap):
 
 
 L2_MIN_PIOTROSKI = 4
+FUTU_L2_STATEMENT_TYPES = ("income", "balance", "cashflow")
+refine_futu = generic_futu_refine
 
 
 def l2_passes(candidate) -> bool:
-    """--refine L2 门槛：通用 L2 的 Piotroski 式质量分 ≥ 4。"""
+    """--refine L2 门槛：8 项均可计算，且 Piotroski 式质量分 ≥ 4。"""
     l2 = candidate.get("l2") or {}
     score = l2.get("piotroski_like_score")
-    return bool(l2.get("ok") and score is not None and score >= L2_MIN_PIOTROSKI)
+    available = l2.get("piotroski_like_available")
+    return bool(
+        l2.get("ok") and available == 8
+        and score is not None and score >= L2_MIN_PIOTROSKI
+    )
 
 
 if __name__ == "__main__":

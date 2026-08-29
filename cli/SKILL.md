@@ -96,7 +96,7 @@ scr = call_cli("screen", "--market", "US", "--strategy", "sepa")
 | `EMA_PERIOD` | `signals` 的 EMA 周期（默认 240） | 否 |
 | `MACD_PARAMS_DB` / `KD_PARAMS_DB` / `RSI_PARAMS_DB` / `SR_PARAMS_DB` | ParamsDB 路径，供 `signals` 取最优参数 + detect | 否 |
 
-> `screen` 默认只跑 OpenD 服务端选股 + snapshot 富集；传 `--refine` 后，L2 走 **yfinance**。
+> `screen` 默认只跑 OpenD 服务端选股 + snapshot 富集；传 `--refine` 后，仅显式声明 L2 的策略走 **Futu F10**，要求 OpenD / futu-api >= 10.6.6608。
 > `signals` 的趋势 L2 走 **yfinance**。`screen` 的 L1/snapshot 需要 OpenD。
 
 调用方自备一份精简 config（只需 `[CONFIG]` 段 + 下列键，其余项一概不用写）。
@@ -157,19 +157,17 @@ kline --code US.AAPL --count 400 [--ktype K_DAY]
 
 ### 2) `screen` — 条件选股（策略条件 + L1 服务端首筛 + snapshot 排序 + 可选 L2）
 ```bash
-screen --market US|HK|A [--strategy sepa|pr|growth_value|deep_value] [--limit N] [--refine]
+screen --market US|HK|A [--strategy sepa|pr|growth_value|deep_value] [--refine]
 ```
 - `--strategy`：默认 `sepa`；也可选 `pr`、`growth_value`、`deep_value`。
-- `--limit`：按 `snapshot_score` 排序后只返回前 N 只。
 - `--no-snapshot`：只跑 `get_stock_filter`，不做 snapshot 富集/排序。
-- `--refine`：对候选运行 yfinance L2 精算；**定义了 L2 门槛的策略会在此步直接按门槛过滤**：
-  - `growth_value`：Piotroski 式质量分 ≥ 4；
-  - `deep_value`：剔除报表币种≠交易币种的美股中概/ADR，并仅保留 `市值 < NCAV`(流动资产−总负债) 的 Graham 烟蒂；
-  - `pr`：无 L2 门槛，仅附注不过滤；
-  - `sepa`：无 L2 门槛，仅注释不过滤。
-  仅精算前 `--refine-limit` 只，未精算的会被剔除（打 warning），需要全量请调大该值。
-- `--refine-limit`：最多精算前多少只，默认 30；不截断最终返回列表。
-- `--refine-sleep`：yfinance 单只间隔秒数，默认 1.2。
+- `--refine`：仅对显式声明专属 L2 的策略运行 Futu F10 原生精算；没有专属 L2 的策略视为跳过。流量表统一查询累计口径（Q1/H1/Q9/FY）；美股资产负债表按 Q1/Q2/Q3/FY 查询，并与累计流量表按截止日对齐。当前值采用所需报表的**最近共同已发布报告期**；多年均值仍只使用年报。定义了 L2 门槛的策略会在此步直接按门槛过滤：
+  - `growth_value`：8 项均有 Futu 原生字段数据，且 Piotroski 式质量分 ≥ 4；
+  - `deep_value`：剔除报表币种≠交易币种、无法直接比较市值与报表金额的候选，并仅保留 `市值 < NCAV`(流动资产−总负债) 的 Graham 烟蒂；
+  - `pr`：未声明专属 L2，跳过；
+  - `sepa`：未声明专属 L2，跳过。
+- 指定 `--refine` 后，只有 `growth_value` 和 `deep_value` 会精算全部 L1 候选；其他策略保持候选不变，且 `l2_refined=0`。
+- F10 请求在单进程内串行执行，每次调用后固定等待 1.1 秒，满足 30 次/30 秒的接口限制；失败不自动重试。
 ```json
 { "market": "HK", "strategy": "sepa", "l1_count": 26,
   "snapshot_enriched": true, "l2_refined": 0, "returned": 26,
@@ -187,6 +185,8 @@ screen --market US|HK|A [--strategy sepa|pr|growth_value|deep_value] [--limit N]
 
 #### 策略条件速览（L1 服务端筛选；财务字段均为年报口径）
 
+四套策略统一要求 20 日均成交额：US ≥ 5000 万美元、HK ≥ 500 万港元、A ≥ 5000 万人民币。
+
 - **sepa** — Minervini 趋势模板：价 > EMA50 > EMA150 > EMA200（日K）；
   距52周低点 ≥ +30%、距52周高点 ≥ -30%；市值 ≥ 150亿；
   EPS 增速 ≥ 20%、营收增速 ≥ 15%。排序=成交额。
@@ -195,7 +195,7 @@ screen --market US|HK|A [--strategy sepa|pr|growth_value|deep_value] [--limit N]
   权益乘数∈[1,4]（净资产≥总资产25%，L1 剔除高杠杆/低基数的假高 ROE，银行/保险等多在此出局）；
   Python 精确算 PR≤0.5；`cash_coverage`(经营现金流TTM/净利润) 作为一次性收益提示字段（不硬过滤）。
   停牌股由快照阶段剔除。排序=PR 主导+账面折价+股息+流动性。
-- **growth_value** — 成长价值：市值下限按市场 US ≥ $20亿 / HK ≥ HK$50亿 / A ≥ ¥50亿；PE_TTM ∈ (0, 35]、PB ∈ (0, 5]；
+- **growth_value** — 成长价值：市值下限按市场 US ≥ $100亿 / HK ≥ HK$100亿 / A ≥ ¥100亿；PE_TTM ∈ (0, 35]、PB ∈ (0, 5]；
   ROE ≥ 8%；营收增速 ≥ 0、净利增速 ≥ 0；经营现金流 TTM ≥ 0；资产负债率 ≤ 60%。
   排序=ROE+盈利收益率+账面折价+股息+流动性加权。
 - **deep_value** — 深度价值/烟蒂：市值 ≥ 10亿；PE_TTM ∈ (0, 13]、PB ∈ (0, 1]；
@@ -277,9 +277,9 @@ MOMENTUM_ROTATION_PYTHON=<ENV_PYTHON> <PYTHON> <REPO>/cli/main.py pm2 momentum-r
 
 ## L2 信号块
 
-`signals` 的 L2 是趋势模板/RS/VCP 信号；`screen --refine` 的 L2 则由策略决定：
-`deep_value` 输出现金/负债精算，`growth_value` 默认输出 yfinance 质量与
-Piotroski-like 精算。
+`signals` 的 L2 是趋势模板/RS/VCP 信号；`screen --refine` 只运行策略显式声明的 L2：
+`deep_value` 输出现金/负债精算，`growth_value` 输出 Futu F10 质量与
+Piotroski-like 精算，`sepa` / `pr` 跳过 L2。
 
 ### `signals` L2 趋势信号
 
@@ -302,7 +302,12 @@ Piotroski-like 精算。
 ```json
 "l2": {
   "ok": true,
-  "yf_code": "1765.HK",
+  "source": "futu",
+  "report_period": "2026/Q1",
+  "financial_type": 1,
+  "latest_available_periods": {
+    "income": "2026/Q2", "balance": "2026/Q1"
+  },
   "cash_and_equivalents": 2770782000.0,
   "total_liabilities": 12415062000.0,
   "net_cash": -9644280000.0,
@@ -311,7 +316,8 @@ Piotroski-like 精算。
 }
 ```
 
-财务表为空/字段缺失：`"l2": {"ok": false, "note": "income_stmt or balance_sheet is empty"}`。
+财务表没有共同报告期：`"l2": {"ok": false, "source": "futu", "note": "no common report period across income and balance"}`。
+Futu 原生 `field_id` 缺失时会失败关闭，并在 `missing_fields` 中列出缺项；展示名不参与计算。
 
 **口径约束（策略侧不得当真值）**：
 - `rs_proxy` 标 `approx: true`——是 vs 单一基准指数的超额收益，非 IBD 百分位；

@@ -13,6 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from futu_fundamental_screener import (  # noqa: E402
+    accumulate_filter,
     custom_indicator_filter,
     financial_filter,
     main,
@@ -31,6 +32,8 @@ HIGH52_MIN = -30.0
 EPS_GROWTH_MIN = 20.0
 REV_GROWTH_MIN = 15.0
 MARKET_VAL_MIN = {"US": 15e9, "HK": 15e9, "A": 15e9}
+TURNOVER_AVG_DAYS = 20
+TURNOVER_MIN = {"US": 50e6, "HK": 5e6, "A": 50e6}
 
 
 def build_filters(market: str, ft):
@@ -44,6 +47,9 @@ def build_filters(market: str, ft):
         simple_filter(sf.CUR_PRICE_TO_LOWEST52_WEEKS_RATIO, LOW52_MIN),
         simple_filter(sf.CUR_PRICE_TO_HIGHEST52_WEEKS_RATIO, HIGH52_MIN),
         simple_filter(sf.MARKET_VAL, MARKET_VAL_MIN[market]),
+        accumulate_filter(
+            sf.TURNOVER, TURNOVER_MIN[market], days=TURNOVER_AVG_DAYS,
+        ),
         financial_filter(sf.EPS_GROWTH_RATE, EPS_GROWTH_MIN, quarter=q),
         financial_filter(sf.SUM_OF_BUSINESS_GROWTH, REV_GROWTH_MIN, quarter=q),
     ]

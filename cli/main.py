@@ -28,7 +28,7 @@ fundamental_analysis screeners / indicator_service），但不依赖其 HTTP/Fas
 
 == market-sense 子命令（输出 JSON）==
   kline   读 OHLCV（data.get_kline_data，源由 config 决定，缓存走绝对路径）
-  screen  条件选股（策略脚本条件 + Futu OpenD L1 + snapshot；可选 yfinance L2）
+  screen  条件选股（策略脚本条件 + Futu OpenD L1 + snapshot；可选 Futu F10 L2）
   signals 单/多只 → 经典指标(EMA/MACD/KD/RSI，ParamsDB 最优参数，缺则回退默认)
           + detect(best_params/meta/performance) + L2(trend-template/200MA/RS/VCP)
 
@@ -191,10 +191,7 @@ def cmd_screen(args, config) -> dict:
     return fs.screen(
         strategy, args.market, config,
         snapshot=not args.no_snapshot,
-        limit=args.limit,
         refine=args.refine,
-        refine_limit=args.refine_limit,
-        refine_sleep=args.refine_sleep,
     )
 
 
@@ -500,13 +497,11 @@ def _build_parser() -> argparse.ArgumentParser:
     ps.add_argument("--market", required=True, choices=list(fs.MARKETS), help="US / HK / A")
     ps.add_argument("--strategy", default="sepa", choices=list(_SCREEN_STRATEGIES),
                     help="筛选策略；默认 sepa")
-    ps.add_argument("--limit", type=int, help="按 snapshot_score 排序后的输出数量")
     ps.add_argument("--no-snapshot", action="store_true", help="只跑 get_stock_filter")
-    ps.add_argument("--refine", action="store_true", help="对候选运行 yfinance L2 精算")
-    ps.add_argument("--refine-limit", type=int, default=fs.YFINANCE_REFINE_LIMIT,
-                    help=f"最多精算前多少只，不截断返回列表；默认 {fs.YFINANCE_REFINE_LIMIT}")
-    ps.add_argument("--refine-sleep", type=float, default=fs.YFINANCE_SLEEP_SEC,
-                    help=f"yfinance 单只间隔秒数；默认 {fs.YFINANCE_SLEEP_SEC}")
+    ps.add_argument(
+        "--refine", action="store_true",
+        help="运行策略显式声明的 Futu F10 L2 精算",
+    )
     ps.set_defaults(func=cmd_screen)
 
     pg = sub.add_parser("signals", parents=[common], help="单/多只指标信号 + detect + L2")

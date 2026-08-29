@@ -17,7 +17,9 @@ import json
 import logging
 import math
 import sys
+import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -39,10 +41,29 @@ SNAPSHOT_BATCH = 400
 # futu 接口一般限制 1 分钟 30 次调用，节流间隔保持 >= 2s
 FILTER_THROTTLE_SEC = 3.5
 SNAPSHOT_THROTTLE_SEC = 2.5
-FILTER_MAX_TRIES = 4
-FILTER_BACKOFF_SEC = 6.0
-YFINANCE_REFINE_LIMIT = 30
-YFINANCE_SLEEP_SEC = 1.2
+# GetFinancialsStatements: 30 秒最多 30 次；1.1 秒固定间隔保留少量余量。
+FINANCIAL_THROTTLE_SEC = 1.1
+# 三表统一采用累计口径（Q1/H1/Q9/FY），避免单季利润表与累计现金流错配。
+# 25 期通常可覆盖 5 个完整年报，且不增加调用次数。
+FINANCIAL_PERIODS = 25
+FINANCIAL_CUMULATIVE_TYPE = 11
+FINANCIAL_SINGLE_QUARTER_TYPE = 10
+FINANCIAL_ANNUAL_TYPE = 7
+
+FINANCIAL_ALIGNMENT_TYPES = {
+    1: 1,       # Q1
+    2: 5, 5: 5, # Q2 单季 / H1 累计
+    3: 6, 6: 6, # Q3 单季 / Q9 累计
+    4: 7, 7: 7, # Q4 单季 / FY
+}
+
+_financial_lock = threading.Lock()
+
+FINANCIAL_STATEMENT_TYPES = {
+    "income": 1,
+    "balance": 2,
+    "cashflow": 3,
+}
 
 SNAPSHOT_FIELDS = (
     "last_price", "open_price", "high_price", "low_price", "prev_close_price",
@@ -158,23 +179,16 @@ def row_value(row, name: str):
     return None
 
 
-def _retry_call(desc: str, call, tries: int = FILTER_MAX_TRIES,
-                backoff: float = FILTER_BACKOFF_SEC):
-    """对 (ret, data) 形式的 OpenD 调用做指数退避重试（超时/限频多为瞬时故障）。"""
-    data = None
-    for attempt in range(1, tries + 1):
-        ret, data = call()
-        if ret == ft.RET_OK:
-            return data
-        if attempt < tries:
-            wait = backoff * attempt
-            print(f"[warn] {desc} failed, retry in {wait:.0f}s: {data}", file=sys.stderr)
-            time.sleep(wait)
-    raise RuntimeError(f"{desc} failed: {data}")
+def _futu_call(desc: str, call):
+    """执行返回 (ret, data) 的 OpenD 调用，并在接口边界检查结果。"""
+    ret, data = call()
+    if ret != ft.RET_OK:
+        raise RuntimeError(f"{desc} failed: {data}")
+    return data
 
 
 def _filter_page(ctx, futu_market, filters: list[Any], begin: int):
-    return _retry_call("get_stock_filter", lambda: ctx.get_stock_filter(
+    return _futu_call("get_stock_filter", lambda: ctx.get_stock_filter(
         market=futu_market, filter_list=filters, begin=begin, num=PAGE_SIZE,
     ))
 
@@ -187,7 +201,7 @@ def _candidate_from_filter_row(row, market: str) -> dict[str, Any]:
 
 def _drop_us_otc(ctx, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
     # 不做"失败保留全部"兜底：混入 OTC 会让后续 get_market_snapshot 整批报错
-    data = _retry_call("get_stock_basicinfo", lambda: ctx.get_stock_basicinfo(
+    data = _futu_call("get_stock_basicinfo", lambda: ctx.get_stock_basicinfo(
         ft.Market.US, ft.SecurityType.STOCK))
     exchange = dict(zip(data["code"], data["exchange_type"]))
     kept = [c for c in candidates if exchange.get(c["code"]) in US_ALLOWED_EXCHANGES]
@@ -254,8 +268,8 @@ def enrich_snapshot(candidates: list[dict[str, Any]], strategy, config) -> list[
             if i:
                 time.sleep(SNAPSHOT_THROTTLE_SEC)
             batch = codes[i:i + SNAPSHOT_BATCH]
-            data = _retry_call("get_market_snapshot",
-                               lambda b=batch: ctx.get_market_snapshot(b))
+            data = _futu_call("get_market_snapshot",
+                              lambda b=batch: ctx.get_market_snapshot(b))
             for row in data.to_dict("records"):
                 snapshots[row["code"]] = row
     finally:
@@ -286,43 +300,256 @@ def enrich_snapshot(candidates: list[dict[str, Any]], strategy, config) -> list[
     return kept
 
 
-def futu_to_yfinance_code(code: str) -> str:
-    if code.startswith("HK."):
-        return f"{code.split('.', 1)[1].lstrip('0') or '0'}.HK"
-    if code.startswith("SH."):
-        return f"{code.split('.', 1)[1]}.SS"
-    if code.startswith("SZ."):
-        return f"{code.split('.', 1)[1]}.SZ"
-    if code.startswith("US."):
-        return code.split(".", 1)[1]
-    return code
+@dataclass(frozen=True)
+class FutuFieldSet:
+    """Futu F10 原生 field_id；每个 ID 的语义同时受报表类型约束。"""
+
+    net_income: tuple[int, ...]
+    revenue: tuple[int, ...]
+    cost_of_revenue: tuple[int, ...]
+    gross_profit: tuple[int, ...]
+    total_assets: tuple[int, ...]
+    equity: tuple[int, ...]
+    current_assets: tuple[int, ...]
+    current_liabilities: tuple[int, ...]
+    cash: tuple[int, ...]
+    total_liabilities: tuple[int, ...]
+    long_term_debt_components: tuple[int, ...]
+    total_debt_components: tuple[int, ...]
+    operating_cash_flow: tuple[int, ...]
 
 
-def _statement_value(frame, names: tuple[str, ...], col: int = 0) -> float | None:
-    if frame is None or getattr(frame, "empty", True) or frame.shape[1] <= col:
+# Futu 的财报字段不是 SDK 枚举：OpenD 返回 field_id + display_name。L2 只使用稳定的
+# field_id，display_name 仅供 UI 展示，不参与计算，因此不受 OpenD 语言影响。
+# 3xxx/5xxx/8xxx 分别是当前选股范围内的 A/HK/US 财报字段族。
+FUTU_FIELD_SETS = {
+    3: FutuFieldSet(
+        net_income=(3043, 3047),
+        revenue=(3002, 3001),
+        cost_of_revenue=(3010, 3009),
+        gross_profit=(),
+        total_assets=(3001,),
+        equity=(3097, 3098),
+        current_assets=(3002,),
+        current_liabilities=(3056,),
+        cash=(3003,),
+        total_liabilities=(3055,),
+        long_term_debt_components=(3084, 3085, 3087),
+        total_debt_components=(3067, 3075, 3084, 3085, 3087),
+        operating_cash_flow=(3001,),
+    ),
+    5: FutuFieldSet(
+        net_income=(5045, 5051, 5052),
+        revenue=(5002, 5001),
+        cost_of_revenue=(5008, 5005),
+        gross_profit=(5010,),
+        total_assets=(5001,),
+        equity=(5109, 5110),
+        current_assets=(5002,),
+        current_liabilities=(5061,),
+        cash=(5003,),
+        total_liabilities=(5060,),
+        long_term_debt_components=(5091, 5093, 5104),
+        total_debt_components=(5070, 5072, 5091, 5093, 5104),
+        operating_cash_flow=(5001,),
+    ),
+    8: FutuFieldSet(
+        net_income=(8037, 8043, 8046),
+        revenue=(8002, 8001),
+        cost_of_revenue=(8003,),
+        gross_profit=(8004,),
+        total_assets=(8001,),
+        equity=(8081, 8085),
+        current_assets=(8002,),
+        current_liabilities=(8049,),
+        cash=(8003, 8004),
+        total_liabilities=(8048,),
+        long_term_debt_components=(8068,),
+        total_debt_components=(8057, 8068),
+        operating_cash_flow=(8015, 8016),
+    ),
+}
+
+
+@dataclass(frozen=True)
+class FutuFinancialReport:
+    statement_name: str
+    date_time_str: str
+    financial_type: int
+    period_text: str
+    currency_code: str
+    accounting_standards: str
+    values: dict[int, float]
+
+    @property
+    def alignment_key(self) -> tuple[str, int]:
+        return (
+            self.date_time_str,
+            FINANCIAL_ALIGNMENT_TYPES.get(self.financial_type, self.financial_type),
+        )
+
+    @property
+    def family(self) -> int:
+        families = {field_id // 1000 for field_id in self.values if field_id > 0}
+        known = families & set(FUTU_FIELD_SETS)
+        if len(known) != 1:
+            raise ValueError(
+                f"unsupported Futu F10 field family for {self.statement_name}: "
+                f"{sorted(families)}"
+            )
+        return next(iter(known))
+
+    def value(self, field_ids: tuple[int, ...]) -> float | None:
+        for field_id in field_ids:
+            value = self.values.get(field_id)
+            if value is not None:
+                return value
         return None
-    for name in names:
-        if name in frame.index:
-            return num(frame.iloc[:, col].get(name))
-    return None
+
+    def sum_values(self, field_ids: tuple[int, ...]) -> float:
+        # F10 对零余额科目通常不下发 item；已识别字段族后，缺失的债务分项按 0 处理。
+        return sum(self.values.get(field_id, 0.0) for field_id in field_ids)
 
 
-def _statement_ratio_series(numerator_frame, numerator_names: tuple[str, ...],
-                            denominator_frame, denominator_names: tuple[str, ...]) -> list[float]:
-    if (
-        numerator_frame is None or getattr(numerator_frame, "empty", True)
-        or denominator_frame is None or getattr(denominator_frame, "empty", True)
-    ):
-        return []
-    out = []
-    columns = min(numerator_frame.shape[1], denominator_frame.shape[1])
-    for col in range(columns):
-        numerator = _statement_value(numerator_frame, numerator_names, col)
-        denominator = _statement_value(denominator_frame, denominator_names, col)
-        value = ratio(numerator, denominator)
-        if value is not None:
-            out.append(value)
-    return out
+def _parse_financial_reports(statement_name: str,
+                             data: dict[str, Any]) -> tuple[FutuFinancialReport, ...]:
+    """直接解析 SDK report_list；display_name/structure_list 不进入 L2 数据模型。"""
+    reports = []
+    for raw in data.get("report_list", []):
+        values = {}
+        for item in raw.get("item_list", []):
+            try:
+                field_id = int(item.get("field_id"))
+            except (TypeError, ValueError):
+                continue
+            value = num(item.get("data"))
+            if field_id > 0 and value is not None:
+                values[field_id] = value
+        date = str(raw.get("date_time_str") or "")
+        financial_type = int(raw.get("financial_type") or 0)
+        if not date or financial_type <= 0:
+            continue
+        reports.append(FutuFinancialReport(
+            statement_name=statement_name,
+            date_time_str=date,
+            financial_type=financial_type,
+            period_text=str(raw.get("period_text") or date),
+            currency_code=str(raw.get("currency_code") or ""),
+            accounting_standards=str(raw.get("accounting_standards") or ""),
+            values=values,
+        ))
+    reports.sort(
+        key=lambda report: (
+            report.date_time_str,
+            report.financial_type == FINANCIAL_ANNUAL_TYPE,
+            report.financial_type,
+        ),
+        reverse=True,
+    )
+    return tuple(reports)
+
+
+class FutuFinancials:
+    """一只标的的 Futu F10 报表集合，负责报告期对齐与字段族校验。"""
+
+    def __init__(self, statements: dict[str, tuple[FutuFinancialReport, ...]]):
+        self.statements = statements
+
+    def aligned(self, *statement_names: str,
+                financial_type: int | None = None) -> list[tuple[FutuFinancialReport, ...]]:
+        if not statement_names:
+            return []
+        mappings = []
+        for name in statement_names:
+            reports = self.statements.get(name, ())
+            if financial_type is not None:
+                alignment_type = FINANCIAL_ALIGNMENT_TYPES.get(
+                    financial_type, financial_type,
+                )
+                reports = tuple(
+                    report for report in reports
+                    if FINANCIAL_ALIGNMENT_TYPES.get(
+                        report.financial_type, report.financial_type,
+                    ) == alignment_type
+                )
+            mapping = {}
+            for report in reports:
+                # 同一截止日可能同时有 Q4 和 FY；解析结果已将 FY 排在前面。
+                mapping.setdefault(report.alignment_key, report)
+            mappings.append(mapping)
+        if any(not mapping for mapping in mappings):
+            return []
+        keys = set(mappings[0])
+        for mapping in mappings[1:]:
+            keys &= set(mapping)
+        ordered_keys = sorted(
+            keys,
+            key=lambda key: (key[0], key[1] == FINANCIAL_ANNUAL_TYPE, key[1]),
+            reverse=True,
+        )
+        return [tuple(mapping[key] for mapping in mappings) for key in ordered_keys]
+
+    def latest(self, *statement_names: str) -> tuple[FutuFinancialReport, ...] | None:
+        aligned = self.aligned(*statement_names)
+        return aligned[0] if aligned else None
+
+    def previous_comparable(self, current: FutuFinancialReport,
+                            *statement_names: str) -> tuple[FutuFinancialReport, ...] | None:
+        aligned = self.aligned(*statement_names, financial_type=current.financial_type)
+        for reports in aligned:
+            if reports[0].date_time_str < current.date_time_str:
+                return reports
+        return None
+
+    def fields_for(self, *reports: FutuFinancialReport) -> FutuFieldSet:
+        families = {report.family for report in reports}
+        if len(families) != 1:
+            raise ValueError(f"Futu F10 field families do not match: {sorted(families)}")
+        return FUTU_FIELD_SETS[next(iter(families))]
+
+    def latest_available_periods(self) -> dict[str, str | None]:
+        return {
+            name: reports[0].period_text if reports else None
+            for name, reports in self.statements.items()
+        }
+
+
+def _financial_query_type(code: str, statement_name: str) -> int:
+    # 美股资产负债表按 Q1/Q2/Q3/FY 保存；利润与现金流按 Q1/H1/Q9/FY 累计。
+    if code.startswith("US.") and statement_name == "balance":
+        return FINANCIAL_SINGLE_QUARTER_TYPE
+    return FINANCIAL_CUMULATIVE_TYPE
+
+
+def _financial_api_call(ctx, *, code: str, statement_type: int,
+                        financial_type: int) -> dict[str, Any]:
+    """串行调用 F10，并用固定间隔满足 30 次/30 秒的接口限制。"""
+    try:
+        ret, data = ctx.get_financials_statements(
+            code,
+            statement_type=statement_type,
+            financial_type=financial_type,
+            num=FINANCIAL_PERIODS,
+        )
+    finally:
+        time.sleep(FINANCIAL_THROTTLE_SEC)
+    if ret != ft.RET_OK:
+        raise RuntimeError(f"get_financials_statements {code}/{statement_type} failed: {data}")
+    return data if isinstance(data, dict) else {}
+
+
+def _fetch_financial_statement(ctx, cache: dict, code: str,
+                               statement_name: str) -> tuple[FutuFinancialReport, ...]:
+    financial_type = _financial_query_type(code, statement_name)
+    cache_key = (code, statement_name, financial_type)
+    if cache_key not in cache:
+        data = _financial_api_call(
+            ctx, code=code,
+            statement_type=FINANCIAL_STATEMENT_TYPES[statement_name],
+            financial_type=financial_type,
+        )
+        cache[cache_key] = _parse_financial_reports(statement_name, data)
+    return cache[cache_key]
 
 
 def _positive(value) -> bool:
@@ -335,115 +562,122 @@ def _greater(a, b) -> bool:
     return bool(a is not None and b is not None and a > b)
 
 
-def _yf_table(ticker, attr: str):
-    table = getattr(ticker, attr, None)
-    if table is None or getattr(table, "empty", True):
+def _gross_margin(income_report: FutuFinancialReport | None,
+                  fields: FutuFieldSet) -> float | None:
+    if income_report is None:
         return None
-    return table
+    revenue = income_report.value(fields.revenue)
+    gross_profit = income_report.value(fields.gross_profit)
+    if gross_profit is not None:
+        return ratio(gross_profit, revenue)
+    cost = income_report.value(fields.cost_of_revenue)
+    if revenue is None or cost is None:
+        return None
+    # 部分 Futu 会计模板以负数返回费用。
+    return ratio(revenue + cost if cost < 0 else revenue - cost, revenue)
 
 
-def _setup_yfinance(config):
-    proxy = config.get("CONFIG", "PROXY", fallback=None)
-    if not proxy:
-        return
-    if "://" not in proxy:
-        proxy = f"http://{proxy}"
+def generic_futu_refine(candidate: dict[str, Any],
+                        financials: FutuFinancials) -> dict[str, Any]:
+    latest = financials.latest("income", "balance", "cashflow")
+    if not latest:
+        return {
+            "ok": False,
+            "source": "futu",
+            "note": "no common report period across income, balance and cashflow",
+            "latest_available_periods": financials.latest_available_periods(),
+        }
+    income, balance, cashflow = latest
+    fields = financials.fields_for(income, balance, cashflow)
 
-    # yfinance 1.x 走 curl_cffi，其 session 不读 HTTP(S)_PROXY 环境变量，
-    # 也不受 requests monkey-patch 影响 —— 唯一可靠入口是 yf.config.network.proxy。
-    # 因此这里以它为准，并校验是否真正生效，避免"配了代理却直连泄漏"。
-    applied = False
-    try:
-        import yfinance as yf
-        net = getattr(getattr(yf, "config", None), "network", None)
-        if net is not None:
-            net.proxy = proxy
-            applied = getattr(net, "proxy", None) == proxy
-    except Exception as exc:  # noqa: BLE001
-        print(f"[warn] yfinance proxy config failed: {exc}", file=sys.stderr)
-    if not applied:
-        print("[warn] yfinance 代理未生效（缺少 yf.config.network），L2 可能直连绕过代理",
-              file=sys.stderr)
-
-    # 仍设置全局 env/requests 代理：覆盖 requests-based 的取数路径（其它模块/子进程）。
-    # 注意：这一步对 yfinance(curl_cffi) 无效，仅作旁路补充，不能替代上面的原生配置。
-    try:
-        try:
-            from data import setup_global_proxy
-        except ImportError:
-            sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-            from data import setup_global_proxy
-        setup_global_proxy(proxy)
-    except Exception as exc:  # noqa: BLE001
-        print(f"[warn] setup_global_proxy failed: {exc}", file=sys.stderr)
-
-
-def generic_yfinance_refine(candidate: dict[str, Any], yf_ticker) -> dict[str, Any]:
-    income = _yf_table(yf_ticker, "income_stmt")
-    balance = _yf_table(yf_ticker, "balance_sheet")
-    cashflow = _yf_table(yf_ticker, "cash_flow")
-    if income is None or balance is None:
-        return {"ok": False, "note": "income_stmt or balance_sheet is empty"}
-
-    roe_values = _statement_ratio_series(
-        income,
-        ("Net Income", "Net Income Common Stockholders"),
-        balance,
-        ("Stockholders Equity", "Common Stock Equity", "Total Equity Gross Minority Interest"),
+    roe_values = []
+    annual = financials.aligned(
+        "income", "balance", financial_type=FINANCIAL_ANNUAL_TYPE,
     )
-    roa_values = _statement_ratio_series(
-        income,
-        ("Net Income", "Net Income Common Stockholders"),
-        balance,
-        ("Total Assets",),
-    )
+    for income_report, balance_report in annual:
+        annual_fields = financials.fields_for(income_report, balance_report)
+        value = ratio(
+            income_report.value(annual_fields.net_income),
+            balance_report.value(annual_fields.equity),
+        )
+        if value is not None:
+            roe_values.append(value)
 
-    net_income = _statement_value(income, ("Net Income", "Net Income Common Stockholders"))
-    operating_cf = _statement_value(cashflow, ("Operating Cash Flow", "Total Cash From Operating Activities"))
-    total_assets = _statement_value(balance, ("Total Assets",))
-    equity = _statement_value(balance, ("Stockholders Equity", "Common Stock Equity", "Total Equity Gross Minority Interest"))
-    current_assets = _statement_value(balance, ("Current Assets",))
-    current_liabilities = _statement_value(balance, ("Current Liabilities",))
-    prev_current_assets = _statement_value(balance, ("Current Assets",), 1)
-    prev_current_liabilities = _statement_value(balance, ("Current Liabilities",), 1)
-    debt = _statement_value(balance, ("Long Term Debt", "Long Term Debt And Capital Lease Obligation"))
-    prev_debt = _statement_value(balance, ("Long Term Debt", "Long Term Debt And Capital Lease Obligation"), 1)
-    revenue = _statement_value(income, ("Total Revenue",))
-    cogs = _statement_value(income, ("Cost Of Revenue", "Cost of Revenue"))
-    prev_revenue = _statement_value(income, ("Total Revenue",), 1)
-    prev_cogs = _statement_value(income, ("Cost Of Revenue", "Cost of Revenue"), 1)
+    previous = financials.previous_comparable(income, "income", "balance")
+    prev_income, prev_balance = previous if previous else (None, None)
 
-    current_ratio = ratio(current_assets, current_liabilities)
-    prev_current_ratio = ratio(prev_current_assets, prev_current_liabilities)
-    gross_margin = ratio(revenue - cogs, revenue) if revenue is not None and cogs is not None else None
-    prev_gross_margin = (
-        ratio(prev_revenue - prev_cogs, prev_revenue)
-        if prev_revenue is not None and prev_cogs is not None else None
+    net_income = income.value(fields.net_income)
+    operating_cf = cashflow.value(fields.operating_cash_flow)
+    total_assets = balance.value(fields.total_assets)
+    equity = balance.value(fields.equity)
+    current_ratio = ratio(
+        balance.value(fields.current_assets),
+        balance.value(fields.current_liabilities),
     )
+    prev_current_ratio = ratio(
+        prev_balance.value(fields.current_assets) if prev_balance else None,
+        prev_balance.value(fields.current_liabilities) if prev_balance else None,
+    )
+    debt = balance.sum_values(fields.long_term_debt_components)
+    prev_debt = (
+        prev_balance.sum_values(fields.long_term_debt_components)
+        if prev_balance else None
+    )
+    gross_margin = _gross_margin(income, fields)
+    prev_gross_margin = _gross_margin(prev_income, fields)
     latest_roa = ratio(net_income, total_assets)
 
-    piotroski = 0
-    flags = {}
+    missing_fields = [
+        name for name, value in (
+            ("net_income", net_income),
+            ("operating_cash_flow", operating_cf),
+            ("total_assets", total_assets),
+            ("equity", equity),
+        )
+        if value is None
+    ]
+    metadata = {
+        "source": "futu",
+        "report_period": income.period_text,
+        "report_date": income.date_time_str,
+        "financial_type": income.financial_type,
+        "financial_currency": income.currency_code or balance.currency_code,
+        "accounting_standards": (
+            income.accounting_standards or balance.accounting_standards
+        ),
+        "latest_available_periods": financials.latest_available_periods(),
+    }
+    if missing_fields:
+        return {
+            "ok": False,
+            **metadata,
+            "note": "required Futu field_id is missing",
+            "missing_fields": missing_fields,
+        }
+
+    flags: dict[str, bool | None] = {}
     flags["positive_net_income"] = _positive(net_income)
     flags["positive_roa"] = _positive(latest_roa)
     flags["positive_operating_cash_flow"] = _positive(operating_cf)
     flags["cash_flow_gt_net_income"] = _greater(operating_cf, net_income)
-    flags["lower_long_term_debt"] = bool(debt is not None and prev_debt is not None and debt < prev_debt)
-    flags["higher_current_ratio"] = bool(
-        current_ratio is not None and prev_current_ratio is not None
-        and current_ratio > prev_current_ratio
+    flags["lower_long_term_debt"] = (
+        debt < prev_debt if prev_debt is not None else None
     )
-    flags["higher_gross_margin"] = bool(
-        gross_margin is not None and prev_gross_margin is not None
-        and gross_margin > prev_gross_margin
+    flags["higher_current_ratio"] = (
+        current_ratio > prev_current_ratio
+        if current_ratio is not None and prev_current_ratio is not None else None
+    )
+    flags["higher_gross_margin"] = (
+        gross_margin > prev_gross_margin
+        if gross_margin is not None and prev_gross_margin is not None else None
     )
     flags["has_valid_equity"] = bool(equity is not None and equity > 0)
-    for value in flags.values():
-        piotroski += int(bool(value))
+    piotroski = sum(value is True for value in flags.values())
+    piotroski_available = sum(value is not None for value in flags.values())
 
     return {
         "ok": True,
-        "yf_code": futu_to_yfinance_code(candidate["code"]),
+        **metadata,
         "periods": len(roe_values),
         "avg_roe_pct": safe_pct(sum(roe_values) / len(roe_values)) if roe_values else None,
         "min_roe_pct": safe_pct(min(roe_values)) if roe_values else None,
@@ -453,28 +687,53 @@ def generic_yfinance_refine(candidate: dict[str, Any], yf_ticker) -> dict[str, A
         "net_income": net_income,
         "operating_cash_flow": operating_cf,
         "piotroski_like_score": piotroski,
+        "piotroski_like_available": piotroski_available,
         "piotroski_like_flags": flags,
     }
 
 
-def run_yfinance_refine(candidates: list[dict[str, Any]], strategy, config,
-                        sleep_sec: float = YFINANCE_SLEEP_SEC) -> list[dict[str, Any]]:
-    import yfinance as yf
+def supports_futu_refine(strategy) -> bool:
+    """Only strategies that explicitly register an L2 refiner opt in to F10."""
+    return callable(getattr(strategy, "refine_futu", None))
 
-    _setup_yfinance(config)
-    refine_one = getattr(strategy, "refine_yfinance", generic_yfinance_refine)
-    total = len(candidates)
-    for i, candidate in enumerate(candidates, 1):
-        code = candidate["code"]
-        yf_code = futu_to_yfinance_code(code)
-        print(f"[L2 {i}/{total}] {code} -> {yf_code}", file=sys.stderr)
+
+def run_futu_refine(candidates: list[dict[str, Any]], strategy,
+                    config) -> list[dict[str, Any]]:
+    if not supports_futu_refine(strategy):
+        return candidates
+
+    with _financial_lock:
+        host = config.get("CONFIG", "FUTU_HOST", fallback="127.0.0.1")
+        port = int(config.get("CONFIG", "FUTU_PORT", fallback=11111))
+        cache: dict[tuple[str, str, int], tuple[FutuFinancialReport, ...]] = {}
+        statement_names = getattr(
+            strategy, "FUTU_L2_STATEMENT_TYPES", tuple(FINANCIAL_STATEMENT_TYPES),
+        )
+        refine_one = strategy.refine_futu
+
+        ctx = ft.OpenQuoteContext(host=host, port=port)
         try:
-            candidate["l2"] = refine_one(candidate, yf.Ticker(yf_code))
-        except Exception as exc:  # noqa: BLE001
-            candidate["l2"] = {"ok": False, "yf_code": yf_code, "note": str(exc)}
-        if i < total and sleep_sec > 0:
-            time.sleep(sleep_sec)
-    return candidates
+            if not callable(getattr(ctx, "get_financials_statements", None)):
+                raise RuntimeError(
+                    "当前 futu-api 不支持 get_financials_statements；"
+                    "请将 OpenD 和 futu-api 升级到 >= 10.6.6608"
+                )
+            total = len(candidates)
+            for i, candidate in enumerate(candidates, 1):
+                code = candidate["code"]
+                print(f"[L2 {i}/{total}] {code} via Futu F10", file=sys.stderr)
+                try:
+                    statements = {
+                        name: _fetch_financial_statement(ctx, cache, code, name)
+                        for name in statement_names
+                    }
+                    financials = FutuFinancials(statements)
+                    candidate["l2"] = refine_one(candidate, financials)
+                except Exception as exc:  # noqa: BLE001
+                    candidate["l2"] = {"ok": False, "source": "futu", "note": str(exc)}
+            return candidates
+        finally:
+            ctx.close()
 
 
 # ---- 结果存取协议（生产端与 gui/backend 共用，路径/格式的唯一定义处）----
@@ -539,33 +798,20 @@ def sanitize(obj):
 
 
 def screen(strategy, market: str, config, snapshot: bool = True,
-           limit: int | None = None, refine: bool = False,
-           refine_limit: int | None = YFINANCE_REFINE_LIMIT,
-           refine_sleep: float = YFINANCE_SLEEP_SEC) -> dict[str, Any]:
-    if limit is not None and limit < 0:
-        raise ValueError("limit must be >= 0")
-    if refine_limit is not None and refine_limit < 0:
-        raise ValueError("refine_limit must be >= 0")
-
+           refine: bool = False) -> dict[str, Any]:
     candidates = run_l1(strategy, market, config)
     l1_count = len(candidates)
     if snapshot:
         candidates = enrich_snapshot(candidates, strategy, config)
-    if limit is not None:
-        candidates = candidates[:limit]
     l2_refined = 0
     l2_filtered = False
-    if refine:
-        refine_count = len(candidates) if refine_limit is None else min(refine_limit, len(candidates))
-        if refine_count:
-            run_yfinance_refine(candidates[:refine_count], strategy, config, refine_sleep)
-        l2_refined = refine_count
-        # 定义了 l2_passes 的策略在 --refine 时直接按其门槛过滤；未定义则仅注释不过滤。
+    if refine and supports_futu_refine(strategy):
+        if candidates:
+            run_futu_refine(candidates, strategy, config)
+        l2_refined = len(candidates)
+        # 显式启用 L2 且定义 l2_passes 的策略直接按其门槛过滤。
         passes = getattr(strategy, "l2_passes", None)
-        if passes is not None:
-            if l2_refined < len(candidates):
-                print(f"[warn] L2 过滤：仅精算了前 {l2_refined}/{len(candidates)} 只，"
-                      f"未精算的将被剔除；如需全量请调大 --refine-limit", file=sys.stderr)
+        if callable(passes):
             candidates = [c for c in candidates if passes(c)]
             l2_filtered = True
     return sanitize({
@@ -586,13 +832,11 @@ def parser(strategy) -> argparse.ArgumentParser:
     )
     ap.add_argument("--market", required=True, choices=list(MARKETS))
     ap.add_argument("--config", default="config_template.ini")
-    ap.add_argument("--limit", type=int, help="按 snapshot_score 排序后的输出数量")
     ap.add_argument("--no-snapshot", action="store_true", help="只跑 get_stock_filter")
-    ap.add_argument("--refine", action="store_true", help="对候选运行 yfinance L2 精算")
-    ap.add_argument("--refine-limit", type=int, default=YFINANCE_REFINE_LIMIT,
-                    help=f"最多精算前多少只，不截断返回列表；默认 {YFINANCE_REFINE_LIMIT}")
-    ap.add_argument("--refine-sleep", type=float, default=YFINANCE_SLEEP_SEC,
-                    help=f"yfinance 单只间隔秒数；默认 {YFINANCE_SLEEP_SEC}")
+    ap.add_argument(
+        "--refine", action="store_true",
+        help="运行策略显式声明的 Futu F10 L2 精算",
+    )
     ap.add_argument("--out", help="输出 JSON 文件")
     ap.add_argument("--out-root", help=f"按协议路径输出：<root>/<date>/<strategy>_<market>.json，如 {OUT_ROOT}")
     ap.add_argument("--date", help="配合 --out-root 的结果日期 YYYYMMDD，默认今天")
@@ -609,8 +853,7 @@ def main(strategy):
 
     result = screen(
         strategy, args.market, config, snapshot=not args.no_snapshot,
-        limit=args.limit, refine=args.refine, refine_limit=args.refine_limit,
-        refine_sleep=args.refine_sleep,
+        refine=args.refine,
     )
     if args.out_root:
         date = args.date or time.strftime("%Y%m%d")

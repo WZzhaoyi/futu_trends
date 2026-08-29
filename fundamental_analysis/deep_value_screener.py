@@ -7,9 +7,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from futu_fundamental_screener import (  # noqa: E402
-    _statement_value,
+    FutuFinancials,
+    accumulate_filter,
     financial_filter,
-    futu_to_yfinance_code,
     main,
     num,
     ratio,
@@ -19,14 +19,18 @@ from futu_fundamental_screener import (  # noqa: E402
 
 NAME = "deep_value"
 DESCRIPTION = "Deep-value fundamental screener"
+FUTU_L2_STATEMENT_TYPES = ("income", "balance")
 
 MARKET_CAP_MIN = 1e9
+TURNOVER_AVG_DAYS = 20
+TURNOVER_MIN = {"US": 50e6, "HK": 5e6, "A": 50e6}
 PE_MIN = 0.01
 PE_MAX = 13.0
 PB_MAX = 1.0
 CASH_MIN = 0.0
 DEBT_ASSET_MAX = 50.0
-CURRENT_RATIO_MIN = 1.5
+# Futu V1 CURRENT_RATIO uses percentage points: 150 means 1.5x.
+CURRENT_RATIO_MIN_PCT = 150.0
 
 
 def build_filters(market: str, ft):
@@ -34,12 +38,15 @@ def build_filters(market: str, ft):
     q = ft.FinancialQuarter.ANNUAL
     return [
         simple_filter(sf.MARKET_VAL, MARKET_CAP_MIN),
+        accumulate_filter(
+            sf.TURNOVER, TURNOVER_MIN[market], days=TURNOVER_AVG_DAYS,
+        ),
         simple_filter(sf.PE_TTM, PE_MIN, PE_MAX),
         simple_filter(sf.PB_RATE, 0.01, PB_MAX, sort=ft.SortDir.ASCEND),
         financial_filter(sf.NET_PROFIT, 0, quarter=q),
         financial_filter(sf.CASH_AND_CASH_EQUIVALENTS, CASH_MIN, quarter=q),
         financial_filter(sf.DEBT_ASSET_RATE, max_=DEBT_ASSET_MAX, quarter=q),
-        financial_filter(sf.CURRENT_RATIO, CURRENT_RATIO_MIN, quarter=q),
+        financial_filter(sf.CURRENT_RATIO, CURRENT_RATIO_MIN_PCT, quarter=q),
     ]
 
 
@@ -54,42 +61,65 @@ def score_snapshot(candidate, snap):
     return {"snapshot_roe": round(roe, 4), "snapshot_score": round(score, 3)}
 
 
-def refine_yfinance(candidate, yf_ticker):
-    income = yf_ticker.income_stmt
-    balance = yf_ticker.balance_sheet
-    if income is None or income.empty or balance is None or balance.empty:
-        return {"ok": False, "note": "income_stmt or balance_sheet is empty"}
+def refine_futu(candidate, financials: FutuFinancials):
+    latest = financials.latest("income", "balance")
+    if not latest:
+        return {
+            "ok": False,
+            "source": "futu",
+            "note": "no common report period across income and balance",
+            "latest_available_periods": financials.latest_available_periods(),
+        }
+    income, balance = latest
+    fields = financials.fields_for(income, balance)
 
-    # 美股中概/ADR：报表币种(如 CNY/EUR)与交易币种(USD)不一致时，
-    # 富途市值(USD)与 yfinance 报表口径的 NCAV 不可比，需剔除。仅在"已知不一致"时剔除。
-    try:
-        info = getattr(yf_ticker, "info", None) or {}
-    except Exception:  # noqa: BLE001
-        info = {}
-    financial_currency = info.get("financialCurrency")
-    trade_currency = info.get("currency")
+    # 富途市值使用交易币种；若报表币种不同，市值与 NCAV 不可直接比较。
+    # 仅在币种均已知且不一致时剔除。
+    financial_currency = income.currency_code or balance.currency_code
+    trade_currency = {
+        "US": "USD", "HK": "HKD", "SH": "CNY", "SZ": "CNY",
+    }.get(candidate["code"].split(".", 1)[0])
     currency_ok = not (financial_currency and trade_currency
                        and financial_currency != trade_currency)
 
-    net_income = _statement_value(income, ("Net Income", "Net Income Common Stockholders"))
-    cash = _statement_value(
-        balance,
-        ("Cash And Cash Equivalents", "Cash Cash Equivalents And Short Term Investments"),
-    )
-    total_liabilities = _statement_value(
-        balance,
-        ("Total Liabilities Net Minority Interest", "Total Liabilities"),
-    )
-    current_assets = _statement_value(balance, ("Current Assets",))
-    interest_debt = _statement_value(
-        balance,
-        ("Total Debt", "Long Term Debt", "Long Term Debt And Capital Lease Obligation"),
-    )
-    equity = _statement_value(
-        balance,
-        ("Stockholders Equity", "Common Stock Equity", "Total Equity Gross Minority Interest"),
-    )
+    net_income = income.value(fields.net_income)
+    cash = balance.value(fields.cash)
+    total_liabilities = balance.value(fields.total_liabilities)
+    current_assets = balance.value(fields.current_assets)
+    interest_debt = balance.sum_values(fields.total_debt_components)
+    equity = balance.value(fields.equity)
     market_cap = num(candidate.get("total_market_val")) or num(candidate.get("market_val"))
+    metadata = {
+        "source": "futu",
+        "report_period": income.period_text,
+        "report_date": income.date_time_str,
+        "financial_type": income.financial_type,
+        "financial_currency": financial_currency,
+        "trade_currency": trade_currency,
+        "accounting_standards": (
+            income.accounting_standards or balance.accounting_standards
+        ),
+        "latest_available_periods": financials.latest_available_periods(),
+    }
+    missing_fields = [
+        name for name, value in (
+            ("net_income", net_income),
+            ("cash", cash),
+            ("current_assets", current_assets),
+            ("total_liabilities", total_liabilities),
+            ("equity", equity),
+            ("market_cap", market_cap),
+        )
+        if value is None
+    ]
+    if missing_fields:
+        return {
+            "ok": False,
+            **metadata,
+            "note": "required Futu field_id is missing",
+            "missing_fields": missing_fields,
+        }
+
     net_cash = None
     if cash is not None and total_liabilities is not None:
         net_cash = cash - total_liabilities
@@ -99,7 +129,7 @@ def refine_yfinance(candidate, yf_ticker):
 
     return {
         "ok": True,
-        "yf_code": futu_to_yfinance_code(candidate["code"]),
+        **metadata,
         "net_income": net_income,
         "cash_and_equivalents": cash,
         "current_assets": current_assets,
@@ -112,10 +142,8 @@ def refine_yfinance(candidate, yf_ticker):
         "ncav_to_market_cap": ratio(ncav, market_cap),
         "cash_to_market_cap": ratio(cash, market_cap),
         "cash_to_liabilities": ratio(cash, total_liabilities),
-        "debt_to_equity": ratio(total_liabilities, equity),
-        "financial_currency": financial_currency,
-        "trade_currency": trade_currency,
-        # 报表币种与交易币种一致才可做 NCAV 比较（剔除美股中概/ADR）
+        "debt_to_equity": ratio(interest_debt, equity),
+        # 报表币种与交易币种一致才可做 NCAV 比较
         "condition_currency_ok": currency_ok,
         # Graham 烟蒂：市值 < NCAV（流动资产 − 总负债）；币种不一致直接判否
         "condition_market_cap_lt_ncav": bool(
@@ -126,7 +154,8 @@ def refine_yfinance(candidate, yf_ticker):
             currency_ok and ncav is not None and market_cap is not None and market_cap < ncav * 2 / 3
         ),
         "condition_cash_minus_liabilities_gt_market_cap": bool(
-            net_cash is not None and market_cap is not None and net_cash > market_cap
+            currency_ok and net_cash is not None
+            and market_cap is not None and net_cash > market_cap
         ),
         "condition_cash_minus_debt_gt_liabilities": bool(
             cash is not None and interest_debt is not None
@@ -136,7 +165,7 @@ def refine_yfinance(candidate, yf_ticker):
 
 
 def l2_passes(candidate) -> bool:
-    """--refine L2 门槛：剔除美股中概/ADR（币种不一致），仅保留命中 Graham 烟蒂（市值 < NCAV）的候选。"""
+    """--refine L2 门槛：剔除币种不一致者，仅保留市值 < NCAV。"""
     l2 = candidate.get("l2") or {}
     return bool(
         l2.get("ok")
