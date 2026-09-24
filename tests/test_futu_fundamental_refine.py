@@ -152,18 +152,14 @@ class FutuFundamentalRefineTest(unittest.TestCase):
         self.assertEqual(result["periods"], 2)
         self.assertEqual(result["avg_roe_pct"], 22.0)
         self.assertEqual(result["min_roe_pct"], 20.0)
+        # fixture 的展示名故意无效，必须按原生 field_id 解析。
+        self.assertEqual(result["net_income"], 70)
         self.assertEqual(result["latest_roa_pct"], 6.3636)
         self.assertEqual(result["current_ratio"], 2.25)
         self.assertEqual(result["gross_margin_pct"], 60.0)
         self.assertEqual(result["operating_cash_flow"], 100)
         self.assertEqual(result["piotroski_like_score"], 8)
         self.assertEqual(result["piotroski_like_available"], 8)
-
-    def test_display_names_are_not_used(self):
-        result = fs.generic_futu_refine({"code": "HK.TEST"}, bundle())
-
-        self.assertEqual(result["net_income"], 70)
-        self.assertEqual(result["latest_roa_pct"], 6.3636)
 
     def test_negative_futu_cost_sign_is_handled_for_a_share_fields(self):
         income = statement_data([

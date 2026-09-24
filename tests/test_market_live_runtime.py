@@ -39,6 +39,8 @@ class LiveRuntimeTest(unittest.TestCase):
             name="test-background-worker",
             maxsize=1,
         )
+        self.addCleanup(lambda: worker.close(timeout=1.0))
+        self.addCleanup(release.set)
         self.assertTrue(worker.submit(1))
         self.assertTrue(started.wait(timeout=1.0))
         self.assertTrue(worker.submit(2))
@@ -48,6 +50,7 @@ class LiveRuntimeTest(unittest.TestCase):
         release.set()
         self.assertTrue(finished.wait(timeout=1.0))
         self.assertTrue(worker.close(timeout=1.0))
+        self.assertFalse(worker._thread.is_alive())
         self.assertEqual(processed, [1, 2])
 
     def test_background_worker_reports_error_and_continues(self) -> None:
@@ -83,15 +86,21 @@ class LiveRuntimeTest(unittest.TestCase):
             with live_runtime.runtime_file_lock(path):
                 pass
 
-    def test_write_json_atomic_replaces_complete_document(self) -> None:
+    def test_write_json_atomic_preserves_old_document_on_replace_failure(self) -> None:
         with tempfile.TemporaryDirectory() as raw_directory:
             path = Path(raw_directory) / "nested" / "state.json"
-            live_runtime.write_json_atomic(path, {"message": "完成", "value": 1})
+            old = {"message": "旧状态", "value": 1}
+            new = {"message": "完成", "value": 2}
+            live_runtime.write_json_atomic(path, old)
+            original = path.read_bytes()
 
-            self.assertEqual(
-                json.loads(path.read_text(encoding="utf-8")),
-                {"message": "完成", "value": 1},
-            )
+            with patch.object(live_runtime.os, "replace", side_effect=OSError("replace failed")):
+                with self.assertRaisesRegex(OSError, "replace failed"):
+                    live_runtime.write_json_atomic(path, new)
+            self.assertEqual(path.read_bytes(), original)
+
+            live_runtime.write_json_atomic(path, new)
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), new)
             self.assertTrue(path.read_text(encoding="utf-8").endswith("\n"))
             self.assertFalse(path.with_suffix(".json.tmp").exists())
 

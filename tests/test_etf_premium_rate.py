@@ -117,13 +117,6 @@ class StrategyStateTest(unittest.TestCase):
             low_position=0.5,
         )
 
-    def test_hysteresis_holds_position_between_thresholds(self):
-        positions = premium.positions_for_premium(
-            np.array([0.04, 0.02, -0.01, 0.02, 0.04]),
-            self.params,
-        )
-        np.testing.assert_allclose(positions, [0.5, 0.5, 1.0, 1.0, 0.5])
-
     def test_live_only_emits_on_position_transition(self):
         self.assertEqual(
             premium.apply_live_signal("base", 0.04, self.params),
@@ -158,7 +151,9 @@ class StrategyStateTest(unittest.TestCase):
                 else self.params.low_position
             )
 
-        np.testing.assert_allclose(backtest_positions, live_positions)
+        expected = [0.5, 0.5, 1.0, 1.0, 0.5]
+        np.testing.assert_allclose(backtest_positions, expected)
+        np.testing.assert_allclose(live_positions, expected)
 
 
 class LiveRuntimeTest(unittest.TestCase):
@@ -166,7 +161,7 @@ class LiveRuntimeTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             premium.LiveRuntimePaths.from_argument("relative/runtime")
 
-    def test_futu_fund_premium_is_hint_only(self):
+    def test_futu_snapshot_converts_percentage_and_estimates_iopv(self):
         snapshot = premium.parse_futu_snapshot(
             {
                 "last_price": 1.684,
@@ -181,12 +176,12 @@ class LiveRuntimeTest(unittest.TestCase):
     def test_market_session_uses_asia_shanghai(self):
         self.assertTrue(
             premium.in_cn_market_session(
-                datetime.fromisoformat("2026-08-14T10:00:00+08:00")
+                datetime.fromisoformat("2026-08-14T02:00:00+00:00")
             )
         )
         self.assertFalse(
             premium.in_cn_market_session(
-                datetime.fromisoformat("2026-08-14T12:00:00+08:00")
+                datetime.fromisoformat("2026-08-14T04:00:00+00:00")
             )
         )
 

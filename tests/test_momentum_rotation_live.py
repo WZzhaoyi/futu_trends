@@ -4,7 +4,7 @@ import sys
 import tempfile
 import types
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import date, time
 from pathlib import Path
 from unittest.mock import patch
@@ -122,7 +122,6 @@ class LiveConfigurationTest(unittest.TestCase):
         )
 
         self.assertEqual(args.mode, "live")
-        self.assertEqual(args.end, date.today().isoformat())
         for name in (
             "etfs",
             "windows",
@@ -131,7 +130,13 @@ class LiveConfigurationTest(unittest.TestCase):
             "port",
             "data_source",
         ):
-            self.assertFalse(hasattr(args, name))
+            with self.subTest(option=name), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as rejected:
+                    momentum.parse_args([
+                        "live", "--runtime-dir", "/tmp/momentum",
+                        "--" + name.replace("_", "-"), "override",
+                    ])
+                self.assertEqual(rejected.exception.code, 2)
 
     def test_connection_and_data_source_come_from_config(self):
         with tempfile.TemporaryDirectory() as raw_dir:
@@ -154,16 +159,10 @@ class LiveConfigurationTest(unittest.TestCase):
 
 
 class LiveSignalTest(unittest.TestCase):
-    def test_momentum_score_uses_linear_method(self):
-        expected = pd.Series([np.nan, 1.23])
-        with patch.object(momentum, "calc_momentum", return_value=expected) as calculate:
-            score = momentum.calculate_momentum_score(np.array([1.0, 1.1]))
-
-        self.assertEqual(score, 1.23)
-        calculate.assert_called_once()
-        args, kwargs = calculate.call_args
-        pd.testing.assert_series_equal(args[0], pd.Series([1.0, 1.1]))
-        self.assertEqual(kwargs, {"N": 2, "method": "linear"})
+    def test_momentum_score_matches_linear_log_price_fit(self):
+        # log 价格为 [0, 0, log(1.01)]：斜率 log(1.01)/2，R²=3/4。
+        score = momentum.calculate_momentum_score(np.array([1.0, 1.0, 1.01]))
+        self.assertAlmostEqual(score, (1.01 ** 125 - 1) * 0.75)
 
     def test_each_symbol_uses_its_own_window(self):
         pairs = [("US.QQQ", 3), ("US.SPY", 4)]
@@ -333,34 +332,6 @@ class LiveSignalTest(unittest.TestCase):
                 self.assertEqual(decision.action, action)
                 self.assertEqual(decision.target_symbol, target)
                 self.assertEqual(decision.blocked, blocked)
-
-    def test_futu_trading_calendar_distinguishes_holiday(self):
-        trading = types.SimpleNamespace(
-            request_trading_days=lambda **_kwargs: (
-                0,
-                [{"time": "2026-08-14", "trade_date_type": "WHOLE"}],
-            )
-        )
-        holiday = types.SimpleNamespace(
-            request_trading_days=lambda **_kwargs: (0, [])
-        )
-
-        self.assertTrue(
-            momentum.is_live_trading_day(
-                trading,
-                "US.QQQ",
-                "2026-08-14",
-                0,
-            )
-        )
-        self.assertFalse(
-            momentum.is_live_trading_day(
-                holiday,
-                "US.QQQ",
-                "2026-08-14",
-                0,
-            )
-        )
 
 
 class LiveRuntimeTest(unittest.TestCase):

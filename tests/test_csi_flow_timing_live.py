@@ -356,7 +356,7 @@ class StrengthRankingTest(unittest.TestCase):
             ["SH.510500", "SH.512100", "SH.510300", "SH.510050"],
         )
 
-    def test_live_buy_signal_only_hints_ranking_and_fixed_n(self):
+    def test_live_buy_signal_hints_ranking_with_configured_window(self):
         class Provider:
             def for_date(self, value):
                 return timing.Threshold(
@@ -1047,7 +1047,7 @@ class LiveContextCleanupTest(unittest.TestCase):
 
 
 class FetchBarsTest(unittest.TestCase):
-    def test_fetches_all_pages_and_publishes_atomic_input(self):
+    def test_fetches_all_pages_and_publishes_input(self):
         calls = []
         contexts = []
 

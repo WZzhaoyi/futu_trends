@@ -1,8 +1,9 @@
 import importlib.util
+import json
+import os
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -45,51 +46,36 @@ def _fake_histories(n_days: int = 40) -> dict[str, pd.DataFrame]:
 
 
 class MomentumOpenFillTest(unittest.TestCase):
-    def test_grid_worker_uses_symbol_changes_without_share_rebalancing(self):
-        frame = pd.DataFrame({"trade_count": [0]})
-        stats = {
-            "total_return": 1.0,
-            "max_ddpercent": -1.0,
-            "sortino_ratio": 1.0,
-            "calmar_ratio": 1.0,
-            "sharpe_ratio": 1.0,
-            "total_commission": 0.0,
-        }
-        params = momentum.SimParams(window=10, cooldown=3)
-        with patch.object(
-            momentum,
-            "simulate",
-            return_value=(frame, [], stats),
-        ) as simulate:
-            momentum._grid_worker(
-                {
-                    "histories": {},
-                    "symbols": ["A", "B"],
-                    "params": params,
-                    "benchmark": "B",
-                    "uname": "A B",
-                }
-            )
-
-        self.assertFalse(simulate.call_args.kwargs["rebalance"])
-
-    def test_formal_backtest_uses_the_same_no_rebalance_policy(self):
+    def test_grid_and_formal_backtest_do_not_rebalance_unchanged_symbol(self):
         histories = _fake_histories()
+        params = momentum.SimParams(window=10)
+        grid = momentum._grid_worker({
+            "histories": histories,
+            "symbols": ["A", "B"],
+            "params": params,
+            "benchmark": "B",
+            "uname": "A B",
+        })
         config = momentum.BacktestConfig(
-            symbols=["A", "B"],
-            start="2026-01-01",
-            end="2026-03-01",
-            window=10,
+            symbols=["A", "B"], start="2026-01-01", end="2026-03-01", window=10,
         )
-        result_frame = pd.DataFrame({"trade_count": [0]})
-        with patch.object(
-            momentum,
-            "simulate",
-            return_value=(result_frame, [], {}),
-        ) as simulate:
-            momentum._simulate_config(config, histories)
+        frame, trades = momentum._simulate_config(config, histories)
+        # 跳空建仓后目标股数会变化；同标的持仓仍只应成交一次。
+        self.assertEqual(grid["rotDays"], 1)
+        self.assertEqual(frame["trade_count"].sum(), 1)
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(trades[0]["vt_symbol"], "A")
+        self.assertEqual(trades[0]["direction"], "long")
 
-        self.assertFalse(simulate.call_args.kwargs["rebalance"])
+        artifact_dir = os.environ.get("FUTU_TEST_ARTIFACT_DIR")
+        if artifact_dir:
+            output = Path(artifact_dir)
+            output.mkdir(parents=True, exist_ok=True)
+            frame.to_csv(output / "momentum-daily.csv")
+            (output / "momentum-trades.json").write_text(
+                json.dumps({"grid": grid, "trades": trades}, default=str, indent=2) + "\n",
+                encoding="utf-8",
+            )
 
     def test_market_open_fills_at_next_day_open(self):
         histories = _fake_histories()
@@ -103,16 +89,18 @@ class MomentumOpenFillTest(unittest.TestCase):
         first = trades[0]
         self.assertEqual(first["direction"], "long")
         self.assertEqual(first["vt_symbol"], "A")
-        bar_date = pd.Timestamp(first["datetime"]).normalize()
-        open_on_bar = float(histories["A"].loc[bar_date, "Open"])
-        self.assertEqual(first["price"], open_on_bar)
+        # window=10 + 5 根预热：第15条收盘决策，第16条开盘成交。
+        expected_date = histories["A"].index[15]
+        self.assertEqual(pd.Timestamp(first["datetime"]), expected_date)
+        self.assertEqual(first["price"], histories["A"].loc[expected_date, "Open"])
+        self.assertNotEqual(first["price"], histories["A"].loc[expected_date, "Close"])
+        self.assertEqual(first["volume"], int(1_000_000 / histories["A"].iloc[14]["Close"]))
 
     def test_market_open_suspension_carries_over(self):
         histories = _fake_histories()
         # 首个决策日的次日（建仓执行日）A 停牌 open=0 → 顺延至再下一日成交
         dates = histories["A"].index
-        decision_day = dates[momentum.SimParams(window=10).warmup_extra + 10 - 1]
-        suspended = dates[list(dates).index(decision_day) + 1]
+        suspended = dates[15]
         histories["A"].loc[suspended, "Open"] = 0.0
         histories["A"].loc[suspended, "High"] = 0.0
         histories["A"].loc[suspended, "Low"] = 0.0
@@ -124,11 +112,11 @@ class MomentumOpenFillTest(unittest.TestCase):
             benchmark_symbol="B",
         )
         first = trades[0]
-        self.assertNotEqual(pd.Timestamp(first["datetime"]).normalize(), suspended)
-        bar_date = pd.Timestamp(first["datetime"]).normalize()
-        self.assertEqual(
-            first["price"], float(histories["A"].loc[bar_date, "Open"])
-        )
+        expected_date = dates[16]
+        self.assertEqual(pd.Timestamp(first["datetime"]), expected_date)
+        self.assertEqual(first["price"], histories["A"].loc[expected_date, "Open"])
+        # 未建仓时仍按停牌日收盘重新计算目标数量，恢复后执行该目标。
+        self.assertEqual(first["volume"], int(1_000_000 / histories["A"].iloc[15]["Close"]))
 
 if __name__ == "__main__":
     unittest.main()

@@ -15,6 +15,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime
@@ -147,7 +148,17 @@ class ConditionEngineTestCase(unittest.TestCase):
     def push_tick(self, main_engine, price):
         tick = TickData(symbol="00700", exchange=Exchange.SEHK, gateway_name="FAKE",
                         datetime=datetime.now(CHINA_TZ), last_price=price)
-        main_engine.event_engine.put(Event(EVENT_TICK, tick))
+        # 注册在策略处理器之后：等待本次 tick 真正处理完，避免用 sleep 猜测。
+        processed = threading.Event()
+        def mark_processed(event):
+            if event.data is tick:
+                processed.set()
+        main_engine.event_engine.register(EVENT_TICK, mark_processed)
+        try:
+            main_engine.event_engine.put(Event(EVENT_TICK, tick))
+            self.assertTrue(processed.wait(timeout=3.0), "tick 未处理完成")
+        finally:
+            main_engine.event_engine.unregister(EVENT_TICK, mark_processed)
 
     def wait_until(self, cond, timeout=3.0):
         deadline = time.time() + timeout
@@ -165,10 +176,14 @@ class ConditionEngineTestCase(unittest.TestCase):
 class TestTriggerLifecycle(ConditionEngineTestCase):
 
     def test_zero_price_tick_ignored(self):
+        self.write_yaml(BASE_YAML.replace('operator: ">"', 'operator: "<"'))
         main, engine, _ = self.build_engine()
         self.push_tick(main, 0)
-        time.sleep(0.3)
         self.assertIn("t1", engine.active_orders)
+        self.assertFalse(engine.managed_orders)
+        self.push_tick(main, 399)
+        self.assertNotIn("t1", engine.active_orders)
+        self.assertIn("t1", self.read_state()["triggered"])
 
     def test_trigger_retire_persist_and_archive(self):
         main, engine, _ = self.build_engine()
@@ -191,6 +206,8 @@ class TestTriggerLifecycle(ConditionEngineTestCase):
         self.push_tick(main, 405.5)
         self.assertTrue(self.wait_until(lambda: "t1" not in engine.active_orders))
 
+        main.event_engine.stop()
+        self.assertIn("t1", self.read_state()["triggered"])
         _, engine2, logs2 = self.build_engine()
         self.assertNotIn("t1", engine2.active_orders)
         self.assertTrue(self.wait_until(lambda: any("跳过装载" in m for m in logs2)))
@@ -200,6 +217,8 @@ class TestTriggerLifecycle(ConditionEngineTestCase):
         self.push_tick(main, 405.5)
         self.assertTrue(self.wait_until(lambda: "t1" not in engine.active_orders))
 
+        main.event_engine.stop()
+        self.assertIn("t1", self.read_state()["triggered"])
         self.write_yaml(BASE_YAML.replace("value: 400", "value: 500"))
         _, engine2, _ = self.build_engine()
         self.assertIn("t1", engine2.active_orders)
@@ -211,7 +230,6 @@ class TestTriggerLifecycle(ConditionEngineTestCase):
         self.push_tick(main, 405.5)
         self.push_tick(main, 406.0)
         self.assertTrue(self.wait_until(lambda: "t1" not in engine.active_orders))
-        time.sleep(0.3)
         self.assertIn("t1", self.read_state()["triggered"])
         self.assertEqual(sum("下单失败" in m for m in logs), 1)
 
