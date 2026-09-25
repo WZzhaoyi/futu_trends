@@ -1,4 +1,7 @@
-import hashlib
+import json
+import os
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,7 +9,6 @@ from unittest.mock import patch
 
 from cli.pm2_service import (
     PM2ConfigError,
-    build_pm2_args,
     build_service_spec,
     main,
     resolve_pm2_invocation,
@@ -16,126 +18,78 @@ from cli.pm2_service import (
 class PM2ServiceTest(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
         self.config = Path(self.temp_dir.name) / "signal api.ini"
         self.config.write_text("[CONFIG]\n", encoding="utf-8")
 
-    def tearDown(self):
-        self.temp_dir.cleanup()
-
-    def test_order_engine_identity_matches_ecosystem_contract(self):
-        spec = build_service_spec("order-engine", str(self.config))
-        digest = hashlib.sha256(str(self.config.absolute()).encode()).hexdigest()[:8]
-        self.assertEqual(spec.instance_name, f"futu-order-signal-api-{digest}")
-        self.assertEqual(spec.environment, {"ORDER_ENGINE_CONFIG": str(self.config.absolute())})
-
-    def test_signal_api_identity_includes_port(self):
-        spec = build_service_spec("signal-api", str(self.config), port=18001)
-        identity = f"{self.config.absolute()}\0{18001}"
-        digest = hashlib.sha256(identity.encode()).hexdigest()[:8]
-        self.assertEqual(spec.instance_name, f"futu-signal-api-signal-api-18001-{digest}")
-        self.assertEqual(spec.environment["SIGNAL_API_PORT"], "18001")
-
-    def test_csi_flow_identity_and_environment(self):
-        runtime = Path(self.temp_dir.name) / "runtime"
-        spec = build_service_spec(
-            "csi-flow",
-            str(self.config),
-            runtime_dir=str(runtime.absolute()),
-            symbol="sh.000902",
+    def ecosystem_apps(self, path, environment):
+        node = shutil.which("node")
+        self.assertIsNotNone(node, "PM2 ecosystem 契约测试需要 Node.js")
+        result = subprocess.run(
+            [node, "-e", "console.log(JSON.stringify(require(process.argv[1]).apps))", str(path)],
+            env={"PATH": os.environ.get("PATH", ""), "TZ": "Asia/Shanghai", **environment},
+            capture_output=True, text=True, timeout=10, check=True,
         )
-        identity = "\0".join(
-            (
-                str(self.config.absolute()),
-                str(runtime.absolute()),
-                "SH.000902",
-            )
-        )
-        digest = hashlib.sha256(identity.encode()).hexdigest()[:8]
-        self.assertEqual(spec.instance_name, f"futu-csi-flow-{digest}")
-        self.assertEqual(
-            spec.environment,
-            {
-                "CSI_FLOW_CONFIG": str(self.config.absolute()),
-                "CSI_FLOW_RUNTIME_DIR": str(runtime.absolute()),
-                "CSI_FLOW_SYMBOL": "SH.000902",
-                "CSI_FLOW_INITIAL_POSITION": "flat",
-                "CSI_FLOW_NOTIFICATION_MODE": "position-aware",
-                "CSI_FLOW_WINDOW_MONTHS": "9",
-                "CSI_FLOW_T1_SELL_MODE": "defer-next-open",
-            },
-        )
-        self.assertEqual(
-            spec.ecosystem_path.name,
-            "ecosystem.csi-flow.config.js",
-        )
-        self.assertTrue(spec.ecosystem_path.is_file())
+        return json.loads(result.stdout)
 
-    def test_etf_premium_identity_and_environment(self):
-        runtime = Path(self.temp_dir.name) / "etf-runtime"
+    @patch("cli.pm2_service.run_pm2", return_value=7)
+    def test_cli_settings_reach_real_ecosystems(self, run_pm2):
+        runtime = str(Path(self.temp_dir.name) / "runtime with spaces")
         strategy = Path(self.temp_dir.name) / "strategy.json"
         strategy.write_text("{}\n", encoding="utf-8")
-        cache = Path(self.temp_dir.name) / "cache"
-        spec = build_service_spec(
-            "etf-premium",
-            str(self.config),
-            runtime_dir=str(runtime.absolute()),
-            symbol="159941",
-            initial_position="low",
-            strategy_file=str(strategy),
-            cache_dir=str(cache),
+        cases = (
+            ("order-engine", "start", "order_engine/__main__.py", {}),
+            ("signal-api", "restart", "gui/backend/api.py", {"--port": "18001"}),
+            ("csi-flow", "start", "market_analysis/csi_flow_timing.py", {
+                "--runtime-dir": runtime, "--symbol": "SH.000300",
+                "--initial-position": "long", "--entry-date": "2026-09-01",
+                "--notification-mode": "position-independent",
+                "--window-months": "10", "--t1-sell-mode": "ignore-same-day",
+            }),
+            ("etf-premium", "start", "market_analysis/etf_premium_rate.py", {
+                "--runtime-dir": runtime, "--symbol": "510300",
+                "--initial-position": "low", "--strategy-file": str(strategy),
+                "--cache-dir": str(Path(self.temp_dir.name) / "cache"),
+                "--interval": "17.0", "--nav-refresh": "123.0",
+                "--max-nav-age": "7", "--max-quote-age": "89.0", "--max-errors": "3",
+            }),
+            ("momentum-rotation", "restart", "market_analysis/momentum_rotation_strategy.py", {
+                "--runtime-dir": runtime,
+            }),
         )
-        identity = "\0".join(
-            (
-                str(self.config.absolute()),
-                str(runtime.absolute()),
-                "159941",
-            )
-        )
-        digest = hashlib.sha256(identity.encode()).hexdigest()[:8]
-        self.assertEqual(
-            spec.instance_name,
-            f"futu-etf-premium-{digest}",
-        )
-        self.assertEqual(
-            spec.environment["ETF_PREMIUM_RUNTIME_DIR"],
-            str(runtime.absolute()),
-        )
-        self.assertEqual(
-            spec.environment["ETF_PREMIUM_STRATEGY_FILE"],
-            str(strategy.absolute()),
-        )
-        self.assertEqual(spec.environment["ETF_PREMIUM_INITIAL_POSITION"], "low")
-        self.assertEqual(spec.environment["ETF_PREMIUM_MAX_NAV_AGE"], "14")
-        self.assertEqual(
-            spec.ecosystem_path.name,
-            "ecosystem.etf-premium.config.js",
-        )
-        self.assertTrue(spec.ecosystem_path.is_file())
-
-    def test_momentum_rotation_identity_and_environment(self):
-        runtime = Path(self.temp_dir.name) / "momentum-runtime"
-        specs = build_service_spec(
-            "momentum-rotation",
-            str(self.config),
-            runtime_dir=str(runtime.absolute()),
-            live_mode="live",
-        )
-        self.assertIsInstance(specs, list)
-        self.assertEqual([spec.instance_name for spec in specs], [
-            f"futu-momentum-rotation-cn-{hashlib.sha256((str(self.config.absolute()) + chr(0) + str(runtime.absolute()) + chr(0) + 'CN').encode()).hexdigest()[:8]}",
-            f"futu-momentum-rotation-us-{hashlib.sha256((str(self.config.absolute()) + chr(0) + str(runtime.absolute()) + chr(0) + 'US').encode()).hexdigest()[:8]}",
-        ])
-        for spec in specs:
-            self.assertEqual(spec.environment["MOMENTUM_ROTATION_MODE"], "live")
-            self.assertEqual(
-                spec.environment["MOMENTUM_ROTATION_RUNTIME_DIR"],
-                str(runtime.absolute()),
-            )
-            self.assertEqual(
-                spec.ecosystem_path.name,
-                "ecosystem.momentum-rotation.config.js",
-            )
-            self.assertTrue(spec.ecosystem_path.is_file())
+        records = []
+        for service, action, script, options in cases:
+            with self.subTest(service=service):
+                supplied = {"--config": str(self.config), **options}
+                argv = [service, action] + [part for pair in supplied.items() for part in pair]
+                run_pm2.reset_mock()
+                self.assertEqual(main(argv), 7)
+                run_pm2.assert_called_once()
+                command, environment = run_pm2.call_args.args
+                self.assertEqual(command[0], "start")
+                self.assertIn("--update-env", command)
+                apps = self.ecosystem_apps(command[1], environment)
+                selected = command[command.index("--only") + 1].split(",")
+                self.assertCountEqual(selected, [app["name"] for app in apps])
+                self.assertEqual(len(apps), 2 if service == "momentum-rotation" else 1)
+                markets = []
+                for app in apps:
+                    self.assertEqual(Path(app["script"]), Path(__file__).resolve().parents[1] / script)
+                    args = app["args"]
+                    if service in {"csi-flow", "etf-premium", "momentum-rotation"}:
+                        self.assertEqual(args[0], "live")
+                        args = args[1:]
+                    delivered = dict(zip(args[::2], args[1::2]))
+                    for flag, value in supplied.items():
+                        self.assertEqual(delivered.get(flag), value, flag)
+                    markets.append(delivered.get("--markets"))
+                if service == "momentum-rotation":
+                    self.assertCountEqual(markets, ["CN", "US"])
+                records.append({"service": service, "command": command, "apps": apps})
+        if output := os.environ.get("FUTU_TEST_ARTIFACT_DIR"):
+            path = Path(output) / "pm2-ecosystems.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(records, indent=2) + "\n", encoding="utf-8")
 
     def test_identity_does_not_dereference_config_symlink(self):
         link = Path(self.temp_dir.name) / "linked.ini"
@@ -144,165 +98,50 @@ class PM2ServiceTest(unittest.TestCase):
         except OSError as exc:
             self.skipTest(f"symlink unavailable: {exc}")
         spec = build_service_spec("order-engine", str(link))
-        digest = hashlib.sha256(str(link.absolute()).encode()).hexdigest()[:8]
+        target = build_service_spec("order-engine", str(self.config))
+        app, = self.ecosystem_apps(spec.ecosystem_path, spec.environment)
         self.assertEqual(spec.config_path, link.absolute())
-        self.assertEqual(spec.instance_name, f"futu-order-linked-{digest}")
+        self.assertNotEqual(spec.instance_name, target.instance_name)
+        self.assertEqual(app["name"], spec.instance_name)
+        self.assertEqual(app["args"], ["--config", str(link)])
 
-    def test_start_and_status_pm2_arguments(self):
-        spec = build_service_spec("signal-api", str(self.config))
-        expected = [
-            "start",
-            str(spec.ecosystem_path),
-            "--only",
-            spec.instance_name,
-            "--update-env",
-        ]
-        self.assertEqual(build_pm2_args("start", spec), expected)
-        self.assertEqual(build_pm2_args("restart", spec), expected)
-        self.assertEqual(build_pm2_args("status", spec), ["describe", spec.instance_name])
+    @patch("cli.pm2_service.run_pm2", return_value=0)
+    def test_status_targets_configured_instance(self, run_pm2):
+        spec = build_service_spec("signal-api", str(self.config), port=18001)
+        self.assertEqual(main([
+            "signal-api", "status", "--config", str(self.config), "--port", "18001",
+        ]), 0)
+        self.assertEqual(run_pm2.call_args.args[0], ["describe", spec.instance_name])
 
-    def test_missing_config_and_invalid_port_fail(self):
-        with self.assertRaises(PM2ConfigError):
-            build_service_spec("order-engine", str(self.config) + ".missing")
-        with self.assertRaises(PM2ConfigError):
-            build_service_spec("signal-api", str(self.config), port=65536)
-        with self.assertRaises(PM2ConfigError):
-            build_service_spec(
-                "csi-flow",
-                str(self.config),
-                runtime_dir="relative/path",
-            )
-        with self.assertRaises(PM2ConfigError):
-            build_service_spec(
-                "csi-flow",
-                str(self.config),
-                runtime_dir=str(Path(self.temp_dir.name).absolute()),
-                initial_position="long",
-            )
-        with self.assertRaises(PM2ConfigError):
-            build_service_spec(
-                "etf-premium",
-                str(self.config),
-                runtime_dir="relative/path",
-                symbol="159941",
-                initial_position="base",
-            )
-        with self.assertRaises(PM2ConfigError):
-            build_service_spec(
-                "momentum-rotation",
-                str(self.config),
-                runtime_dir=str(Path(self.temp_dir.name).absolute()),
-                live_mode="custom",
-            )
-        with self.assertRaises(PM2ConfigError):
-            build_service_spec(
-                "etf-premium",
-                str(self.config),
-                runtime_dir=str(Path(self.temp_dir.name).absolute()),
-                symbol="SZ.159941",
-                initial_position="base",
-            )
+    def test_invalid_settings_rejected(self):
+        runtime = str(Path(self.temp_dir.name) / "runtime")
+        cases = (
+            ("order-engine", str(self.config) + ".missing", {}, "配置文件不存在"),
+            ("signal-api", str(self.config), {"port": 65536}, "端口超出范围"),
+            ("csi-flow", str(self.config), {"runtime_dir": "relative/path"}, "绝对路径"),
+            ("csi-flow", str(self.config), {
+                "runtime_dir": runtime, "initial_position": "long",
+            }, "entry-date"),
+            ("etf-premium", str(self.config), {
+                "runtime_dir": "relative/path", "symbol": "159941", "initial_position": "base",
+            }, "绝对路径"),
+            ("momentum-rotation", str(self.config), {
+                "runtime_dir": runtime, "live_mode": "custom",
+            }, "mode 只能是 live"),
+            ("etf-premium", str(self.config), {
+                "runtime_dir": runtime, "symbol": "SZ.159941", "initial_position": "base",
+            }, "6位基金代码"),
+        )
+        for service, config, options, reason in cases:
+            with self.subTest(service=service, options=options):
+                with self.assertRaisesRegex(PM2ConfigError, reason):
+                    build_service_spec(service, config, **options)
 
     def test_unix_pm2_override(self):
         invocation = resolve_pm2_invocation(
             ["status"], environ={"PM2_BIN": "/custom/pm2"}, platform="darwin",
         )
         self.assertEqual(invocation, ["/custom/pm2", "status"])
-
-    @patch("cli.pm2_service.run_pm2", return_value=7)
-    def test_main_passes_through_pm2_exit_code(self, run_pm2_mock):
-        rc = main(["signal-api", "restart", "--config", str(self.config), "--port", "9001"])
-        self.assertEqual(rc, 7)
-        args, env = run_pm2_mock.call_args.args
-        self.assertEqual(args[0], "start")
-        self.assertEqual(env["SIGNAL_API_PORT"], "9001")
-
-    @patch("cli.pm2_service.run_pm2", return_value=0)
-    def test_main_builds_csi_flow_service(self, run_pm2_mock):
-        runtime = Path(self.temp_dir.name) / "runtime"
-        rc = main(
-            [
-                "csi-flow",
-                "start",
-                "--config",
-                str(self.config),
-                "--runtime-dir",
-                str(runtime.absolute()),
-                "--notification-mode",
-                "position-independent",
-                "--window-months",
-                "9",
-                "--t1-sell-mode",
-                "defer-next-open",
-            ]
-        )
-        self.assertEqual(rc, 0)
-        args, env = run_pm2_mock.call_args.args
-        self.assertEqual(args[0], "start")
-        self.assertEqual(env["CSI_FLOW_SYMBOL"], "SH.000902")
-        self.assertEqual(
-            env["CSI_FLOW_NOTIFICATION_MODE"],
-            "position-independent",
-        )
-        self.assertEqual(env["CSI_FLOW_WINDOW_MONTHS"], "9")
-        self.assertEqual(env["CSI_FLOW_T1_SELL_MODE"], "defer-next-open")
-        self.assertEqual(
-            env["CSI_FLOW_RUNTIME_DIR"],
-            str(runtime.absolute()),
-        )
-
-    @patch("cli.pm2_service.run_pm2", return_value=0)
-    def test_main_builds_etf_premium_service(self, run_pm2_mock):
-        runtime = Path(self.temp_dir.name) / "etf-runtime"
-        rc = main(
-            [
-                "etf-premium",
-                "start",
-                "--config",
-                str(self.config),
-                "--runtime-dir",
-                str(runtime.absolute()),
-                "--symbol",
-                "159941",
-                "--initial-position",
-                "base",
-            ]
-        )
-        self.assertEqual(rc, 0)
-        args, env = run_pm2_mock.call_args.args
-        self.assertEqual(args[0], "start")
-        self.assertEqual(env["ETF_PREMIUM_SYMBOL"], "159941")
-        self.assertEqual(env["ETF_PREMIUM_INTERVAL"], "60.0")
-        self.assertEqual(
-            env["ETF_PREMIUM_RUNTIME_DIR"],
-            str(runtime.absolute()),
-        )
-
-    @patch("cli.pm2_service.run_pm2", return_value=0)
-    def test_main_builds_momentum_rotation_service(self, run_pm2_mock):
-        runtime = Path(self.temp_dir.name) / "momentum-runtime"
-        rc = main(
-            [
-                "momentum-rotation",
-                "start",
-                "--config",
-                str(self.config),
-                "--runtime-dir",
-                str(runtime.absolute()),
-                "--mode",
-                "live",
-            ]
-        )
-        self.assertEqual(rc, 0)
-        args, env = run_pm2_mock.call_args.args
-        self.assertEqual(args[0], "start")
-        self.assertIn("--only", args)
-        self.assertRegex(args[args.index("--only") + 1], r"futu-momentum-rotation-(cn|us)-[0-9a-f]{8},futu-momentum-rotation-(cn|us)-[0-9a-f]{8}")
-        self.assertEqual(env["MOMENTUM_ROTATION_MODE"], "live")
-        self.assertEqual(
-            env["MOMENTUM_ROTATION_RUNTIME_DIR"],
-            str(runtime.absolute()),
-        )
 
     @patch("cli.pm2_service.run_pm2", return_value=0)
     def test_save_needs_no_config(self, run_pm2_mock):

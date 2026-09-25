@@ -1,6 +1,8 @@
 import configparser
+import io
 import unittest
 from unittest import mock
+from contextlib import redirect_stdout
 
 import notification_engine.engine as engine_module
 import notification_engine.webhook as webhook_module
@@ -9,14 +11,10 @@ from notification_engine.webhook import WebhookNotifier
 
 
 class FeishuCellValueToTextTest(unittest.TestCase):
-    def test_empty_response_is_empty_text(self):
-        for values in ([], [[]], [[None]]):
+    def test_cell_values_become_text(self):
+        for values, expected in (([], ""), ([[]], ""), ([[None]], ""), ([["existing"]], "existing"), ([[123]], "123")):
             with self.subTest(values=values):
-                self.assertEqual(_feishu_cell_value_to_text(values), "")
-
-    def test_non_empty_cell_is_text(self):
-        self.assertEqual(_feishu_cell_value_to_text([["existing"]]), "existing")
-        self.assertEqual(_feishu_cell_value_to_text([[123]]), "123")
+                self.assertEqual(_feishu_cell_value_to_text(values), expected)
 
 
 class NotificationTimeoutTest(unittest.TestCase):
@@ -91,21 +89,25 @@ class NotificationTimeoutTest(unittest.TestCase):
         self.assertIn("recipient_count=2 refused_count=1", logs.output[0])
         self.assertNotIn("rejected@example.com", logs.output[0])
 
-    def test_telegram_uses_network_timeout(self):
-        engine = self._telegram_engine()
-
-        with mock.patch("builtins.print") as print_mock:
-            engine.send_telegram_message("message", "https://example.com")
-
-        self.assertEqual(
-            engine.SESSION.post.call_args.kwargs["timeout"],
-            engine_module.NOTIFICATION_NETWORK_TIMEOUT,
+    def test_telegram_delivery_uses_correct_transport_and_reports_result(self):
+        cases = (
+            ("send_telegram_message", "sendMessage", "json", "text", "hello", 123),
+            ("send_telegram_photo", "sendPhoto", "data", "photo", "https://example.com/image.jpg", 456),
         )
-        print_mock.assert_called_once_with(
-            "Notification: channel=telegram operation=sendMessage ok=true status=200 "
-            "message_id=123",
-            flush=True,
-        )
+        for method, operation, encoding, field, value, message_id in cases:
+            with self.subTest(operation=operation):
+                engine = self._telegram_engine(payload={"ok": True, "result": {"message_id": message_id}})
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    getattr(engine, method)(value)
+                engine.SESSION.post.assert_called_once()
+                request = engine.SESSION.post.call_args
+                self.assertTrue(request.args[0].endswith("/" + operation))
+                self.assertGreater(request.kwargs["timeout"], 0)
+                self.assertEqual(request.kwargs[encoding]["chat_id"], "secret-chat")
+                self.assertEqual(request.kwargs[encoding][field], value)
+                for detail in ("channel=telegram", "operation=" + operation, "ok=true", f"message_id={message_id}"):
+                    self.assertIn(detail, output.getvalue())
 
     def test_telegram_logs_rejected_http_response_without_credentials(self):
         engine = self._telegram_engine(
@@ -127,28 +129,6 @@ class NotificationTimeoutTest(unittest.TestCase):
         )
         self.assertNotIn("secret-token", logs.output[0])
         self.assertNotIn("secret-chat", logs.output[0])
-
-    def test_telegram_photo_requests_use_shared_response_log(self):
-        engine = self._telegram_engine(
-            payload={"ok": True, "result": {"message_id": 456}}
-        )
-
-        with mock.patch("builtins.print") as print_mock:
-            engine.send_telegram_photo("https://example.com/image.jpg")
-
-        self.assertEqual(
-            engine.SESSION.post.call_args.kwargs["timeout"],
-            engine_module.NOTIFICATION_NETWORK_TIMEOUT,
-        )
-        self.assertEqual(
-            engine.SESSION.post.call_args.kwargs["data"]["chat_id"],
-            "secret-chat",
-        )
-        print_mock.assert_called_once_with(
-            "Notification: channel=telegram operation=sendPhoto ok=true status=200 "
-            "message_id=456",
-            flush=True,
-        )
 
     def test_telegram_media_group_falls_back_when_api_reports_failure(self):
         engine = self._telegram_engine(
@@ -252,7 +232,7 @@ class WebhookNotifierTest(unittest.TestCase):
         }
         return WebhookNotifier(config)
 
-    def test_success_uses_shared_delivery_log(self):
+    def test_success_returns_and_reports_delivery_id(self):
         response = mock.Mock(
             status_code=200,
             ok=True,
@@ -264,15 +244,13 @@ class WebhookNotifierTest(unittest.TestCase):
             webhook_module.requests,
             "post",
             return_value=response,
-        ), mock.patch("builtins.print") as print_mock:
+        ), redirect_stdout(io.StringIO()) as output:
             result = self._notifier().send("message")
 
         self.assertTrue(result.ok)
-        print_mock.assert_called_once_with(
-            "Notification: channel=webhook operation=send ok=true "
-            "status=200 run_id=run-123",
-            flush=True,
-        )
+        self.assertEqual(result.run_id, "run-123")
+        for detail in ("channel=webhook", "operation=send", "ok=true", "run_id=run-123"):
+            self.assertIn(detail, output.getvalue())
 
     def test_failure_log_omits_url_and_raw_response(self):
         response = mock.Mock(

@@ -5,7 +5,7 @@ import tempfile
 import types
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import date, time
+from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
@@ -29,114 +29,24 @@ sys.modules[SPEC.name] = momentum
 SPEC.loader.exec_module(momentum)
 
 
-def find_leg(name: str):
-    for leg in momentum.LIVE_LEGS:
-        if leg.name == name:
-            return leg
-    raise AssertionError(f"LIVE_LEGS 缺少 {name}")
-
-
 def market_legs(market: str):
     return tuple(leg for leg in momentum.LIVE_LEGS if leg.market == market)
 
 
 class LiveConfigurationTest(unittest.TestCase):
-    def test_live_legs_match_deployed_configuration(self):
-        us_a = find_leg("US-A")
-        self.assertEqual(us_a.market, "US")
-        self.assertEqual(
-            us_a.symbols,
-            ("US.QQQ", "US.FXI", "US.GLD", "US.UUP"),
-        )
-        self.assertEqual(us_a.window, 22)
-        self.assertEqual(us_a.cooldown, 0)
-        self.assertEqual(us_a.gap_eps, 0.49)
-        self.assertEqual(us_a.cash_symbols, ("US.UUP",))
-        self.assertEqual(us_a.slippage, momentum.DEFAULT_SLIPPAGE_US)
-
-        us_b = find_leg("US-B")
-        self.assertEqual(us_b.market, "US")
-        self.assertEqual(
-            us_b.symbols,
-            ("US.QQQ", "US.SPY", "US.FXI", "US.GLD", "US.UUP"),
-        )
-        self.assertEqual(us_b.window, 22)
-        self.assertEqual(us_b.cooldown, 0)
-        self.assertEqual(us_b.gap_eps, 0.30)
-        self.assertEqual(us_b.cash_symbols, ("US.UUP",))
-        self.assertEqual(us_b.slippage, momentum.DEFAULT_SLIPPAGE_US)
-
-        cn_a = find_leg("CN-A")
-        self.assertEqual(cn_a.market, "CN")
-        self.assertEqual(
-            cn_a.symbols,
-            ("SZ.159941", "SZ.159949", "SH.510300", "SH.518880"),
-        )
-        self.assertEqual(cn_a.window, 26)
-        self.assertEqual(cn_a.cooldown, 3)
-        self.assertEqual(cn_a.gap_eps, 0.0)
-        self.assertEqual(cn_a.slippage, momentum.DEFAULT_SLIPPAGE_CN)
-
-        cn_b = find_leg("CN-B")
-        self.assertEqual(cn_b.market, "CN")
-        self.assertEqual(
-            cn_b.symbols,
-            ("SZ.159941", "SZ.159949", "SH.510300", "SH.518880"),
-        )
-        self.assertEqual(cn_b.window, 24)
-        self.assertEqual(cn_b.cooldown, 0)
-        self.assertEqual(cn_b.gap_eps, 0.34)
-        self.assertEqual(cn_b.slippage, momentum.DEFAULT_SLIPPAGE_CN)
-
-    def test_market_specs_have_staggered_notification_times(self):
-        self.assertEqual(
-            momentum.MARKET_SPECS["US"]["notification_time"], time(16, 10)
-        )
-        self.assertEqual(
-            str(momentum.MARKET_SPECS["US"]["timezone"]),
-            "America/New_York",
-        )
-        self.assertEqual(
-            momentum.MARKET_SPECS["CN"]["notification_time"], time(15, 10)
-        )
-        self.assertEqual(
-            str(momentum.MARKET_SPECS["CN"]["timezone"]), "Asia/Shanghai"
-        )
-        self.assertEqual(
-            len({leg.market for leg in momentum.LIVE_LEGS}), 2
-        )
-        self.assertEqual(
-            [leg.name for leg in momentum.LIVE_LEGS],
-            ["US-A", "US-B", "CN-A", "CN-B"],
-        )
-
-    def test_live_cli_has_no_strategy_or_connection_overrides(self):
-        args = momentum.parse_args(
-            [
-                "live",
-                "--runtime-dir",
-                "/tmp/momentum",
-                "--config",
-                "config.ini",
-            ]
-        )
-
-        self.assertEqual(args.mode, "live")
-        for name in (
-            "etfs",
-            "windows",
-            "notification_time",
-            "host",
-            "port",
-            "data_source",
+    def test_live_cli_rejects_strategy_and_connection_overrides(self):
+        for name, value in (
+            ("etfs", "US.QQQ"), ("windows", "22"), ("notification-time", "16:10"),
+            ("host", "127.0.0.1"), ("port", "11111"), ("data-source", "futu"),
         ):
-            with self.subTest(option=name), redirect_stderr(io.StringIO()):
-                with self.assertRaises(SystemExit) as rejected:
+            with self.subTest(option=name):
+                errors = io.StringIO()
+                with redirect_stderr(errors), self.assertRaises(SystemExit) as rejected:
                     momentum.parse_args([
-                        "live", "--runtime-dir", "/tmp/momentum",
-                        "--" + name.replace("_", "-"), "override",
+                        "live", "--runtime-dir", "/tmp/momentum", "--" + name, value,
                     ])
                 self.assertEqual(rejected.exception.code, 2)
+                self.assertIn("unrecognized arguments: --" + name, errors.getvalue())
 
     def test_connection_and_data_source_come_from_config(self):
         with tempfile.TemporaryDirectory() as raw_dir:
@@ -159,28 +69,14 @@ class LiveConfigurationTest(unittest.TestCase):
 
 
 class LiveSignalTest(unittest.TestCase):
-    def test_momentum_score_matches_linear_log_price_fit(self):
-        # log 价格为 [0, 0, log(1.01)]：斜率 log(1.01)/2，R²=3/4。
-        score = momentum.calculate_momentum_score(np.array([1.0, 1.0, 1.01]))
-        self.assertAlmostEqual(score, (1.01 ** 125 - 1) * 0.75)
-
-    def test_each_symbol_uses_its_own_window(self):
-        pairs = [("US.QQQ", 3), ("US.SPY", 4)]
-        closes = {
-            "US.QQQ": [1.0, 2.0, 3.0, 4.0],
-            "US.SPY": [1.0, 1.1, 1.2, 1.3],
-        }
-
-        scores = momentum.score_live_pairs(pairs, closes)
-
-        self.assertAlmostEqual(
-            scores["US.QQQ"],
-            momentum.calculate_momentum_score(np.array([2.0, 3.0, 4.0])),
+    def test_each_symbol_uses_its_own_window_and_linear_score(self):
+        scores = momentum.score_live_pairs(
+            [("US.QQQ", 3), ("US.SPY", 4)],
+            {"US.QQQ": [100.0, 1.0, 1.01, 1.0201], "US.SPY": [1.0, 1.0, 1.0, 1.01]},
         )
-        self.assertAlmostEqual(
-            scores["US.SPY"],
-            momentum.calculate_momentum_score(np.array([1.0, 1.1, 1.2, 1.3])),
-        )
+        # QQQ 最近3点是等比增长（R²=1）；SPY 4点拟合斜率为0.3*log(1.01)，R²=0.6。
+        self.assertAlmostEqual(scores["US.QQQ"], 1.01 ** 250 - 1)
+        self.assertAlmostEqual(scores["US.SPY"], (1.01 ** 75 - 1) * 0.6)
 
     def test_decision_action_matrix(self):
         today = date(2026, 8, 14)

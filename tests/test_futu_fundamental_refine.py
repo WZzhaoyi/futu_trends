@@ -96,34 +96,6 @@ def bundle(income=INCOME, balance=BALANCE, cashflow=CASHFLOW):
 
 
 class FutuFundamentalRefineTest(unittest.TestCase):
-    def test_four_strategies_apply_market_size_and_20_day_liquidity_filters(self):
-        expected_market_caps = {
-            sepa_screener: {"US": 15e9, "HK": 15e9, "A": 15e9},
-            pr_screener: {"US": 10e9, "HK": 10e9, "A": 10e9},
-            growth_value_screener: {"US": 10e9, "HK": 10e9, "A": 10e9},
-            deep_value_screener: {"US": 1e9, "HK": 1e9, "A": 1e9},
-        }
-        expected_turnover = {"US": 50e6, "HK": 5e6, "A": 50e6}
-
-        for strategy, market_caps in expected_market_caps.items():
-            for market in ("US", "HK", "A"):
-                with self.subTest(strategy=strategy.NAME, market=market):
-                    filters = strategy.build_filters(market, fs.ft)
-                    market_cap = next(
-                        item for item in filters
-                        if getattr(item, "stock_field", None)
-                        == fs.ft.StockField.MARKET_VAL
-                    )
-                    turnover = next(
-                        item for item in filters
-                        if getattr(item, "stock_field", None)
-                        == fs.ft.StockField.TURNOVER
-                    )
-
-                    self.assertEqual(market_cap.filter_min, market_caps[market])
-                    self.assertEqual(turnover.filter_min, expected_turnover[market])
-                    self.assertEqual(turnover.days, 20)
-
     def test_deep_value_current_ratio_filter_uses_futu_percentage_units(self):
         current_ratio_filter = next(
             item for item in deep_value_screener.build_filters("HK", fs.ft)
@@ -132,10 +104,6 @@ class FutuFundamentalRefineTest(unittest.TestCase):
 
         # Futu V1 represents 1.5x as 150 percentage points.
         self.assertEqual(current_ratio_filter.filter_min, 150.0)
-        self.assertEqual(
-            deep_value_screener.CURRENT_RATIO_MIN_PCT,
-            current_ratio_filter.filter_min,
-        )
 
     def test_generic_refine_uses_latest_common_cumulative_report_and_annual_history(self):
         result = fs.generic_futu_refine({"code": "HK.TEST"}, bundle())

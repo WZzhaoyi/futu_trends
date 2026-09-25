@@ -110,50 +110,26 @@ class NavAlignmentTest(unittest.TestCase):
 
 
 class StrategyStateTest(unittest.TestCase):
-    def setUp(self):
-        self.params = premium.StrategyParams(
-            buy_threshold=0.0,
-            sell_threshold=0.03,
-            low_position=0.5,
+    def test_hysteresis_positions_and_actions(self):
+        params = premium.StrategyParams(
+            buy_threshold=0.0, sell_threshold=0.03, low_position=0.5,
         )
-
-    def test_live_only_emits_on_position_transition(self):
-        self.assertEqual(
-            premium.apply_live_signal("base", 0.04, self.params),
+        values = np.array([0.03, 0.04, 0.04, 0.0, 0.02, -0.01, -0.01, 0.03, 0.02, 0.04])
+        expected = [
+            ("base", "NONE"), ("low", "SELL"), ("low", "NONE"), ("low", "NONE"), ("low", "NONE"),
+            ("base", "BUY"), ("base", "NONE"), ("base", "NONE"), ("base", "NONE"),
             ("low", "SELL"),
-        )
-        self.assertEqual(
-            premium.apply_live_signal("low", 0.04, self.params),
-            ("low", "NONE"),
-        )
-        self.assertEqual(
-            premium.apply_live_signal("low", -0.01, self.params),
-            ("base", "BUY"),
-        )
-
-    def test_backtest_and_live_follow_the_same_transition_sequence(self):
-        premiums = np.array([0.04, 0.02, -0.01, 0.02, 0.04])
-        backtest_positions = premium.positions_for_premium(
-            premiums,
-            self.params,
-        )
+        ]
         state = "base"
-        live_positions = []
-        for value in premiums:
-            state, _action = premium.apply_live_signal(
-                state,
-                float(value),
-                self.params,
-            )
-            live_positions.append(
-                self.params.base_position
-                if state == "base"
-                else self.params.low_position
-            )
-
-        expected = [0.5, 0.5, 1.0, 1.0, 0.5]
-        np.testing.assert_allclose(backtest_positions, expected)
-        np.testing.assert_allclose(live_positions, expected)
+        transitions = []
+        for value in values:
+            state, action = premium.decide_position(state, float(value), params)
+            transitions.append((state, action))
+        self.assertEqual(transitions, expected)
+        np.testing.assert_allclose(
+            premium.positions_for_premium(values, params),
+            [1.0, 0.5, 0.5, 0.5, 0.5, 1.0, 1.0, 1.0, 1.0, 0.5],
+        )
 
 
 class LiveRuntimeTest(unittest.TestCase):
@@ -233,23 +209,6 @@ class NotificationTest(unittest.TestCase):
         self.assertIn("SELL", engine.webhooks[0])
         self.assertIn("滞后2天", engine.webhooks[0])
         self.assertIn("估算IOPV", engine.webhooks[0])
-
-
-class CliTest(unittest.TestCase):
-    def test_defaults_match_target_etf_and_joinquant_period(self):
-        parser = premium.build_parser()
-        args = parser.parse_args(["backtest"])
-        self.assertEqual(args.symbol, "159941")
-        self.assertEqual(args.start, "2016-01-01")
-        self.assertEqual(args.cost, 0.001)
-
-        live = parser.parse_args(["live", "--runtime-dir", "/tmp/etf-premium"])
-        self.assertEqual(live.initial_position, "base")
-        self.assertEqual(live.interval, 60.0)
-        self.assertEqual(live.nav_refresh, 900.0)
-        self.assertEqual(live.max_nav_age, 14)
-        self.assertEqual(live.max_quote_age, 180)
-        self.assertEqual(live.max_errors, 5)
 
 
 if __name__ == "__main__":

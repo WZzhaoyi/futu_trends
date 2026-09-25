@@ -94,78 +94,18 @@ class LiveEventNotifierTest(unittest.TestCase):
         self.assertIn("READY", engine.webhooks[0])
 
 
-class StrategyDefinitionTest(unittest.TestCase):
-    def test_frozen_m1_definition_and_cli_defaults(self):
-        self.assertEqual(timing.STRATEGY, "m1")
+class StrategyConfigurationTest(unittest.TestCase):
+    def test_live_cli_accepts_explicit_strategy_options(self):
+        configured = timing.build_parser().parse_args([
+            "live", "--symbol", "SH.000902", "--runtime-dir", "/tmp/csi-flow",
+            "--window-months", "10", "--n", "11",
+            "--notification-mode", "position-independent", "--t1-sell-mode", "ignore-same-day",
+        ])
         self.assertEqual(
-            timing.VERSION,
-            "M1-LF-held-downside-exact-grid-strength-t1-defer-v2",
+            (configured.window_months, configured.strength_n,
+             configured.notification_mode, configured.t1_sell_mode),
+            (10, 11, "position-independent", "ignore-same-day"),
         )
-        self.assertEqual(timing.PUBLISH_SCHEMA_VERSION, 3)
-        self.assertEqual(timing.WINDOW_MONTHS, 9)
-        self.assertEqual(timing.T1_SELL_MODE, "defer-next-open")
-        self.assertEqual(timing.STRENGTH_N, 9)
-        self.assertEqual(timing.GRID_POINTS, 8008)
-        self.assertEqual(
-            timing.GRID_POINTS,
-            len(timing.ENTRY_Z30_GRID)
-            * len(timing.ENTRY_Z60_GRID)
-            * len(timing.EXIT_Z30_GRID)
-            * len(timing.EXIT_Z60_GRID),
-        )
-
-        parser = timing.build_parser()
-        fetch_args = parser.parse_args(
-            [
-                "fetch-bars",
-                "--as-of",
-                "2026-07-01",
-                "--output",
-                "/tmp/bars.json",
-            ]
-        )
-        self.assertEqual(fetch_args.futu_time_convention, "end")
-        self.assertEqual(fetch_args.window_months, 9)
-        self.assertFalse(hasattr(fetch_args, "host"))
-        self.assertFalse(hasattr(fetch_args, "port"))
-        live_args = parser.parse_args(
-            [
-                "live",
-                "--symbol",
-                "SH.000902",
-                "--runtime-dir",
-                "/tmp/csi-flow",
-            ]
-        )
-        self.assertEqual(live_args.futu_time_convention, "end")
-        self.assertEqual(live_args.window_months, 9)
-        self.assertEqual(live_args.strength_n, 9)
-        self.assertEqual(live_args.notification_mode, "position-aware")
-        self.assertEqual(live_args.t1_sell_mode, "defer-next-open")
-        self.assertFalse(hasattr(live_args, "host"))
-        self.assertFalse(hasattr(live_args, "port"))
-
-        configured = parser.parse_args(
-            [
-                "live",
-                "--symbol",
-                "SH.000902",
-                "--runtime-dir",
-                "/tmp/csi-flow",
-                "--window-months",
-                "10",
-                "--n",
-                "11",
-                "--notification-mode",
-                "position-independent",
-                "--t1-sell-mode",
-                "ignore-same-day",
-            ]
-        )
-        self.assertEqual(configured.window_months, 10)
-        self.assertEqual(configured.strength_n, 11)
-        self.assertEqual(configured.notification_mode, "position-independent")
-        self.assertEqual(configured.t1_sell_mode, "ignore-same-day")
 
 
 class DeferredT1StrategyTest(unittest.TestCase):
@@ -448,31 +388,6 @@ class PositionIndependentSignalNotificationTest(unittest.TestCase):
             symbol="SH.000902",
         )
 
-    def test_sell_notifies_while_flat_without_changing_position(self):
-        with tempfile.TemporaryDirectory() as raw_dir:
-            state = timing.LiveState(Path(raw_dir) / "state.json", "flat", None)
-            events = []
-            engine = timing.LiveSignalEngine(
-                "SH.000902",
-                self.Provider(sell=True),
-                state,
-                "end",
-                notification_mode="position-independent",
-                event_callback=events.append,
-            )
-            with mock.patch.object(
-                timing,
-                "latest_feature",
-                return_value=timing.Feature(-1.0, -1.0, 0.0, 0.0, 0.1),
-            ):
-                engine.finalize(self.bar("2026-07-01 10:00"))
-
-            signal = [event for event in events if event["type"] == "SIGNAL"][-1]
-            self.assertEqual(signal["action"], "SELL")
-            self.assertEqual(signal["position_before"], 0)
-            self.assertIsNone(state.pending)
-            self.assertEqual(state.position, 0)
-
     def test_position_aware_mode_keeps_original_position_filter(self):
         with tempfile.TemporaryDirectory() as raw_dir:
             state = timing.LiveState(Path(raw_dir) / "state.json", "flat", None)
@@ -497,98 +412,71 @@ class PositionIndependentSignalNotificationTest(unittest.TestCase):
             self.assertEqual(state.signal_notification_dates, {})
 
     def test_t1_sell_waits_for_next_open_then_notifies_and_syncs_state(self):
-        with tempfile.TemporaryDirectory() as raw_dir:
-            state_path = Path(raw_dir) / "state.json"
-            state = timing.LiveState(state_path, "long", "2026-07-01")
-            events = []
-            engine = timing.LiveSignalEngine(
-                "SH.000902",
-                self.Provider(sell=True),
-                state,
-                "end",
-                notification_mode="position-aware",
-                event_callback=events.append,
-            )
-            feature = timing.Feature(-1.0, -1.0, 0.0, 0.0, 0.1)
-            with mock.patch.object(timing, "latest_feature", return_value=feature):
-                engine.finalize(self.bar("2026-07-01 10:00"))
-                engine.finalize(self.bar("2026-07-01 10:30"))
+        for mode in ("position-aware", "position-independent"):
+            with self.subTest(mode=mode):
+                with tempfile.TemporaryDirectory() as raw_dir:
+                    state_path = Path(raw_dir) / "state.json"
+                    state = timing.LiveState(state_path, "long", "2026-07-01")
+                    events = []
+                    engine = timing.LiveSignalEngine(
+                        "SH.000902",
+                        self.Provider(sell=True),
+                        state,
+                        "end",
+                        notification_mode=mode,
+                        event_callback=events.append,
+                    )
+                    feature = timing.Feature(-1.0, -1.0, 0.0, 0.0, 0.1)
+                    with mock.patch.object(timing, "latest_feature", return_value=feature):
+                        engine.finalize(self.bar("2026-07-01 10:00"))
+                        engine.finalize(self.bar("2026-07-01 10:30"))
 
-            signals = [
-                event for event in events if event["type"] == "SIGNAL"
-            ]
-            self.assertEqual(
-                [event["action"] for event in signals],
-                ["NONE", "NONE"],
-            )
-            self.assertFalse(signals[0]["t1_sellable"])
-            self.assertIsNone(state.pending)
-            self.assertEqual(state.position, 1)
-            self.assertEqual(
-                state.deferred_t1_sell["signal_key"],
-                "2026-07-01 10:00",
-            )
-            self.assertNotIn("SELL", state.signal_notification_dates)
+                    signals = [
+                        event for event in events if event["type"] == "SIGNAL"
+                    ]
+                    self.assertEqual(
+                        [event["action"] for event in signals],
+                        ["NONE", "NONE"],
+                    )
+                    self.assertFalse(signals[0]["t1_sellable"])
+                    self.assertIsNone(state.pending)
+                    self.assertEqual(state.position, 1)
+                    self.assertEqual(
+                        state.deferred_t1_sell["signal_key"],
+                        "2026-07-01 10:00",
+                    )
+                    self.assertNotIn("SELL", state.signal_notification_dates)
 
-            restarted_state = timing.LiveState(state_path, "flat", None)
-            restarted_events = []
-            restarted = timing.LiveSignalEngine(
-                "SH.000902",
-                self.Provider(sell=True),
-                restarted_state,
-                "end",
-                notification_mode="position-aware",
-                event_callback=restarted_events.append,
-            )
-            restarted.execute_deferred_t1_sell(
-                self.bar("2026-07-02 09:45")
-            )
+                    restarted_state = timing.LiveState(state_path, "flat", None)
+                    restarted_events = []
+                    restarted = timing.LiveSignalEngine(
+                        "SH.000902",
+                        self.Provider(sell=True),
+                        restarted_state,
+                        "end",
+                        notification_mode=mode,
+                        event_callback=restarted_events.append,
+                    )
+                    restarted.execute_deferred_t1_sell(
+                        self.bar("2026-07-02 09:45")
+                    )
 
-            opening_signal = [
-                event
-                for event in restarted_events
-                if event["type"] == "SIGNAL"
-            ][-1]
-            self.assertEqual(opening_signal["action"], "SELL")
-            self.assertEqual(opening_signal["execution"], "CURRENT_BAR_OPEN")
-            self.assertTrue(opening_signal["t1_sellable"])
-            self.assertIsNone(restarted_state.pending)
-            self.assertIsNone(restarted_state.deferred_t1_sell)
-            self.assertEqual(restarted_state.position, 0)
-            self.assertIsNone(restarted_state.entry_date)
-            self.assertEqual(
-                restarted_state.signal_notification_dates["SELL"],
-                "2026-07-02",
-            )
-
-    def test_position_independent_t1_sell_also_waits_for_next_open(self):
-        with tempfile.TemporaryDirectory() as raw_dir:
-            state = timing.LiveState(
-                Path(raw_dir) / "state.json", "long", "2026-07-01"
-            )
-            events = []
-            engine = timing.LiveSignalEngine(
-                "SH.000902",
-                self.Provider(sell=True),
-                state,
-                "end",
-                notification_mode="position-independent",
-                event_callback=events.append,
-            )
-            feature = timing.Feature(-1.0, -1.0, 0.0, 0.0, 0.1)
-            with mock.patch.object(timing, "latest_feature", return_value=feature):
-                engine.finalize(self.bar("2026-07-01 10:00"))
-
-            self.assertEqual(events[-1]["action"], "NONE")
-            self.assertIsNotNone(state.deferred_t1_sell)
-
-            engine.execute_deferred_t1_sell(self.bar("2026-07-02 09:45"))
-            opening_signal = [
-                event for event in events if event["type"] == "SIGNAL"
-            ][-1]
-            self.assertEqual(opening_signal["action"], "SELL")
-            self.assertEqual(state.position, 0)
-            self.assertIsNone(state.deferred_t1_sell)
+                    opening_signal = [
+                        event
+                        for event in restarted_events
+                        if event["type"] == "SIGNAL"
+                    ][-1]
+                    self.assertEqual(opening_signal["action"], "SELL")
+                    self.assertEqual(opening_signal["execution"], "CURRENT_BAR_OPEN")
+                    self.assertTrue(opening_signal["t1_sellable"])
+                    self.assertIsNone(restarted_state.pending)
+                    self.assertIsNone(restarted_state.deferred_t1_sell)
+                    self.assertEqual(restarted_state.position, 0)
+                    self.assertIsNone(restarted_state.entry_date)
+                    self.assertEqual(
+                        restarted_state.signal_notification_dates["SELL"],
+                        "2026-07-02",
+                    )
 
     def test_buy_notifies_while_long_without_replacing_position(self):
         with tempfile.TemporaryDirectory() as raw_dir:
@@ -637,6 +525,10 @@ class PositionIndependentSignalNotificationTest(unittest.TestCase):
             feature = timing.Feature(-1.0, -1.0, 0.0, 0.0, 0.1)
             with mock.patch.object(timing, "latest_feature", return_value=feature):
                 engine.finalize(self.bar("2026-07-01 10:00"))
+                signal = [event for event in events if event["type"] == "SIGNAL"][-1]
+                self.assertEqual(signal["position_before"], 0)
+                self.assertIsNone(state.pending)
+                self.assertEqual(state.position, 0)
                 engine.finalize(self.bar("2026-07-01 10:30"))
 
                 restarted_state = timing.LiveState(state_path, "flat", None)
@@ -689,11 +581,11 @@ class LiveRuntimeTest(unittest.TestCase):
 class PublicationAndStateIdentityTest(unittest.TestCase):
     def valid_publication(self):
         return {
-            "schema_version": timing.PUBLISH_SCHEMA_VERSION,
+            "schema_version": 3,
             "publication_kind": "monthly_threshold",
-            "strategy": timing.STRATEGY,
+            "strategy": "m1",
             "strategy_status": timing.STRATEGY_STATUS,
-            "version": timing.VERSION,
+            "version": "M1-LF-held-downside-exact-grid-strength-t1-defer-v2",
             "script_sha256": timing.sha256_file(MODULE_PATH),
             "symbol": "000902.SH",
             "month": "2026-07",

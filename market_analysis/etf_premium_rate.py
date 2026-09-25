@@ -540,14 +540,6 @@ class LiveState:
         self.save(symbol)
 
 
-def apply_live_signal(
-    current_position: str,
-    t1_premium: float,
-    params: StrategyParams,
-) -> tuple[str, str]:
-    return decide_position(current_position, t1_premium, params)
-
-
 class LiveNotifier:
     """异步发送通知，避免网络或 SMTP 阻塞行情轮询。"""
 
@@ -818,7 +810,7 @@ def run_live(args: argparse.Namespace) -> int:
                         t1_premium = (
                             snapshot["price"] / float(nav["unit_nav"]) - 1
                         )
-                        new_position, action = apply_live_signal(
+                        new_position, action = decide_position(
                             state.position, t1_premium, params
                         )
                         state.position = new_position
