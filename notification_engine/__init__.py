@@ -16,4 +16,4 @@
 #  Copyright (c)  Joey - All Rights Reserved
 
 from .engine import NotificationEngine
-from .webhook import WebhookNotifier, HookResult
+from .webhook import TargetResult, HookResult, WebhookNotifier

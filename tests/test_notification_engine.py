@@ -1,5 +1,6 @@
 import configparser
 import io
+import json
 import unittest
 from unittest import mock
 from contextlib import redirect_stdout
@@ -227,8 +228,10 @@ class WebhookNotifierTest(unittest.TestCase):
     @staticmethod
     def _notifier() -> WebhookNotifier:
         config = configparser.ConfigParser()
-        config["CONFIG"] = {
-            "WEBHOOK_URL": "https://secret.example/hooks?token=secret",
+        config["CONFIG"] = {"WEBHOOK_TARGETS": "hook"}
+        config["WEBHOOK.hook"] = {
+            "url": "https://secret.example/hooks?token=secret",
+            "signing": "none",
         }
         return WebhookNotifier(config)
 
@@ -275,6 +278,327 @@ class WebhookNotifierTest(unittest.TestCase):
         self.assertIn("status=502 error=upstream rejected", logs.output[0])
         self.assertNotIn("secret.example", logs.output[0])
         self.assertNotIn("response-secret", logs.output[0])
+
+
+class WebhookTargetsTest(unittest.TestCase):
+    """多目标投递、HMAC-SHA256 V2 签名与目标级配置。"""
+
+    HERMES = "https://hermes.example/api/webhook"
+    OPENCLAW = "https://hook.example/hooks/agent"
+
+    @staticmethod
+    def _config() -> configparser.ConfigParser:
+        config = configparser.ConfigParser()
+        config.read_string(
+            """
+            [CONFIG]
+            WEBHOOK_TARGETS = hermes, openclaw
+
+            [WEBHOOK.hermes]
+            url = https://hermes.example/api/webhook
+            signing = hmac-sha256-v2
+            secret = s3cr3t
+            event_id_field = event_id
+            timeout_seconds = 8
+
+            [WEBHOOK.hermes.headers]
+            X-Tenant = team-quant
+
+            [WEBHOOK.hermes.payload]
+            channel    = qqbot
+            event_type = signal_hook
+
+            [WEBHOOK.openclaw]
+            url = https://hook.example/hooks/agent
+            signing = none
+
+            [WEBHOOK.openclaw.headers]
+            x-openclaw-token = hook-token
+
+            [WEBHOOK.openclaw.payload]
+            to = c2c:someone
+            """
+        )
+        return config
+
+    @staticmethod
+    def _response(*, status=200, payload=None):
+        response = mock.Mock(status_code=status, ok=status < 400)
+        response.json.return_value = payload if payload is not None else {}
+        response.text = json.dumps(payload) if payload is not None else ""
+        return response
+
+    @staticmethod
+    def _single_target(**options) -> configparser.ConfigParser:
+        config = configparser.ConfigParser()
+        config["CONFIG"] = {"WEBHOOK_TARGETS": "hermes"}
+        config["WEBHOOK.hermes"] = {
+            "url": WebhookTargetsTest.HERMES,
+            "signing": "hmac-sha256-v2",
+            "secret": "s3cr3t",
+            **options,
+        }
+        return config
+
+    def test_hmac_v2_signs_the_exact_body_bytes(self):
+        notifier = WebhookNotifier(self._single_target(event_id_field="event_id"))
+        response = self._response(payload={"ok": True, "runId": "run-1"})
+
+        with mock.patch.object(
+            webhook_module.requests, "post", return_value=response
+        ) as post, mock.patch.object(
+            webhook_module.time, "time", return_value=1790483599
+        ), redirect_stdout(io.StringIO()) as log_output:
+            result = notifier.send("策略信号：顶背离")
+
+        self.assertTrue(result.ok)
+        headers = post.call_args.kwargs["headers"]
+        body = post.call_args.kwargs["data"]
+        self.assertNotIn("json", post.call_args.kwargs)
+        self.assertEqual(headers["X-Webhook-Timestamp"], "1790483599")
+        self.assertEqual(
+            headers["X-Webhook-Signature-V2"],
+            webhook_module.sign_hmac_sha256_v2("s3cr3t", "1790483599", body),
+        )
+        # X-Request-ID = event_id，与 body 里的 event_id 同值
+        event_id = headers["X-Request-ID"]
+        self.assertEqual(result.request_id, event_id)
+        self.assertEqual(json.loads(body.decode("utf-8"))["event_id"], event_id)
+        # 中文按原始 UTF-8 发送，签名对象就是实发字节
+        self.assertIn("策略信号：顶背离".encode("utf-8"), body)
+        self.assertEqual(json.loads(body.decode("utf-8"))["event_id"], event_id)
+        # 日志行带上 request_id，便于拿接收端的 delivery id 反查
+        self.assertIn(f"request_id={headers['X-Request-ID']}", log_output.getvalue())
+
+    def test_event_id_is_deterministic_for_the_same_content(self):
+        sent = []
+
+        def fake_post(url, **kwargs):
+            sent.append(kwargs["headers"]["X-Request-ID"])
+            return self._response(payload={"ok": True})
+
+        with mock.patch.object(
+            webhook_module.requests, "post", side_effect=fake_post
+        ), redirect_stdout(io.StringIO()):
+            notifier = WebhookNotifier(self._single_target())
+            notifier.send("同一条信号")
+            notifier.send("同一条信号")
+            notifier.send("另一条信号")
+
+        # 同日同内容重复投递得到同一个 event_id（接收端可去重），不同内容则不同
+        self.assertEqual(sent[0], sent[1])
+        self.assertEqual(len(sent[0]), 32)
+        self.assertNotEqual(sent[0], sent[2])
+
+    def test_event_id_does_not_depend_on_the_date(self):
+        sent = []
+
+        def fake_post(url, **kwargs):
+            sent.append(kwargs["headers"]["X-Request-ID"])
+            return self._response(payload={"ok": True})
+
+        with mock.patch.object(
+            webhook_module.requests, "post", side_effect=fake_post
+        ), mock.patch.object(
+            webhook_module.time, "time", side_effect=[1790517224.0, 1790780000.0]
+        ), redirect_stdout(io.StringIO()):
+            notifier = WebhookNotifier(self._single_target())
+            notifier.send("同一条信号")
+            notifier.send("同一条信号")
+
+        # 相隔数天、内容相同 → 仍是同一个 event_id
+        self.assertEqual(sent[0], sent[1])
+
+    def test_event_id_follows_event_type(self):
+        sent = []
+
+        def fake_post(url, **kwargs):
+            sent.append(kwargs["headers"]["X-Request-ID"])
+            return self._response(payload={"ok": True})
+
+        notifier = WebhookNotifier(self._single_target(payload_json='{"event_type": "signal_cn"}'))
+        other = WebhookNotifier(self._single_target(payload_json='{"event_type": "signal_us"}'))
+        with mock.patch.object(
+            webhook_module.requests, "post", side_effect=fake_post
+        ), redirect_stdout(io.StringIO()):
+            notifier.send("同一条信号")
+            other.send("同一条信号")
+
+        self.assertNotEqual(sent[0], sent[1])
+
+    def test_targets_deliver_independently(self):
+        notifier = WebhookNotifier(self._config())
+        responses = {
+            self.HERMES: self._response(payload={"status": "accepted"}),
+            self.OPENCLAW: self._response(status=502, payload={"error": "upstream rejected"}),
+        }
+
+        with mock.patch.object(
+            webhook_module.requests, "post",
+            side_effect=lambda url, **kwargs: responses[url],
+        ) as post, self.assertLogs(
+            "notification_engine.delivery_log", level="ERROR"
+        ) as logs, redirect_stdout(io.StringIO()):
+            result = notifier.send("信号")
+
+        self.assertEqual(post.call_count, 2)
+        self.assertFalse(result.ok)
+        self.assertTrue(result.targets["hermes"].ok)
+        # event_type 参与 event_id 计算：带 event_type 的目标与不带的算出的 id 不同
+        self.assertEqual(len(result.targets["hermes"].request_id), 32)
+        self.assertNotEqual(
+            result.targets["hermes"].request_id, result.targets["openclaw"].request_id
+        )
+        self.assertEqual(result.targets["openclaw"].error, "upstream rejected")
+        self.assertEqual(result.error, "upstream rejected")
+
+        calls = {call.args[0]: call.kwargs for call in post.call_args_list}
+        self.assertEqual(calls[self.HERMES]["headers"]["x-tenant"], "team-quant")
+        self.assertEqual(calls[self.HERMES]["timeout"], 8.0)
+        self.assertEqual(calls[self.OPENCLAW]["timeout"], 30.0)
+        self.assertEqual(
+            json.loads(calls[self.HERMES]["data"].decode("utf-8"))["channel"], "qqbot"
+        )
+        self.assertEqual(
+            json.loads(calls[self.OPENCLAW]["data"].decode("utf-8"))["to"], "c2c:someone"
+        )
+        # 失败日志只带目标名与状态，不带地址或密钥
+        self.assertIn("target=openclaw", logs.output[0])
+        self.assertNotIn("s3cr3t", logs.output[0])
+        self.assertNotIn("hook.example", logs.output[0])
+
+    def test_missing_signing_is_rejected_instead_of_sent_unsigned(self):
+        config = self._single_target(signing="")
+
+        with mock.patch.object(
+            webhook_module.requests, "post"
+        ) as post, self.assertLogs(
+            "notification_engine.delivery_log", level="ERROR"
+        ) as logs:
+            notifier = WebhookNotifier(config)
+            result = notifier.send("信号")
+
+        self.assertEqual(notifier.target_names, [])
+        self.assertFalse(result.ok)
+        post.assert_not_called()
+        self.assertIn("missing signing", logs.output[0])
+
+    def test_unsupported_signing_is_rejected_instead_of_sent_unsigned(self):
+        config = self._single_target(signing="hmac-sha256", secret="s3cr3t")
+
+        with mock.patch.object(
+            webhook_module.requests, "post"
+        ) as post, self.assertLogs(
+            "notification_engine.delivery_log", level="ERROR"
+        ) as logs:
+            notifier = WebhookNotifier(config)
+            result = notifier.send("信号")
+
+        self.assertEqual(notifier.target_names, [])
+        self.assertFalse(result.ok)
+        post.assert_not_called()
+        self.assertIn("unsupported signing", logs.output[0])
+
+    def test_signed_target_without_secret_is_not_delivered(self):
+        config = self._single_target(secret="")
+
+        with mock.patch.object(
+            webhook_module.requests, "post"
+        ) as post, self.assertLogs(
+            "notification_engine.delivery_log", level="ERROR"
+        ) as logs:
+            notifier = WebhookNotifier(config)
+            result = notifier.send("信号")
+
+        self.assertEqual(notifier.target_names, [])
+        self.assertFalse(result.ok)
+        post.assert_not_called()
+        self.assertIn("missing secret", logs.output[0])
+
+    def test_payload_json_keeps_exact_case_and_type(self):
+        config = self._single_target(
+            payload_json=json.dumps(
+                {"wakeMode": "now", "deliver": True, "timeoutSeconds": 30}
+            )
+        )
+        config["WEBHOOK.hermes.payload"] = {"channel": "qqbot", "wakemode": "later"}
+        response = self._response(payload={"status": "accepted"})
+
+        with mock.patch.object(
+            webhook_module.requests, "post", return_value=response
+        ) as post, redirect_stdout(io.StringIO()):
+            result = WebhookNotifier(config).send("信号")
+
+        self.assertTrue(result.ok)
+        payload = json.loads(post.call_args.kwargs["data"].decode("utf-8"))
+        self.assertEqual(payload["wakeMode"], "now")
+        self.assertIs(payload["deliver"], True)
+        self.assertEqual(payload["timeoutSeconds"], 30)
+        self.assertEqual(payload["channel"], "qqbot")
+        self.assertNotIn("wakemode", payload)
+        self.assertEqual(payload["message"], "信号")
+
+    def test_transport_error_is_reported_per_target(self):
+        def fake_post(url, **kwargs):
+            if url == self.HERMES:
+                return self._response(payload={"ok": True})
+            raise webhook_module.requests.ConnectionError("connection refused")
+
+        with mock.patch.object(
+            webhook_module.requests, "post", side_effect=fake_post
+        ), self.assertLogs(
+            "notification_engine.delivery_log", level="ERROR"
+        ) as logs, redirect_stdout(io.StringIO()):
+            result = WebhookNotifier(self._config()).send("信号")
+
+        self.assertFalse(result.ok)
+        self.assertTrue(result.targets["hermes"].ok)
+        self.assertEqual(result.targets["openclaw"].error, "ConnectionError")
+        self.assertIn("target=openclaw", logs.output[0])
+        self.assertIn("exception=ConnectionError", logs.output[0])
+        self.assertNotIn("hook.example", logs.output[0])
+        self.assertNotIn("connection refused", logs.output[0])
+
+    def test_missing_webhook_targets_is_reported(self):
+        config = configparser.ConfigParser()
+        config["CONFIG"] = {"PROXY": ""}
+
+        with self.assertLogs(
+            "notification_engine.delivery_log", level="ERROR"
+        ) as logs:
+            notifier = WebhookNotifier(config)
+            result = notifier.send("信号")
+
+        self.assertEqual(notifier.target_names, [])
+        self.assertFalse(result.ok)
+        self.assertIn("missing WEBHOOK_TARGETS", logs.output[0])
+
+    def test_missing_url_is_rejected(self):
+        config = self._single_target(url="")
+
+        with mock.patch.object(
+            webhook_module.requests, "post"
+        ) as post, self.assertLogs(
+            "notification_engine.delivery_log", level="ERROR"
+        ) as logs:
+            notifier = WebhookNotifier(config)
+            result = notifier.send("信号")
+
+        self.assertEqual(notifier.target_names, [])
+        self.assertFalse(result.ok)
+        post.assert_not_called()
+        self.assertIn("missing url", logs.output[0])
+
+    def test_run_id_is_reported_from_response_json(self):
+        response = self._response(payload={"ok": True, "runId": "run-1"})
+
+        with mock.patch.object(
+            webhook_module.requests, "post", return_value=response
+        ), redirect_stdout(io.StringIO()):
+            result = WebhookNotifier(self._single_target()).send("信号")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.run_id, "run-1")
 
 
 if __name__ == "__main__":
