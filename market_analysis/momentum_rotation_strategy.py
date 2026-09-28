@@ -1184,27 +1184,56 @@ class LiveNotifier:
             eprint(f"通知队列已满，丢弃事件: {key}")
 
     @staticmethod
+    def emitted_stamp(event: dict[str, Any]) -> tuple[Optional[datetime], str]:
+        """emitted_at 按市场时区解析，返回 (时间, 时区标签)；解析失败为 (None, "")"""
+        raw = event.get("emitted_at")
+        zone = str(event.get("timezone") or "")
+        if not raw:
+            return None, ""
+        try:
+            stamp = datetime.fromisoformat(str(raw))
+        except (ValueError, TypeError):
+            return None, ""
+        if zone:
+            try:
+                stamp = stamp.astimezone(ZoneInfo(zone))
+            except KeyError:
+                return stamp, ""  # 时区名无法识别：仍按原偏移展示时间，但不标时区
+        return stamp, zone
+
+    @staticmethod
+    def timing_text(event: dict[str, Any]) -> str:
+        """时间信息：emitted_at 按市场时区渲染的单一时间戳"""
+        stamp, zone = LiveNotifier.emitted_stamp(event)
+        suffix = f" ({zone})" if zone else ""
+        if stamp is None:
+            return f"{event['evaluation_date']}{suffix}"
+        return f"{stamp:%Y-%m-%d %H:%M}{suffix}"
+
+    @staticmethod
     def format_event(event: dict[str, Any]) -> tuple[str, str]:
         action = event.get("action") or event["type"]
-        subject = f"动量轮动 {action}"
+        # NONE（无需轮动）是常态，主题与正文头部都不展示它
+        subject = "动量轮动" if action == "NONE" else f"动量轮动 {action}"
         if event["type"] != "SIGNAL":
             return subject, f"动量轮动 {event['type']}\n{event.get('message', '')}"
 
         target = event.get("target_symbol") or "CASH"
+        headline = subject
+        rows = event["ranking"]
+        # 同腿各符号共用同一窗口，合并到表头；万一出现多窗口则退回逐行标注
+        windows = {row["window"] for row in rows}
+        shared_window = windows.pop() if len(windows) == 1 else None
+        header = f"动量排名 (window={shared_window}):" if shared_window else "动量排名:"
         lines = [
-            f"动量轮动 {event['action']}",
+            f"{headline} {LiveNotifier.timing_text(event)}",
             f"市场: {event['market']} 腿: {event['leg']}",
-            f"交易日: {event['evaluation_date']}",
-            f"提示时间: {event['notification_time']} {event['timezone']}",
             f"目标: {target}",
-            f"排名首位: {event.get('selected_symbol') or '无'}",
-            "动量排名:",
+            header,
         ]
-        for row in event["ranking"]:
-            lines.append(
-                f"- {row['symbol']} window={row['window']}: "
-                f"{row['score']:.2%}"
-            )
+        for row in rows:
+            scope = "" if shared_window else f" window={row['window']}"
+            lines.append(f"- {row['symbol']}{scope}: {row['score']:.2%}")
         return subject, "\n".join(lines)
 
     def _deliver(self, event: dict[str, Any]) -> None:
