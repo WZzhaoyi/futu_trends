@@ -1,5 +1,6 @@
 import importlib.util
 import io
+import json
 import sys
 import tempfile
 import types
@@ -525,6 +526,72 @@ class LiveEndToEndTest(unittest.TestCase):
         )
         self.assertTrue(context.closed)
         self.assertTrue(notifier.closed)
+
+    def test_none_action_records_without_notification(self):
+        """同一状态下的第二次评估为 NONE：照常写状态与 stdout，但不发通知。"""
+        fake_futu = types.ModuleType("futu")
+        fake_futu.AuType = types.SimpleNamespace(QFQ="QFQ")
+        fake_futu.OpenQuoteContext = FakeQuoteContext
+        fake_futu.RET_OK = 0
+        fake_futu.SubType = types.SimpleNamespace(K_DAY="K_DAY")
+        notifier = RecordingNotifier()
+        FakeQuoteContext.instances.clear()
+
+        with tempfile.TemporaryDirectory() as raw_dir:
+            config_path = Path(raw_dir) / "config.ini"
+            config_path.write_text(
+                "[CONFIG]\nDATA_SOURCE=futu\nFUTU_HOST=127.0.0.1\nFUTU_PORT=11111\n",
+                encoding="utf-8",
+            )
+            args = momentum.parse_args(
+                [
+                    "live",
+                    "--runtime-dir",
+                    raw_dir,
+                    "--config",
+                    str(config_path),
+                ]
+            )
+            with (
+                patch.dict(sys.modules, {"futu": fake_futu}),
+                patch.object(
+                    momentum,
+                    "build_live_notifier",
+                    return_value=notifier,
+                ),
+            ):
+                with redirect_stdout(io.StringIO()):
+                    self.assertEqual(momentum.run_live(args), 0)
+                # 首轮 INITIAL 建仓仍属调仓，照常通知
+                self.assertEqual(
+                    [event["action"] for event in notifier.events],
+                    ["INITIAL"] * 4,
+                )
+
+                notifier.events.clear()
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    self.assertEqual(momentum.run_live(args), 0)
+
+            events = [
+                json.loads(line)
+                for line in output.getvalue().splitlines()
+                if line.startswith("{")
+            ]
+            states = {
+                market: momentum.LiveState(
+                    Path(raw_dir) / f"state-live-{market.lower()}.json",
+                    market_legs(market),
+                )
+                for market in ("US", "CN")
+            }
+
+        self.assertEqual(notifier.events, [])
+        self.assertEqual(len(events), 4)
+        self.assertEqual({event["action"] for event in events}, {"NONE"})
+        for market, state in states.items():
+            self.assertEqual(state.last_snapshot["action"], "NONE")
+            self.assertEqual(state.last_snapshot["market"], market)
 
     def test_on_holiday_records_idle_without_signal(self):
         fake_futu = types.ModuleType("futu")

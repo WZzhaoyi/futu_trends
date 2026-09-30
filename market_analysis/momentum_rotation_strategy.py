@@ -1407,6 +1407,7 @@ def run_live(args: argparse.Namespace) -> int:
 
     PM2 ecosystem 的 cron 只负责唤醒；首次启动与定时启动走同一路径。
     交易日内只使用最近完整收盘的日K，非交易日发 IDLE 不通知。
+    只有实际调仓（action != NONE）才发通知；NONE/IDLE 只写状态与 stdout。
     --markets 限定本次评估的市场（cron 分市场触发的必要条件，默认全部）。
     """
     try:
@@ -1594,7 +1595,9 @@ def run_live(args: argparse.Namespace) -> int:
                             json.dumps(event, ensure_ascii=False),
                             flush=True,
                         )
-                        if notifier is not None:
+                        # 仅在实际调仓（ROTATE/BUY/SELL/INITIAL）时通知；
+                        # NONE（含被防抖拦截）只留状态与 stdout，不打扰
+                        if notifier is not None and action != "NONE":
                             notifier.notify(event)
             except Exception as exc:
                 close_futu_context(context)
