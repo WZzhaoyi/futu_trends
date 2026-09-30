@@ -34,6 +34,17 @@ class PrScreenerTest(unittest.TestCase):
         self.assertIsNone(growth_filter.filter_min)
         self.assertIsNone(growth_filter.filter_max)
 
+    def test_pe_ceiling_is_11(self):
+        """PE≤11 与 PR≤0.5 方向相反：只在 ROE% > 22 时生效，砍掉高 ROE 的估值豁免。"""
+        filters = pr_screener.build_filters("HK", ft)
+        pe_filter = next(
+            item for item in filters
+            if item.stock_field == ft.StockField.PE_TTM
+        )
+
+        self.assertEqual(pe_filter.filter_max, 11.0)
+        self.assertEqual(pr_screener.PE_MAX, 11.0)
+
     def test_candidate_calculates_cash_coverage_and_growth_adjusted_pr(self):
         candidate = pr_screener.candidate_from_filter_row(FilterRow(), "HK")
 

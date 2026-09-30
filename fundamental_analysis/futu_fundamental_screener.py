@@ -37,6 +37,16 @@ FILTER_MARKETS = {
 # OTC(粉单)无行情权限，get_market_snapshot 会整批报错，需在 L1 后剔除
 US_ALLOWED_EXCHANGES = {"US_NYSE", "US_NASDAQ", "US_AMEX"}
 PAGE_SIZE = 200
+
+# ---- 「要求为正」的下限 ----
+# Futu 的 filter_min 是闭区间，且实测对 1e-9 及以下的下限会量化成 0：
+# US 市场单独用 OCF_TTM >= 0 / >= 1e-12 / >= 1e-9 三条筛选，命中数完全相同
+# （5054），而 >= 0.001 / >= 0.01 / >= 1 也都是 4864。
+# 所以「用极小正数表达严格 >0」是无效的写法，POSITIVE_MIN 取 0.01 才真正生效。
+# 它在比率/倍数（PE、PB、权益乘数）上是「近似 0」，在货币金额上是「1 分钱」，
+# 两者语义都仍是桶底；但**百分比口径上它是 0.01%，不是「近似 0」**——
+# 百分比字段里带业务含义的零阈值（如「增速 ≥0 即不收缩」）不要套用它。
+POSITIVE_MIN = 0.01
 SNAPSHOT_BATCH = 400
 # futu 接口一般限制 1 分钟 30 次调用，节流间隔保持 >= 2s
 FILTER_THROTTLE_SEC = 3.5
@@ -75,7 +85,7 @@ SNAPSHOT_FIELDS = (
 )
 
 FILTER_FIELDS = (
-    "market_val", "pe_ttm", "pb_rate", "return_on_equity_rate", "roa_ttm",
+    "market_val", "pcf_ttm", "pe_ttm", "pb_rate", "return_on_equity_rate", "roa_ttm",
     "net_profit", "sum_of_business_growth", "net_profix_growth",
     "operating_cash_flow_ttm", "debt_asset_rate", "cash_and_cash_equivalents",
     "cur_price_to_lowest52_weeks_ratio", "cur_price_to_highest52_weeks_ratio",
@@ -317,6 +327,11 @@ class FutuFieldSet:
     long_term_debt_components: tuple[int, ...]
     total_debt_components: tuple[int, ...]
     operating_cash_flow: tuple[int, ...]
+    # ---- 现金流表：固定资产相关（用于 FCF = 经营现金流 − 净资本开支）----
+    # 符号口径按市场不同，务必配合 FUTU_FIXED_ASSET_SIGN 使用，详见其注释。
+    fixed_asset_acquired: tuple[int, ...] = ()
+    fixed_asset_disposed: tuple[int, ...] = ()
+    fixed_asset_net: tuple[int, ...] = ()
 
 
 # Futu 的财报字段不是 SDK 枚举：OpenD 返回 field_id + display_name。L2 只使用稳定的
@@ -337,6 +352,9 @@ FUTU_FIELD_SETS = {
         long_term_debt_components=(3084, 3085, 3087),
         total_debt_components=(3067, 3075, 3084, 3085, 3087),
         operating_cash_flow=(3001,),
+        # A 股：3043「购建固定资产…支付的现金」(正号=流出)、3037「处置…收回的现金净额」(正号=流入)
+        fixed_asset_acquired=(3043,),
+        fixed_asset_disposed=(3037,),
     ),
     5: FutuFieldSet(
         net_income=(5045, 5051, 5052),
@@ -352,6 +370,9 @@ FUTU_FIELD_SETS = {
         long_term_debt_components=(5091, 5093, 5104),
         total_debt_components=(5070, 5072, 5091, 5093, 5104),
         operating_cash_flow=(5001,),
+        # 港股：5071「购买固定资产」(本身为负号)、5070「出售固定资产」(正号)
+        fixed_asset_acquired=(5071,),
+        fixed_asset_disposed=(5070,),
     ),
     8: FutuFieldSet(
         net_income=(8037, 8043, 8046),
@@ -367,6 +388,9 @@ FUTU_FIELD_SETS = {
         long_term_debt_components=(8068,),
         total_debt_components=(8057, 8068),
         operating_cash_flow=(8015, 8016),
+        # 美股：Futu 只给 8046「固定资产交易净额」，已含处置且已带符号（可为正）。
+        # 注意同一 id 在利润表里是别的科目，必须只从 cashflow 报表读取。
+        fixed_asset_net=(8046,),
     ),
 }
 
@@ -500,6 +524,59 @@ class FutuFinancials:
             if reports[0].date_time_str < current.date_time_str:
                 return reports
         return None
+
+    def ttm(self, statement_name: str, field_ids: tuple[int, ...]) -> float | None:
+        """把累计口径报表拼成 TTM：最近一期 + 上一完整年度 − 去年同期同口径。
+
+        年报本身即 TTM，直接取用。任一组成项缺失即返回 None —— 宁可判「不可计算」，
+        也不要用半截口径算出一个偏小或偏大的分母。
+        """
+        reports = sorted(
+            self.statements.get(statement_name, ()),
+            key=lambda report: report.date_time_str, reverse=True,
+        )
+        if not reports or not field_ids:
+            return None
+        latest = reports[0]
+        alignment = FINANCIAL_ALIGNMENT_TYPES.get(
+            latest.financial_type, latest.financial_type,
+        )
+        if alignment == FINANCIAL_ANNUAL_TYPE:
+            return latest.value(field_ids)
+        annual = [
+            report for report in reports
+            if FINANCIAL_ALIGNMENT_TYPES.get(
+                report.financial_type, report.financial_type,
+            ) == FINANCIAL_ANNUAL_TYPE and report.date_time_str < latest.date_time_str
+        ]
+        prior_same = [
+            report for report in reports
+            if FINANCIAL_ALIGNMENT_TYPES.get(
+                report.financial_type, report.financial_type,
+            ) == alignment and report.date_time_str < latest.date_time_str
+        ]
+        if not annual or not prior_same:
+            return None
+        current_value = latest.value(field_ids)
+        annual_value = annual[0].value(field_ids)
+        prior_value = prior_same[0].value(field_ids)
+        if current_value is None or annual_value is None or prior_value is None:
+            return None
+        return current_value + annual_value - prior_value
+
+    def net_fixed_asset_cash_flow_ttm(self, fields: FutuFieldSet) -> float | None:
+        """固定资产交易的净现金流（TTM，负号=净流出），即 FCF 里的「−资本开支」。
+
+        符号口径三地不同：A 的 3043 是「正号流出」、港股的 5071 是「负号流出」，
+        取绝对值后两者归一；美股的 8046 本身已是净额且已带符号，直接用。
+        """
+        if fields.fixed_asset_net:
+            return self.ttm("cashflow", fields.fixed_asset_net)
+        acquired = self.ttm("cashflow", fields.fixed_asset_acquired)
+        disposed = self.ttm("cashflow", fields.fixed_asset_disposed)
+        if acquired is None:
+            return None
+        return (disposed or 0.0) - abs(acquired)
 
     def fields_for(self, *reports: FutuFinancialReport) -> FutuFieldSet:
         families = {report.family for report in reports}
@@ -805,6 +882,7 @@ def screen(strategy, market: str, config, snapshot: bool = True,
         candidates = enrich_snapshot(candidates, strategy, config)
     l2_refined = 0
     l2_filtered = False
+    l2_reject_reasons: dict[str, int] = {}
     if refine and supports_futu_refine(strategy):
         if candidates:
             run_futu_refine(candidates, strategy, config)
@@ -812,7 +890,20 @@ def screen(strategy, market: str, config, snapshot: bool = True,
         # 显式启用 L2 且定义 l2_passes 的策略直接按其门槛过滤。
         passes = getattr(strategy, "l2_passes", None)
         if callable(passes):
-            candidates = [c for c in candidates if passes(c)]
+            # 计数器只统计、不改变判据：通过与否一律以 l2_passes 为准，
+            # l2_reject_reason 仅用于归因，两者不一致时以 l2_passes 为准。
+            # 若策略没提供归因函数，落到 unclassified，保证计数能与
+            # l2_refined − returned 对账。
+            reason_of = getattr(strategy, "l2_reject_reason", None)
+            kept = []
+            for candidate in candidates:
+                if passes(candidate):
+                    kept.append(candidate)
+                    continue
+                reason = reason_of(candidate) if callable(reason_of) else None
+                reason = reason or "unclassified"
+                l2_reject_reasons[reason] = l2_reject_reasons.get(reason, 0) + 1
+            candidates = kept
             l2_filtered = True
     return sanitize({
         "market": market,
@@ -821,6 +912,7 @@ def screen(strategy, market: str, config, snapshot: bool = True,
         "snapshot_enriched": bool(snapshot),
         "l2_refined": l2_refined,
         "l2_filtered": l2_filtered,
+        "l2_reject_reasons": l2_reject_reasons,
         "returned": len(candidates),
         "candidates": candidates,
     })

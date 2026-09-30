@@ -7,6 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from futu_fundamental_screener import (  # noqa: E402
+    POSITIVE_MIN,
     FutuFinancials,
     accumulate_filter,
     financial_filter,
@@ -24,10 +25,11 @@ FUTU_L2_STATEMENT_TYPES = ("income", "balance")
 MARKET_CAP_MIN = 1e9
 TURNOVER_AVG_DAYS = 20
 TURNOVER_MIN = {"US": 50e6, "HK": 5e6, "A": 50e6}
-PE_MIN = 0.01
+PE_MIN = POSITIVE_MIN
 PE_MAX = 13.0
 PB_MAX = 1.0
-CASH_MIN = 0.0
+# 货币资金 / 净利润的「为正」下限；原为 0.0，会放过恰好等于 0 的标的。
+CASH_MIN = POSITIVE_MIN
 DEBT_ASSET_MAX = 50.0
 # Futu V1 CURRENT_RATIO uses percentage points: 150 means 1.5x.
 CURRENT_RATIO_MIN_PCT = 150.0
@@ -42,8 +44,8 @@ def build_filters(market: str, ft):
             sf.TURNOVER, TURNOVER_MIN[market], days=TURNOVER_AVG_DAYS,
         ),
         simple_filter(sf.PE_TTM, PE_MIN, PE_MAX),
-        simple_filter(sf.PB_RATE, 0.01, PB_MAX, sort=ft.SortDir.ASCEND),
-        financial_filter(sf.NET_PROFIT, 0, quarter=q),
+        simple_filter(sf.PB_RATE, POSITIVE_MIN, PB_MAX, sort=ft.SortDir.ASCEND),
+        financial_filter(sf.NET_PROFIT, POSITIVE_MIN, quarter=q),
         financial_filter(sf.CASH_AND_CASH_EQUIVALENTS, CASH_MIN, quarter=q),
         financial_filter(sf.DEBT_ASSET_RATE, max_=DEBT_ASSET_MAX, quarter=q),
         financial_filter(sf.CURRENT_RATIO, CURRENT_RATIO_MIN_PCT, quarter=q),
@@ -164,14 +166,21 @@ def refine_futu(candidate, financials: FutuFinancials):
     }
 
 
+def l2_reject_reason(candidate) -> str | None:
+    """L2 被拒的第一条原因；None 表示通过。仅用于计数与归因，判据以 l2_passes 为准。"""
+    l2 = candidate.get("l2") or {}
+    if not l2.get("ok"):
+        return "l2_unavailable"
+    if not l2.get("condition_currency_ok"):
+        return "currency_mismatch"
+    if not l2.get("condition_market_cap_lt_ncav"):
+        return "market_cap_not_below_ncav"
+    return None
+
+
 def l2_passes(candidate) -> bool:
     """--refine L2 门槛：剔除币种不一致者，仅保留市值 < NCAV。"""
-    l2 = candidate.get("l2") or {}
-    return bool(
-        l2.get("ok")
-        and l2.get("condition_currency_ok")
-        and l2.get("condition_market_cap_lt_ncav")
-    )
+    return l2_reject_reason(candidate) is None
 
 
 if __name__ == "__main__":

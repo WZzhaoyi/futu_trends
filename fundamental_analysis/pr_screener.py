@@ -7,7 +7,7 @@ PR ≤ 0.5 视为「半价买入优质公司」。
 L1 筛选 get_stock_filter 服务端首筛 + 返回字段的 Python 精确计算：
 
 服务端筛选（年报口径财务字段）：
-  - 市值 ≥ 100 亿（本位币）、20 日均成交额达到市场门槛、PB > 0、PE_TTM ∈ (0, 30]
+  - 市值 ≥ 100 亿（本位币）、20 日均成交额达到市场门槛、PB > 0、PE_TTM ∈ (0, 11]
   - ROE ≥ 8%、ROA_TTM ≥ 1%、权益乘数 ∈ [1, 4]（净资产 ≥ 总资产 25%）
   - 净利润 > 0、经营现金流 TTM > 0、资产负债率 ≤ 65%
 
@@ -33,6 +33,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from futu_fundamental_screener import (  # noqa: E402
+    POSITIVE_MIN,
     _candidate_from_filter_row,
     accumulate_filter,
     financial_filter,
@@ -52,15 +53,17 @@ DESCRIPTION = "市赚率 (PR=PE/ROE/100, PR<=0.5) value screener — L1"
 MARKET_CAP_MIN = 1e10
 TURNOVER_AVG_DAYS = 20
 TURNOVER_MIN = {"US": 50e6, "HK": 5e6, "A": 50e6}
-PE_MIN = 0.01
-# PR<=0.5 ⇔ PE <= ROE%*0.5；ROE>=8% 时 PE 上限本就很低。
-# 30 仅用于控制候选规模（ROE=60% 的极端高 ROE 才可能 PE=30 仍合格，会被权益乘数二次过滤）。
-PE_MAX = 30.0
+PE_MIN = POSITIVE_MIN
+# PE 绝对上限 11。注意它与 PR<=0.5 的作用方向相反：
+# PR<=0.5 ⇔ PE <= ROE%*0.5，ROE=8% 时只允许 PE<=4，但 ROE=78% 时允许 PE<=39。
+# 故 PE_MAX=11 只在 ROE% > 22 时真正生效，效果是**取消高 ROE 的估值豁免**——
+# 例如 ROE 78%、PR 仅 0.169 的标的（PR 判定极便宜）会被这条砍掉。
+# 这是刻意的：PR 度量的是「相对盈利能力的便宜度」，PE<=11 加上的是「绝对盈利倍数」上限。
+PE_MAX = 11.0
 ROE_MIN = 8.0
 ROA_MIN = 1.0
 DEBT_ASSET_MAX = 65.0
-# Futu 的区间下限是闭区间；用极小正数表达严格 >0。
-FINANCIAL_POSITIVE_MIN = 1e-12
+# 净利润 / 经营现金流的「为正」下限见 POSITIVE_MIN（runner 上有量化说明，勿改回 1e-12）。
 
 # ---- PR 与假高 ROE 剔除 ----
 PR_MAX = 0.5
@@ -78,14 +81,14 @@ def build_filters(market: str, ft):
         accumulate_filter(
             sf.TURNOVER, TURNOVER_MIN[market], days=TURNOVER_AVG_DAYS,
         ),
-        simple_filter(sf.PB_RATE, 0.01),  # PB<=0（净资产为负/失真）直接剔除
+        simple_filter(sf.PB_RATE, POSITIVE_MIN),  # PB<=0（净资产为负/失真）直接剔除
         simple_filter(sf.PE_TTM, PE_MIN, PE_MAX, sort=ft.SortDir.ASCEND),
         financial_filter(sf.RETURN_ON_EQUITY_RATE, ROE_MIN, quarter=q),
         financial_filter(sf.ROA_TTM, ROA_MIN, quarter=q),
         financial_filter(sf.EQUITY_MULTIPLIER,
                          EQUITY_MULTIPLIER_MIN, EQUITY_MULTIPLIER_MAX, quarter=q),
-        financial_filter(sf.NET_PROFIT, FINANCIAL_POSITIVE_MIN, quarter=q),
-        financial_filter(sf.OPERATING_CASH_FLOW_TTM, FINANCIAL_POSITIVE_MIN, quarter=q),
+        financial_filter(sf.NET_PROFIT, POSITIVE_MIN, quarter=q),
+        financial_filter(sf.OPERATING_CASH_FLOW_TTM, POSITIVE_MIN, quarter=q),
         financial_filter(sf.DEBT_ASSET_RATE, max_=DEBT_ASSET_MAX, quarter=q),
         # 仅请求返回字段，不参与服务端筛选。
         financial_filter(sf.NET_PROFIX_GROWTH, quarter=q, is_no_filter=True),

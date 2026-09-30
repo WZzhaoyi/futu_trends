@@ -77,11 +77,14 @@ BALANCE = statement_data([
         5091: 160, 5003: 200, 5060: 220,
     }),
 ])
+# 5071「购买固定资产」按港股口径本身为负号（流出）。
+# TTM 经营现金流 = 100 + 150 − 50 = 200；TTM 资本开支 = (−30) + (−40) − (−10) = −60。
+# 故 FCF_TTM = 200 − 60 = 140，r = FCF/OCF = 0.7。
 CASHFLOW = statement_data([
-    ("2026-06-30", 5, "2026/H1", {5001: 100}),
+    ("2026-06-30", 5, "2026/H1", {5001: 100, 5071: -30}),
     ("2026-03-31", 1, "2026/Q1", {5001: 50}),
-    ("2025-12-31", 7, "2025/FY", {5001: 150}),
-    ("2025-06-30", 5, "2025/H1", {5001: 50}),
+    ("2025-12-31", 7, "2025/FY", {5001: 150, 5071: -40}),
+    ("2025-06-30", 5, "2025/H1", {5001: 50, 5071: -10}),
     ("2025-03-31", 1, "2025/Q1", {5001: 25}),
     ("2024-12-31", 7, "2024/FY", {5001: 90}),
 ])
@@ -296,7 +299,10 @@ class FutuFundamentalRefineTest(unittest.TestCase):
         for strategy, statement_types in expected_statements.items():
             with self.subTest(strategy=strategy.NAME):
                 ctx = FakeContext()
-                candidate = {"code": "HK.TEST", "total_market_val": 100}
+                # pcf_ttm=700 即 P/OCF=7.0；r=0.7 时 P/FCF = 7.0 / 0.7 = 10.0 ≤ 11
+                candidate = {
+                    "code": "HK.TEST", "total_market_val": 100, "pcf_ttm": 700.0,
+                }
                 with mock.patch.object(fs.ft, "OpenQuoteContext", return_value=ctx), \
                         mock.patch.object(fs.time, "sleep"):
                     fs.run_futu_refine([candidate], strategy, config)
@@ -312,6 +318,218 @@ class FutuFundamentalRefineTest(unittest.TestCase):
                 else:
                     self.assertNotIn("l2", candidate)
                     self.assertIsNone(passes)
+
+    def test_growth_value_l2_enforces_p_over_fcf_ceiling(self):
+        """P/FCF ≤ 11 是硬门槛，且边界要卡在 11 上（含等于）。
+
+        夹具下 TTM 经营现金流 = 200、FCF_TTM = 140，r = 0.7，
+        故 P/FCF = (pcf_ttm ÷ 100) ÷ 0.7，阈值对应 pcf_ttm = 770。
+        """
+        financials = bundle()
+        for pcf_ttm, expected in ((600.0, True), (770.0, True), (771.0, False)):
+            with self.subTest(pcf_ttm=pcf_ttm):
+                candidate = {
+                    "code": "HK.TEST", "total_market_val": 100, "pcf_ttm": pcf_ttm,
+                }
+                candidate["l2"] = growth_value_screener.refine_futu(
+                    candidate, financials,
+                )
+                self.assertTrue(candidate["l2"]["fcf_ok"])
+                self.assertEqual(
+                    candidate["l2"]["fcf_ttm"], 140.0,
+                )
+                self.assertAlmostEqual(
+                    candidate["l2"]["p_over_fcf"], (pcf_ttm / 100) / 0.7, places=4,
+                )
+                self.assertEqual(
+                    growth_value_screener.l2_passes(candidate), expected,
+                )
+
+    def test_pcf_ceiling_tracks_pfcf_max_not_prefilter(self):
+        """判据的等价阈值由 PFCF_MAX 推出，不能跟着 L1 的预筛上限漂。
+
+        夹具下 r = 0.7，故 ceiling = 100 × 11 × 0.7 = 770；
+        若误用 PCF_TTM_MAX(1200) 会得到 840，判据就被悄悄放松了。
+        """
+        financials = bundle()
+        candidate = {"code": "HK.TEST", "total_market_val": 100, "pcf_ttm": 700.0}
+        l2 = growth_value_screener.refine_futu(candidate, financials)
+
+        self.assertEqual(growth_value_screener.PFCF_MAX, 11.0)
+        self.assertEqual(growth_value_screener.PCF_TTM_MAX, 1200.0)
+        self.assertAlmostEqual(l2["pcf_ttm_ceiling"], 770.0, places=2)
+
+    def test_growth_value_reject_reason_attribution(self):
+        """拒绝原因按判据求值顺序归因；None 必须与 l2_passes 完全一致。"""
+        base = {"ok": True, "piotroski_like_available": 8, "piotroski_like_score": 4,
+                "fcf_ok": True}
+        cases = [
+            ({"ok": False}, "l2_unavailable"),
+            ({**base, "piotroski_like_available": 7}, "piotroski_incomplete"),
+            ({**base, "piotroski_like_score": 3}, "piotroski_below_threshold"),
+            ({**base, "piotroski_like_score": None}, "piotroski_below_threshold"),
+            ({**base, "fcf_ok": False}, "fcf_unavailable"),
+            ({**base, "p_over_fcf": None}, "fcf_non_positive"),
+            ({**base, "p_over_fcf": 12.0}, "pfcf_above_max"),
+            ({**base, "p_over_fcf": 11.0}, None),
+            ({**base, "p_over_fcf": 5.0}, None),
+        ]
+        for l2, expected in cases:
+            with self.subTest(l2=l2):
+                candidate = {"l2": l2}
+                self.assertEqual(
+                    growth_value_screener.l2_reject_reason(candidate), expected,
+                )
+                self.assertEqual(
+                    growth_value_screener.l2_passes(candidate), expected is None,
+                )
+
+    def test_deep_value_reject_reason_attribution(self):
+        base = {"ok": True, "condition_currency_ok": True,
+                "condition_market_cap_lt_ncav": True}
+        cases = [
+            ({"ok": False}, "l2_unavailable"),
+            ({**base, "condition_currency_ok": False}, "currency_mismatch"),
+            ({**base, "condition_market_cap_lt_ncav": False},
+             "market_cap_not_below_ncav"),
+            (base, None),
+        ]
+        for l2, expected in cases:
+            with self.subTest(l2=l2):
+                candidate = {"l2": l2}
+                self.assertEqual(
+                    deep_value_screener.l2_reject_reason(candidate), expected,
+                )
+                self.assertEqual(
+                    deep_value_screener.l2_passes(candidate), expected is None,
+                )
+
+    def test_screen_records_l2_reject_reason_counts(self):
+        """计数必须能对账：sum(原因) == l2_refined − returned。"""
+        candidates = [
+            {"code": "X1", "l2": {"ok": False}},
+            {"code": "X2", "l2": {"ok": True, "piotroski_like_available": 8,
+                                  "piotroski_like_score": 4, "fcf_ok": True,
+                                  "p_over_fcf": 20.0}},
+            {"code": "X3", "l2": {"ok": True, "piotroski_like_available": 8,
+                                  "piotroski_like_score": 2, "fcf_ok": True,
+                                  "p_over_fcf": 5.0}},
+            {"code": "X4", "l2": {"ok": True, "piotroski_like_available": 8,
+                                  "piotroski_like_score": 4, "fcf_ok": True,
+                                  "p_over_fcf": 5.0}},
+        ]
+        with mock.patch.object(fs, "run_l1", return_value=list(candidates)), \
+                mock.patch.object(fs, "run_futu_refine", return_value=None):
+            result = fs.screen(
+                growth_value_screener, "A", configparser.ConfigParser(),
+                snapshot=False, refine=True,
+            )
+
+        self.assertEqual(result["l2_refined"], 4)
+        self.assertEqual(result["returned"], 1)
+        self.assertEqual(result["l2_reject_reasons"], {
+            "l2_unavailable": 1,
+            "pfcf_above_max": 1,
+            "piotroski_below_threshold": 1,
+        })
+        self.assertEqual(
+            sum(result["l2_reject_reasons"].values()),
+            result["l2_refined"] - result["returned"],
+        )
+
+    def test_growth_value_l2_rejects_non_positive_free_cash_flow(self):
+        """FCF ≤ 0 时 P/FCF 无意义，必须判不合格而不是放行。"""
+        candidate = {"code": "HK.TEST", "total_market_val": 100, "pcf_ttm": 700.0}
+        # 资本开支远超经营现金流：TTM 资本开支由 5071 吞掉全部 OCF
+        heavy = statement_data([
+            ("2026-06-30", 5, "2026/H1", {5001: 100, 5071: -300}),
+            ("2025-12-31", 7, "2025/FY", {5001: 150, 5071: -300}),
+            ("2025-06-30", 5, "2025/H1", {5001: 50, 5071: -100}),
+        ])
+        financials = bundle(cashflow=heavy)
+        candidate["l2"] = growth_value_screener.refine_futu(candidate, financials)
+        self.assertTrue(candidate["l2"]["fcf_ok"])
+        self.assertLessEqual(candidate["l2"]["fcf_ttm"], 0)
+        self.assertIsNone(candidate["l2"]["p_over_fcf"])
+        self.assertFalse(growth_value_screener.l2_passes(candidate))
+
+    def test_fixed_asset_sign_is_normalised_across_a_and_hk(self):
+        """A 的 3043 是正号流出、港股的 5071 是负号流出，归一后必须同号同值。"""
+        a_cash = statement_data([("2026-06-30", 7, "2026/FY", {3043: 60.0})])
+        hk_cash = statement_data([("2026-06-30", 7, "2026/FY", {5071: -60.0})])
+        a_financials = fs.FutuFinancials(
+            {"cashflow": fs._parse_financial_reports("cashflow", a_cash)},
+        )
+        hk_financials = fs.FutuFinancials(
+            {"cashflow": fs._parse_financial_reports("cashflow", hk_cash)},
+        )
+        self.assertEqual(
+            a_financials.net_fixed_asset_cash_flow_ttm(fs.FUTU_FIELD_SETS[3]),
+            -60.0,
+        )
+        self.assertEqual(
+            hk_financials.net_fixed_asset_cash_flow_ttm(fs.FUTU_FIELD_SETS[5]),
+            -60.0,
+        )
+
+    def test_growth_value_prefilter_is_necessary_condition_for_p_over_fcf(self):
+        """L1 预筛必须写成 PCF_TTM ≤ 1200（百分比刻度），且经营现金流下限严格 >0。"""
+        filters = growth_value_screener.build_filters("HK", fs.ft)
+        pcf = next(
+            item for item in filters
+            if item.stock_field == fs.ft.StockField.PCF_TTM
+        )
+        self.assertEqual(pcf.filter_max, 1200.0)
+        ocf = next(
+            item for item in filters
+            if getattr(item, "stock_field", None) == fs.ft.StockField.OPERATING_CASH_FLOW_TTM
+        )
+        self.assertEqual(ocf.filter_min, fs.POSITIVE_MIN)
+
+    def test_positive_min_clears_futu_quantisation_threshold(self):
+        """实测 Futu 把 1e-9 及以下的下限量化成 0，POSITIVE_MIN 必须高于该阈值。
+
+        否则「要求为正」会退化成「≥0」，放进恰好等于 0 的标的。
+        """
+        self.assertGreater(fs.POSITIVE_MIN, 0.001)
+        self.assertLessEqual(fs.POSITIVE_MIN, 0.01)
+
+    def test_strategies_share_positive_min_for_positivity_bounds(self):
+        """四个策略里「要求为正」的下限必须都引用 POSITIVE_MIN，不能各写各的。"""
+        expectations = {
+            pr_screener: (
+                fs.ft.StockField.PB_RATE, fs.ft.StockField.PE_TTM,
+                fs.ft.StockField.NET_PROFIT,
+                fs.ft.StockField.OPERATING_CASH_FLOW_TTM,
+            ),
+            growth_value_screener: (
+                fs.ft.StockField.PE_TTM, fs.ft.StockField.PB_RATE,
+                fs.ft.StockField.PCF_TTM,
+                fs.ft.StockField.OPERATING_CASH_FLOW_TTM,
+                fs.ft.StockField.SUM_OF_BUSINESS_GROWTH,
+                fs.ft.StockField.NET_PROFIX_GROWTH,
+            ),
+            deep_value_screener: (
+                fs.ft.StockField.PE_TTM, fs.ft.StockField.PB_RATE,
+                fs.ft.StockField.NET_PROFIT,
+                fs.ft.StockField.CASH_AND_CASH_EQUIVALENTS,
+            ),
+        }
+        for strategy, fields in expectations.items():
+            with self.subTest(strategy=strategy.NAME):
+                actual = {
+                    getattr(item, "stock_field", None): item.filter_min
+                    for item in strategy.build_filters("A", fs.ft)
+                    if getattr(item, "stock_field", None) in fields
+                }
+                self.assertEqual(set(actual), set(fields))
+                for field, value in actual.items():
+                    self.assertEqual(value, fs.POSITIVE_MIN, msg=str(field))
+
+    def test_growth_thresholds_use_positive_min(self):
+        """增速下限统一用 POSITIVE_MIN：百分比口径上 0.01 即 0.01%，仍是桶底。"""
+        self.assertEqual(growth_value_screener.REV_GROWTH_MIN, fs.POSITIVE_MIN)
+        self.assertEqual(growth_value_screener.PROFIT_GROWTH_MIN, fs.POSITIVE_MIN)
 
     def test_financial_api_failure_is_not_retried(self):
         class FakeContext:
