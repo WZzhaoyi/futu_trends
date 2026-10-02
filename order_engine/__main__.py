@@ -59,7 +59,7 @@ class AsyncNotifier:
 
 
 def collect_order_gateway_names(config, default_data_gateway: str, default_order_gateway: str) -> set:
-    """从条件单yaml收集启用订单引用的网关，保证per-order覆盖的网关也会被注册。"""
+    """从yaml收集启用规则的行情网关及订单交易网关。"""
     names = set()
     order_config_path = config.get("CONFIG", "ORDER_CONFIG", fallback=None)
     if not order_config_path or not os.path.exists(order_config_path):
@@ -73,10 +73,9 @@ def collect_order_gateway_names(config, default_data_gateway: str, default_order
         if not isinstance(order, dict) or not order.get('enabled', False):
             continue
         names.add(str(order.get('data_gateway', default_data_gateway)).upper())
-        names.add(str(order.get('order_gateway', default_order_gateway)).upper())
         for action in order.get('actions') or []:
-            if isinstance(action, dict) and 'order_gateway' in action:
-                names.add(str(action['order_gateway']).upper())
+            if isinstance(action, dict) and action.get('type') != 'notify':
+                names.add(str(action.get('order_gateway', order.get('order_gateway', default_order_gateway))).upper())
     return names
 
 
@@ -88,8 +87,7 @@ def main():
 
     data_gateway_name = config.get("CONFIG", "ORDER_DATA_GATEWAY", fallback="FUTU").strip().upper()
     order_gateway_name = config.get("CONFIG", "ORDER_TRADE_GATEWAY", fallback="QMT").strip().upper()
-    gateway_names = {data_gateway_name, order_gateway_name}
-    gateway_names |= collect_order_gateway_names(config, data_gateway_name, order_gateway_name)
+    gateway_names = collect_order_gateway_names(config, data_gateway_name, order_gateway_name)
     unknown_gateways = gateway_names - GATEWAY_NAMES
     if unknown_gateways:
         raise ValueError(f"不支持的网关: {', '.join(sorted(unknown_gateways))}")

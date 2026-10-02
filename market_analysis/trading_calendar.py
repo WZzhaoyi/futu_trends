@@ -1,6 +1,6 @@
 """多市场交易日历：Futu 日历查询 + 市场时区换算 + 本地缓存。
 
-四条规则（live 策略踩过的坑都在这里）：
+交易日历规则：
 
 1. 交易日一律按“市场当地日期”判断：美股用 America/New_York，A 股用 Asia/Shanghai，
    港股用 Asia/Hong_Kong。
@@ -11,7 +11,7 @@
 3. 各市场日历互相独立：A 股国庆休市时美股照常开市，港股只休 10-01。缓存按市场分开存。
 4. 市场必须由调用方显式给出，既没有默认参数也没有兜底市场；空值/未知市场直接报错。
 5. 与交易日有关的配置（MARKET / TRADING_DAY_GATE）统一在本模块解析校验，
-   各策略不再各读各的，避免同一个语义在多个调用方里各自解释。
+   调用方使用一致的市场与交易日闸门配置语义。
 
 缓存策略：只无条件信任“已经过去的日期”；当天（市场当地日期）的结论一律现查，
 查询失败时才退回缓存，避免 OpenD 抖动把错误结论写进缓存后长期生效。
@@ -34,7 +34,7 @@ CACHE_DIR = PROJECT_ROOT / "data" / "calendar"
 WHOLE_DAY = "WHOLE"
 HALF_DAY = "MORNING"
 
-# 与交易日相关的两个配置键由本模块统一解析，各策略不再各读各的
+# 市场与交易日闸门配置由本模块解析。
 MARKET_KEY = "MARKET"
 GATE_KEY = "TRADING_DAY_GATE"
 GATE_ON_VALUES = {"on", "true", "1", "yes"}
@@ -126,10 +126,10 @@ def load_cached_calendar(market: Any, cache_dir: Optional[Path] = None) -> dict[
     return dict(days) if isinstance(days, dict) else {}
 
 
-def _store_day(market: Market, target: str, value: Optional[str], cache_dir: Optional[Path]) -> None:
+def _store_days(market: Market, values: dict[str, Optional[str]], cache_dir: Optional[Path]) -> None:
     path = cache_file(market, cache_dir)
     days = load_cached_calendar(market, cache_dir)
-    days[target] = value
+    days.update(values)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
@@ -158,28 +158,9 @@ def _resolve_connection(config: Any, host: Optional[str], port: Optional[int]) -
     return host or DEFAULT_HOST, int(port or DEFAULT_PORT)
 
 
-def _query_day_type(
-    market: Market,
-    target: str,
-    context: Any,
-    ret_ok: Any,
-) -> Optional[str]:
-    ret, days = context.request_trading_days(
-        start=target,
-        end=target,
-        code=market.calendar_symbol,
-    )
-    if ret != ret_ok:
-        raise RuntimeError(f"Futu 交易日查询失败 ({market.name} {target}): {days}")
-    for day in days:
-        if str(day.get("time", ""))[:10] == target:
-            return str(day.get("trade_date_type") or WHOLE_DAY)
-    return None
-
-
-def trading_day_type(
+def trading_day_types(
     market: Any,
-    trading_date: Optional[date] = None,
+    dates: Any,
     *,
     context: Any = None,
     config: Any = None,
@@ -187,43 +168,97 @@ def trading_day_type(
     port: Optional[int] = None,
     use_cache: bool = True,
     cache_dir: Optional[Path] = None,
-) -> Optional[str]:
-    """该市场当地日期是否为交易日：返回 WHOLE/HALF_DAY/None（非交易日）。
-
-    trading_date 默认取市场当地的今天。context 已连接时直接复用（不新建、不关闭），
-    否则用 host/port（或 config 里的 Futu 配置）临时连接。
-    """
+) -> dict[str, Optional[str]]:
+    """批量查询日期类型；历史日期用缓存，当天/未来重新查询，失败只回退已有缓存。"""
     spec = market_of(market)
-    target = str(trading_date or today_in(spec))[:10]
-    settled = target < today_in(spec).isoformat()
-
+    targets = sorted({str(day)[:10] for day in dates})
+    if not targets:
+        return {}
+    today = today_in(spec).isoformat()
     cached = load_cached_calendar(spec, cache_dir) if use_cache else {}
-    if use_cache and settled and target in cached:
-        return cached[target]
+    missing = [target for target in targets if target >= today or target not in cached]
+    if not missing:
+        return {target: cached[target] for target in targets}
 
     from futu import OpenQuoteContext, RET_OK
 
     owned = None
     if context is None:
         connection_host, connection_port = _resolve_connection(config, host, port)
-        owned = OpenQuoteContext(host=connection_host, port=connection_port)
+        owned = OpenQuoteContext(connection_host, connection_port)
         context = owned
+    values = {}
     try:
-        value = _query_day_type(spec, target, context, RET_OK)
+        # Bound each query to one year while reusing the connection and accumulated cache.
+        cursor = date.fromisoformat(missing[0])
+        last = date.fromisoformat(missing[-1])
+        while cursor <= last:
+            finish = min(cursor + timedelta(days=364), last)
+            ret, rows = context.request_trading_days(
+                start=cursor.isoformat(), end=finish.isoformat(), code=spec.calendar_symbol)
+            if ret != RET_OK:
+                raise RuntimeError(f"Futu 交易日查询失败 ({spec.name}): {rows}")
+            days = (cursor + timedelta(days=i) for i in range((finish - cursor).days + 1))
+            values.update({day.isoformat(): None for day in days})
+            for row in rows:
+                target = str(row.get('time', ''))[:10]
+                if cursor.isoformat() <= target <= finish.isoformat():
+                    values[target] = str(row.get('trade_date_type') or WHOLE_DAY)
+            cursor = finish + timedelta(days=1)
     except Exception:
-        if use_cache and target in cached:
-            return cached[target]
+        if use_cache and all(target in cached for target in targets):
+            return {target: cached[target] for target in targets}
         raise
     finally:
         if owned is not None:
             try:
                 owned.close()
-            except Exception as exc:  # noqa: BLE001 - SDK 关闭异常不该掩盖查询结果
+            except Exception as exc:
                 print(f"警告: 关闭 Futu context 失败: {exc}")
 
     if use_cache:
-        _store_day(spec, target, value, cache_dir)
-    return value
+        _store_days(spec, values, cache_dir)
+    cached.update(values)
+    return {target: cached[target] for target in targets}
+
+
+def trading_day_type(
+    market: Any,
+    trading_date: Optional[date] = None,
+    **kwargs: Any,
+) -> Optional[str]:
+    """查询单日交易日类型，使用市场日历缓存与失败回退规则。"""
+    spec = market_of(market)
+    target = str(trading_date or today_in(spec))[:10]
+    return trading_day_types(spec, [target], **kwargs)[target]
+
+
+def trading_sessions(market: Any, dates: Any, **kwargs: Any) -> list[tuple[datetime, datetime]]:
+    """交易日的连续盘中时段，午休分段；MORNING为港股12:00/美股13:00提前收市。"""
+    spec = market_of(market)
+    types = trading_day_types(spec, dates, **kwargs)
+    result = []
+    for target, kind in sorted(types.items()):
+        if kind is None:
+            continue
+        day = date.fromisoformat(target)
+        if kind not in (WHOLE_DAY, HALF_DAY, 'AFTERNOON'):
+            raise ValueError(f'不支持的交易日类型: {spec.name} {target} {kind}')
+        if spec.name == 'US':
+            if kind == 'AFTERNOON':
+                raise ValueError(f'不支持的美股交易日类型: {kind}')
+            periods = [(time(9, 30), time(13) if kind == HALF_DAY else time(16))]
+        else:
+            morning_end = time(11, 30) if spec.name == 'CN' else time(12)
+            close = time(15) if spec.name == 'CN' else time(16)
+            periods = [(time(9, 30), morning_end), (time(13), close)]
+            if kind == HALF_DAY:
+                periods = periods[:1]
+            elif kind == 'AFTERNOON':
+                periods = periods[1:]
+        result.extend((datetime.combine(day, opening, spec.timezone),
+                       datetime.combine(day, closing, spec.timezone)) for opening, closing in periods)
+    return result
 
 
 def is_trading_day(

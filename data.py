@@ -16,18 +16,21 @@
 #  Copyright (c)  Joey - All Rights Reserved
 
 import configparser
+from copy import deepcopy
 from time import sleep
 import time as time_module
 import futu as ft
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from tools import (
     futu_code_to_ib_contract,
     futu_code_to_longbridge_code,
     market_of_code,
     to_yfinance_code,
 )
+from market_analysis.trading_calendar import market_of, trading_sessions
 import math
 import sys
 import threading
@@ -118,7 +121,7 @@ def _is_trading(code, host, port):
 
 # ---- K线缓存 ----
 
-_kline_cache = {}  # (code, ktype) → (fetch_ts, df)
+_kline_cache = {}  # (source_type, code, ktype) → (fetch_ts, df)
 _KLINE_TTL_TRADING = 60  # 盘中 60 秒
 
 def _is_cache_fresh(fetch_ts, df, max_count, code, config):
@@ -222,72 +225,63 @@ def get_us_stocks():
     
     return _us_stocks_cache
 
-def convert_to_Nhour(df: pd.DataFrame, n_hours: int = 4, session_type: str = '') -> pd.DataFrame:
+def hour_windows(sessions, n_hours=4, session_type=''):
+    """连续交易时段内的小时窗口；聚合与周期检查共用边界。"""
+    for opening, closing in sessions:
+        start, end = pd.Timestamp(opening), pd.Timestamp(closing)
+        width = end - start if session_type == 'HALF_DAY' else pd.Timedelta(hours=n_hours)
+        cursor = start
+        while cursor < end:
+            finish = min(cursor + width, end)
+            yield cursor, finish
+            cursor = finish
+
+
+def convert_to_Nhour(
+    df: pd.DataFrame, n_hours: int = 4, session_type: str = '', *,
+    market: str, config: configparser.ConfigParser | None = None,
+    bar: str = 'forming', now: datetime | None = None, input_minutes: int = 1,
+) -> pd.DataFrame:
+    """盘中OHLCV聚合：从连续交易时段开盘对齐，午休重置，保留短尾。
+
+    输入索引为每根原始K线的开始时间。market必须显式传入；HALF_DAY按每段交易时段聚合。
+    返回市场时区索引及bar_start/bar_end；不改动输入。closed过滤未完成窗口。
     """
-    将数据转换为N小时周期或半日的K线
-    
-    Args:
-        df (pd.DataFrame): 输入数据，必须包含OHLCV数据，索引为时间戳
-        n_hours (int): 目标小时数，默认4小时
-        session_type (str): 时间段类型，可选值：
-            - None: 按照固定小时数聚合
-            - 'HALF_DAY': 按照上午/下午分段聚合
-    
-    Returns:
-        pd.DataFrame: 转换后的K线数据
-    """
-    # 确保索引是时间类型
-    df.index = pd.to_datetime(df.index)
-    
-    if session_type == 'HALF_DAY':
-        # 准备结果数据结构
-        result_data = []
-        time_map = {'AM': '12:00:00', 'PM': '16:00:00'}
-        
-        # 获取所有唯一的日期
-        dates = pd.Series(df.index.date).unique()
-        
-        for date in dates:
-            # 获取当日数据
-            day_data = df[df.index.date == date]
-            
-            # 分别处理上午和下午的数据
-            for session in ['AM', 'PM']:
-                if session == 'AM':
-                    session_data = day_data[day_data.index.hour < 13]
-                else:
-                    session_data = day_data[day_data.index.hour >= 13]
-                
-                # 如果该时段有数据，则生成K线
-                if not session_data.empty:
-                    kline = {
-                        'open': session_data['open'].iloc[0],
-                        'high': session_data['high'].max(),
-                        'low': session_data['low'].min(),
-                        'close': session_data['close'].iloc[-1],
-                        'volume': session_data['volume'].sum(),
-                        'time_key': pd.to_datetime(f"{date} {time_map[session]}")
-                    }
-                    result_data.append(kline)
-        
-        # 创建结果DataFrame
-        if len(result_data):
-            result = pd.DataFrame(result_data)
-            result.set_index('time_key', inplace=True)
-            return result
-        return pd.DataFrame()
-        
-    else:
-        # 按N小时周期分组
-        result = df.groupby(pd.Grouper(freq=f'{n_hours}H')).agg({
-            'open': 'first',
-            'high': 'max',
-            'low': 'min',
-            'close': 'last',
-            'volume': 'sum'
-        })
-    
-    return result.dropna()  # 删除没有数据的时段
+    spec = market_of(market)
+    if isinstance(n_hours, bool) or not isinstance(n_hours, int) or n_hours <= 0:
+        raise ValueError('n_hours必须是正整数')
+    if session_type not in ('', 'HALF_DAY') or bar not in ('closed', 'forming'):
+        raise ValueError('不支持的session_type/bar')
+    if input_minutes <= 0:
+        raise ValueError('input_minutes必须大于0')
+    columns = ['open', 'high', 'low', 'close', 'volume', 'bar_start', 'bar_end']
+    if df.empty:
+        return pd.DataFrame(columns=columns, index=pd.DatetimeIndex([], tz=spec.timezone, name='bar_start'))
+    frame = df.copy()
+    index = pd.DatetimeIndex(frame.index)
+    frame.index = index.tz_localize(spec.timezone) if index.tz is None else index.tz_convert(spec.timezone)
+    frame = frame[~frame.index.duplicated(keep='last')].sort_index()
+    moment = pd.Timestamp(now or datetime.now(spec.timezone))
+    moment = moment.tz_localize(spec.timezone) if moment.tzinfo is None else moment.tz_convert(spec.timezone)
+    duration = pd.Timedelta(minutes=input_minutes)
+    frame = frame[frame.index + (duration if bar == 'closed' else pd.Timedelta(0)) <= moment]
+    if frame.empty:
+        return pd.DataFrame(columns=columns, index=pd.DatetimeIndex([], tz=spec.timezone, name='bar_start'))
+    sessions = trading_sessions(spec, sorted(set(frame.index.date)), config=config)
+    rows = []
+    for cursor, finish in hour_windows(sessions, n_hours, session_type):
+        values = frame[(frame.index >= cursor) & (frame.index < finish)]
+        if (not values.empty and cursor >= frame.index.min()
+                and (bar == 'forming' or finish <= moment)):
+            if input_minutes > 1 and any(values.index + duration > finish):
+                raise ValueError('原始K线跨越目标窗口边界，请改用分钟K线')
+            rows.append({'open': values.open.iloc[0], 'high': values.high.max(),
+                         'low': values.low.min(), 'close': values.close.iloc[-1],
+                         'volume': values.volume.sum(), 'bar_start': cursor, 'bar_end': finish})
+    result = pd.DataFrame(rows, columns=columns).set_index('bar_start', drop=False)
+    result.index = pd.DatetimeIndex(result.index, tz=spec.timezone, name='bar_start')
+    return result
+
 
 def fetch_futu_data(code: str, ktype: str, max_count: int, config: configparser.ConfigParser) -> pd.DataFrame | None:
     """获取Futu最近数据"""
@@ -309,8 +303,15 @@ def fetch_futu_data(code: str, ktype: str, max_count: int, config: configparser.
         
         # 计算时间范围
         end = datetime.now()
+        if _ktype == ft.KLType.K_1M:
+            tz = ZoneInfo('America/New_York' if code.startswith('US.') else 'Asia/Hong_Kong')
+            end = datetime.now(tz).replace(tzinfo=None)
         # 根据请求数量和K线类型计算合适的开始时间
-        if _ktype == ft.KLType.K_60M:
+        if _ktype == ft.KLType.K_1M:
+            # Include weekends/holidays without requesting years of minute history.
+            days_needed = math.ceil(request_count / 240) * 2 + 14
+            start = end - timedelta(days=days_needed)
+        elif _ktype == ft.KLType.K_60M:
             # 按交易时段估算，一天约6个交易小时
             days_needed = math.ceil(request_count / 6)
             # 使用交易日历获取开始日期
@@ -319,28 +320,55 @@ def fetch_futu_data(code: str, ktype: str, max_count: int, config: configparser.
             # 对于日K及以上周期，直接用交易日历
             start = pd.bdate_range(end=end, periods=request_count, freq='B')[0]
         
+        minute_cache = None
+        if _ktype == ft.KLType.K_1M:
+            previous = _kline_cache.get(('futu', code, 'K_1M'))
+            if (previous is not None and len(previous[1]) >= request_count
+                    and previous[1].index[-1].date() == end.date()):
+                minute_cache = previous[1]
+                request_count = max(request_count, len(minute_cache))
+                start = minute_cache.index[-1].to_pydatetime()
         start_str = start.strftime('%Y-%m-%d')
         end_str = end.strftime('%Y-%m-%d')
         
         quote_ctx = ft.OpenQuoteContext(host=host, port=port)
         try:
-            kline = quote_ctx.request_history_kline(
-                code=code,
-                ktype=_ktype,
-                start=start_str,
-                end=end_str,
-                autype=ft.AuType.QFQ,
-                max_count=None
-            )
-            
-            if kline[0] != ft.RET_OK:
-                print(f"Futu API error: {kline[1]}")
-                return None
-                
-            df = kline[1].copy()
+            if _ktype == ft.KLType.K_1M:
+                pages, cursor = [], None
+                while True:
+                    kline = quote_ctx.request_history_kline(
+                        code=code, ktype=_ktype, start=start_str, end=end_str,
+                        autype=ft.AuType.QFQ, max_count=1000, page_req_key=cursor,
+                        extended_time=False,
+                    )
+                    if kline[0] != ft.RET_OK:
+                        raise RuntimeError(f'Futu分钟历史获取失败: {kline[1]}')
+                    pages.append(kline[1])
+                    next_cursor = kline[2]
+                    if next_cursor is None:
+                        break
+                    if next_cursor == cursor:
+                        raise RuntimeError('Futu历史分页游标未前进')
+                    cursor = next_cursor
+                    # Futu exempts subsequent pages from its initial-request rate limit.
+                history = pd.concat(pages, ignore_index=True)
+            else:
+                kline = quote_ctx.request_history_kline(
+                    code=code, ktype=_ktype, start=start_str, end=end_str,
+                    autype=ft.AuType.QFQ, max_count=None,
+                )
+                if kline[0] != ft.RET_OK:
+                    print(f"Futu API error: {kline[1]}")
+                    return None
+                history = kline[1]
+
+            df = history.copy()
             df['time_key'] = pd.to_datetime(df['time_key'])
             df = df.set_index('time_key')
             
+            if minute_cache is not None:
+                df = pd.concat([minute_cache, df])
+                df = df[~df.index.duplicated(keep='last')]
             # 确保获取最近的数据
             df = df.sort_index().tail(request_count)
 
@@ -362,7 +390,7 @@ def get_yfinance_params(ktype: str, max_count: int) -> dict:
     
     # 计算适当的时间范围
     if interval.endswith('m') or interval == '1h':
-        period = '60d'
+        period = '7d' if interval == '1m' else '60d'
     elif interval == '1d':
         period = 'max' if max_count > 1300 else '5y' if max_count > 730 else '2y' if max_count > 365 else '1y' if max_count > 180 else '6mo'
     elif interval == '1wk':
@@ -672,7 +700,7 @@ def fetch_ibkr_data(code: str, ktype: str, max_count: int, config: configparser.
         finally:
             ib.disconnect()
 
-def get_kline_data(code: str, config: configparser.ConfigParser, max_count: int = 270, file_cache_dir: str | None = None) -> pd.DataFrame | None:
+def get_kline_data(code: str, config: configparser.ConfigParser, max_count: int = 270, file_cache_dir: str | None = None, *, force_refresh: bool = False) -> pd.DataFrame | None:
     """
     统一的K线获取接口，支持内存缓存和可选的文件缓存。
     缓存过期由市场交易状态决定：盘中 60s TTL，盘后永不过期。
@@ -682,13 +710,12 @@ def get_kline_data(code: str, config: configparser.ConfigParser, max_count: int 
         config (configparser.ConfigParser): 配置对象
         max_count (int): 获取K线的数量
         file_cache_dir (str): 文件缓存目录，None 则仅使用内存缓存
+        force_refresh (bool): 默认False；周期边界检查时跳过缓存读取、更新最新行情
 
     Returns:
         pd.DataFrame: K线数据，包含 open, high, low, close, volume
     """
     ktype = config.get("CONFIG", "FUTU_PUSH_TYPE", fallback="K_DAY")  # 缺省按日线，避免 NoOptionError
-    cache_key = (code, ktype)
-
     market = code.split('.')[0].upper()
     market_key = f"DATA_SOURCE_{market}"
     if config.has_option("CONFIG", market_key):
@@ -696,23 +723,36 @@ def get_kline_data(code: str, config: configparser.ConfigParser, max_count: int 
     else:
         source_type = config.get("CONFIG", "DATA_SOURCE").lower()
 
+    cache_key = (source_type, code, ktype)
+    hours = {'K_60M': 1, 'K_120M': 2, 'K_180M': 3, 'K_240M': 4, 'K_HALF_DAY': None}
+    # 小时缓存使用独立的交易时段聚合格式标识。
+    file_ktype = f'{ktype}_session_v1' if ktype in hours else ktype
+
     # 第一层：内存缓存
-    if cache_key in _kline_cache:
+    if not force_refresh and cache_key in _kline_cache:
         fetch_ts, cached_df = _kline_cache[cache_key]
         if _is_cache_fresh(fetch_ts, cached_df, max_count, code, config):
             return cached_df.tail(max_count).copy()
 
     # 第二层：文件缓存
-    if file_cache_dir:
-        file_path, fetch_ts = _find_cache_file(file_cache_dir, code, ktype)
+    if file_cache_dir and not force_refresh:
+        file_path, fetch_ts = _find_cache_file(file_cache_dir, code, file_ktype)
         if file_path:
             df = pd.read_csv(file_path, index_col=0, parse_dates=True)
             if _is_cache_fresh(fetch_ts, df, max_count, code, config):
                 _kline_cache[cache_key] = (fetch_ts, df)
                 return df.tail(max_count).copy()
 
-    # 第三层：远程拉取
-    if source_type == 'futu':
+    # 所有自定义小时周期共用分钟数据和盘中聚合入口。
+    if ktype in hours:
+        market_name = market_of_code(code)
+        longest = {'CN': 120, 'HK': 180, 'US': 390}[market_name]
+        minutes = min((hours[ktype] or 7) * 60, longest)
+        minute_config = deepcopy(config)
+        minute_config.set('CONFIG', 'FUTU_PUSH_TYPE', 'K_1M')
+        df = get_kline_data(code, minute_config, max_count=(max_count + 2) * minutes + 390,
+                            file_cache_dir=file_cache_dir, force_refresh=force_refresh)
+    elif source_type == 'futu':
         df = fetch_futu_data(code, ktype, max_count, config)
     elif source_type == 'yfinance':
         df = fetch_yfinance_data(code, ktype, max_count, config)
@@ -728,27 +768,20 @@ def get_kline_data(code: str, config: configparser.ConfigParser, max_count: int 
     if df is None or df.empty:
         return None
 
-    # 确保时间索引 & 统一去掉时区（tz-naive）
-    # 各数据源返回时区情况：
-    # | 数据源      | HK              | US               |
-    # |------------|-----------------|------------------|
-    # | Futu       | naive           | naive            |
-    # | yfinance   | Asia/Hong_Kong  | America/New_York |
-    # | AKShare    | naive           | —                |
-    # | Longbridge | naive           | naive            |
-    # | IBKR       | naive           | naive            |
-    # 仅 yfinance 带时区，统一去掉以保持一致
+    # 带时区的索引先转换为市场当地时间，再移除时区以保持调用格式一致。
     df.index = pd.to_datetime(df.index)
     if df.index.tz is not None:
+        market_tz = {'US': 'America/New_York', 'HK': 'Asia/Hong_Kong',
+                     'SH': 'Asia/Shanghai', 'SZ': 'Asia/Shanghai'}.get(market)
+        if market_tz:
+            df.index = df.index.tz_convert(market_tz)
         df.index = df.index.tz_localize(None)
 
-    # 处理特殊周期
-    if ktype == 'K_HALF_DAY':
-        df = convert_to_Nhour(df, session_type='HALF_DAY')
-    elif ktype == 'K_240M':
-        df = convert_to_Nhour(df, n_hours=4).dropna()
-    elif ktype == 'K_120M':
-        df = convert_to_Nhour(df, n_hours=2).dropna()
+    if ktype in hours:
+        df = convert_to_Nhour(df, n_hours=hours[ktype] or 4,
+                              session_type='HALF_DAY' if ktype == 'K_HALF_DAY' else '',
+                              market=market_of_code(code), config=config)
+        df.index = df.index.tz_localize(None)
 
     # 写缓存
     if df is not None and not df.empty:
@@ -757,7 +790,7 @@ def get_kline_data(code: str, config: configparser.ConfigParser, max_count: int 
         if len(df) >= len(old):
             _kline_cache[cache_key] = (fetch_ts, df)
         if file_cache_dir:
-            _write_cache_file(file_cache_dir, code, ktype, df)
+            _write_cache_file(file_cache_dir, code, file_ktype, df)
 
     return df.tail(max_count).copy()
 

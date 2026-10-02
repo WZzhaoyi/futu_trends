@@ -127,4 +127,8 @@ class MainEngine:
         # 先关网关停止事件产生，再停事件引擎，尽量消费完在途事件
         for gateway in self._gateways.values():
             gateway.close()
+        for engine in self._engines.values():
+            close = getattr(engine, "close", None)
+            if close:
+                close()
         self.event_engine.stop()

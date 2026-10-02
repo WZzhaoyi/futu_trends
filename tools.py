@@ -284,41 +284,20 @@ def market_of_code(code: str) -> str | None:
     """
     return CODE_MARKETS.get(str(code).split(".", 1)[0].strip().upper())
 
-def convert_to_Nhour(df: pd.DataFrame,hour:2|4=4) -> pd.DataFrame:
-    """
-    将 60m 数据转换为 2h/4h 数据
+def convert_to_Nhour(df: pd.DataFrame, hour: int = 4, *, market: str, config=None) -> pd.DataFrame:
+    """按指定市场交易时段，将分钟K线聚合为小时K线。"""
+    from data import convert_to_Nhour as aggregate
+    return aggregate(df, n_hours=hour, market=market, config=config, input_minutes=1)
 
-    Args:
-        df (pd.DataFrame): 包含 60m 数据的 DataFrame，必须包含 'open', 'high', 'low', 'close', 'volume' 列
-
-    Returns:
-        pd.DataFrame: 转换后的 2h/4h 数据
-    """
-    # 确保索引是时间类型
-    df.index = pd.to_datetime(df.index)
-
-    # 确保数据长度是hour的倍数
-    if len(df) % hour != 0:
-        df = df.iloc[(len(df) % hour)-len(df):]  # 截断到4的倍数
-
-    # 初始化一个空的 DataFrame 用于存储数据
-    _df = pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
-
-    # 使用 for 循环遍历每一行
-    for i in range(0, len(df), hour):
-        index = df.index[i+hour-1]
-        _df.loc[index, 'open'] = df.iloc[i]['open']  # 开盘价
-        _df.loc[index, 'high'] = df.iloc[i:i+hour]['high'].max()  # 最高价
-        _df.loc[index, 'low'] = df.iloc[i:i+hour]['low'].min()  # 最低价
-        _df.loc[index, 'close'] = df.iloc[i+hour-1]['close']  # 收盘价
-        _df.loc[index, 'volume'] = df.iloc[i:i+hour]['volume'].sum()  # 成交量
-
-    # 复制索引为新的一列 time_key
-    _df['time_key'] = _df.index
-
-    return _df
 
 def kline(code:str, max_count:int=365, ktype=ft.KLType.K_DAY, host='127.0.0.1', port=11111, autype=ft.AuType.QFQ):
+    if ktype in ('K_60M', 'K_120M', 'K_180M', 'K_240M', 'K_HALF_DAY'):
+        import configparser
+        from data import get_kline_data
+        config = configparser.ConfigParser()
+        config['CONFIG'] = {'DATA_SOURCE': 'yfinance' if code.startswith('US.') else 'futu',
+                            'FUTU_PUSH_TYPE': ktype, 'FUTU_HOST': host, 'FUTU_PORT': str(port)}
+        return get_kline_data(code, config, max_count=max_count)
     if ktype == ft.KLType.K_DAY:
         max_count = 90
 
@@ -352,19 +331,11 @@ def kline(code:str, max_count:int=365, ktype=ft.KLType.K_DAY, host='127.0.0.1', 
             "Volume": "volume"
         }, inplace=True)
 
-        if ktype == 'K_240M':
-            df = convert_to_Nhour(df).dropna()
-        elif ktype == 'K_120M':
-            df = convert_to_Nhour(df,2).dropna()
-
         return df
     
     if 'HK' in code or 'SH' in code or 'SZ' in code:
 
-        if ktype == 'K_240M' or ktype == 'K_120M':
-            _ktype = ft.KLType.K_60M
-        else:
-            _ktype = ktype
+        _ktype = ktype
 
         kline_seconds = get_kline_seconds(_ktype)
 
@@ -383,11 +354,6 @@ def kline(code:str, max_count:int=365, ktype=ft.KLType.K_DAY, host='127.0.0.1', 
             print(kline[1])
             return None
         
-        if ktype == 'K_240M':
-            return convert_to_Nhour(kline[1])
-        elif ktype == 'K_120M':
-            df = convert_to_Nhour(kline[1],2).dropna()
-
         return kline[1]
 
 def crossover_status(series_a: pd.Series, series_b: pd.Series) -> list:

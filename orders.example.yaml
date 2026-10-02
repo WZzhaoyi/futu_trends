@@ -1,171 +1,199 @@
-# 条件单配置示例
+# 条件单配置
+# config.ini: [CONFIG] ORDER_CONFIG=orders.yaml；复制后启用需要的规则。
+# 所有示例默认禁用；顶层仅支持orders。
 #
-# 使用方式:
-# 1. 复制本文件为 orders.yaml
-# 2. 在 config.ini 中设置 ORDER_CONFIG=orders.yaml
-# 3. 测试订单链路时先使用 order_gateway: SIM
-# 4. 确认触发、推送、ORDER_EVENT_LOG 正常后，再切换到 QMT
+# 功能
+# - 支持价格、时间、tools.RSI/KDJ/MACD/MA/EMA和signal.*条件。
+# - 支持通知、限价/市价买卖和条件撤单；买卖动作只触发一次。
+# - notification.mode控制notify动作：一次提醒或每次重新进入条件时提醒。
+# - 由Tick驱动；指标按timeframe检查，同一周期不重复计算。
+# - 小时窗口从开盘对齐，午休后重新对齐，保留不足整周期的尾部窗口。
+# - 支持节假日、半日市、美股夏令时及不同周期的组合条件。
+# - Webhook、Telegram、邮件在config.ini中配置，见config_template.ini。
 #
-# 当前功能边界:
-# - 行情源和订单源可以分别配置:
-#   - data_gateway: FUTU
-#   - order_gateway: SIM 或 QMT
-# - 支持条件组嵌套，logical_operator/operator 支持 AND、OR。
-# - 叶子条件比较符按变量类型区分（对齐 IBKR 条件单语义，连续值无相等概念）:
-#   数值字段与 datetime 只支持 >、<、>=、<=；
-#   signal.* 与字符串字段只支持 ==、!=、contains。
-# - 支持 TickData 字段作为变量，例如 datetime、last_price、open_price、high_price、
-#   low_price、pre_close、volume、bid_price_1、ask_price_1 等。
-#   limit_up/limit_down 不可用: 富途行情无真实涨跌停价（仅有最小价差 price_spread），
-#   涨跌停边界请用具体价格数值表达。
-# - 支持 signal.* 虚拟变量，复用 trends.py 与 get_kline_data 缓存:
-#   signal.breakout 的值就是 trends.py 指标函数返回的信号字符串，可用 contains 做关键词匹配。
-#   可用信号: breakout、reverse、continue、top_down、balance。
-#   signal 在后台线程计算并缓存30秒，不阻塞行情处理；缓存未就绪时按空字符串参与比较。
-# - 条件触发为一次性（对齐 IBKR 条件单语义）: 触发即退休并写入 ORDER_STATE_FILE，
-#   动作失败（下单被拒、网关未连接等）只通知、不自动重试，需人工处理。
-# - 条件变量名、信号名在启动时校验；data_gateway 必须是能提供行情的网关（FUTU），
-#   行情订阅失败会导致启动报错，不会出现"已武装但收不到行情"的状态。
-# - datetime 比较值格式必须为: YYYY-MM-DD HH:MM:SS +0800。
-# - SIM 是极简订单源: 不看交易时段、不看价格档位，收到订单立即模拟全部成交。
-# - QMT 当前只作为订单源使用；免费版行情能力不作为条件单依赖。
-# - 订单状态会写入 ORDER_EVENT_LOG，并通过通知链路推送状态变化和成交回报。
-#   只跟踪本引擎提交的订单（雪花纯数字 remark 识别）；同账户的人工/其他系统订单完全过滤。
-# - cancel.conditions 与下单 conditions 复用同一套条件语法；条件满足时尝试撤销该配置提交的未终态订单。
-#   撤单提交失败或订单迟迟未进终态时，每10秒重试一次，最多3次后放弃并通知人工处理
-#   （收市废单、已成交、柜台拒绝撤单等场景不会无限重试）。
-# - datetime 变量的时区：港股/A股为北京时间，美股为美东时间（与 OpenD 行情推送一致），
-#   比较值需自带对应时区偏移，例如美股写 -0400（夏令时）/-0500（冬令时）。
-# - 配置采用严格校验：重复 id、trigger_once 等未实现字段都会导致启动失败。
-#   symbol 必须加引号（否则 YAML 会解析成数字）；limit 下单必须带 price；
-#   datetime 比较值格式在启动时校验；启用订单引用的网关必须已注册。
-# - 触发状态持久化到 ORDER_STATE_FILE：已触发的条件单重启后不再装载，防止重复下单；
-#   修改该条件单的任何配置内容（哈希变化）会自动重新激活。
-# - tick 的 last_price <= 0 时（集合竞价前、坏数据）不评估任何条件，防止止损类条件误触发。
+# 通用配置项
+# id/symbol/exchange/conditions/actions：必填；id唯一，symbol须加引号。
+# exchange：SH/SZ/HK/US；enabled：默认false；description：默认省略。
+# data_gateway：默认ORDER_DATA_GATEWAY（FUTU），需支持Tick推送。
+# order_gateway：交易动作默认ORDER_TRADE_GATEWAY（QMT），可选SIM/QMT；动作可覆盖。
+# 纯通知规则仅需行情网关。
+# variable/operator/value：条件叶子必填，阈值无默认值。
+# params：默认指标参数；timeframe：继承FUTU_PUSH_TYPE（缺省1d）。
+# timeframe可选1h/2h/3h/4h/1d/1w，同时决定K线周期和周期结束时的检查时机。
+# last_price、volume、datetime等Tick字段逐Tick检查。
+# 数值比较：>、<、>=、<=；字符串比较：==、!=、contains。
+# 条件组logical_operator：默认AND，可选AND/OR；items可嵌套。
+# 条件组也可使用operator: AND/OR + conditions: [...]。
+# datetime.value：YYYY-MM-DD HH:MM:SS +0800（美股使用美东时区偏移）。
 #
-# 当前不支持:
-# - 条件持续时长，例如“价格保持 5 秒”。
-# - 跨订单状态条件，例如“上一笔成交后再下第二笔”。
-# - 盘前/盘后/午间休市等交易时段规则校验。
-# - 改单、止盈止损联动。
-# - 多标的同一条件组，例如“A 上涨且 B 下跌”。
-# - QMT 实盘前置风控；真实风控仍以迅投/券商客户端为准。
+# tools.*默认参数
+# RSI：{N: 24}；MA/EMA：{N: 20}；这三个指标不设置output。
+# KDJ：{N: 15, M1: 5, M2: 5}；output必填K/D/J。
+# MACD：{fast_period: 12, slow_period: 26, signal_period: 9}；output必填DIF/DEA/HIST。
+# 周期参数为1到1000的整数；MACD fast_period必须小于slow_period。
+# N表示指定timeframe的K线根数。
+#
+# signal.*默认参数（显式params > 标的参数数据库 > 默认值）
+# top_down：{rsi_period: 7, oversold: 30, overbought: 70}。
+# reverse：{k_period: 15, d_period: 5, oversold: 50, overbought: 50}。
+# continue：{fast_period: 12, slow_period: 26, signal_period: 9, macd_extreme: 150}。
+# breakout：{lookback: 80, pivot_window: 3, min_touches: 2, tolerance_atr: 0.35,
+#            breakout_buffer_atr: 0.2, volume_ratio: 1.0}。
+# balance：{M: 5, N: 28, R: 20}。
+# signal.*输出字符串；📈/📉表示偏多/偏空，不设置output。
+#
+# actions与notification
+# actions：非空列表；type可选notify/limit/market，没有默认值。
+# notify.message：默认空字符串；发送时补充条件值及指标周期信息。
+# notification：默认省略，控制notify动作，需至少一个notify动作。
+# notification.mode：默认once；once首次满足后不再通知，on_enter每次重新进入时通知。
+# notification.cooldown_seconds：默认60秒，最小0；冷却内再次进入时跳过，不补发。
+# on_enter只重复通知；同一规则中的买卖动作和一次性触发状态在重启后仍保留。
+# 修改规则配置可重新激活。
+# limit/market.action（buy/sell）、quantity：必填；limit.price必填，market.price默认0。
+# cancel：默认省略；cancel.enabled默认false，启用后conditions必填。
+# ORDER_EVENT_LOG：默认order_events.jsonl；ORDER_STATE_FILE：默认order_state.json。
 
 orders:
-  # 示例 1: 收盘也可测试的复合条件。
-  # Futu 提供 snapshot/tick，SIM 收到订单后立即成交。
-  - id: futu_sim_time_price_smoke
-    enabled: false
-    description: "FUTU行情 + SIM订单: 时间窗口与价格区间测试"
-    symbol: "00700"
-    exchange: "HK"
-    data_gateway: "FUTU"
-    order_gateway: "SIM"
-    conditions:
-      logical_operator: "AND"
-      items:
-        - variable: "datetime"
-          operator: ">="
-          value: "2000-01-01 00:00:00 +0800"
-        - variable: "datetime"
-          operator: "<="
-          value: "2099-12-31 23:59:59 +0800"
-        - variable: "last_price"
-          operator: ">"
-          value: 0
-        - variable: "last_price"
-          operator: "<"
-          value: 999999
-    actions:
-      - type: "limit"
-        action: "buy"
-        quantity: 100
-        price: 0
-
-  # 示例 2: 嵌套复合条件。
-  # 等价于: 时间窗口成立 AND (价格突破上沿 OR 价格跌破下沿)。
-  - id: nested_or_price_band
-    enabled: false
-    description: "嵌套条件: 时间窗口 + 上破/下破"
-    symbol: "00700"
-    exchange: "HK"
-    data_gateway: "FUTU"
-    order_gateway: "SIM"
-    conditions:
-      operator: "AND"
-      conditions:
-        - variable: "datetime"
-          operator: ">="
-          value: "2000-01-01 00:00:00 +0800"
-        - variable: "datetime"
-          operator: "<="
-          value: "2099-12-31 23:59:59 +0800"
-        - operator: "OR"
-          conditions:
-            - variable: "last_price"
-              operator: ">"
-              value: 470
-            - variable: "last_price"
-              operator: "<"
-              value: 450
-    actions:
-      - type: "notify"
-        message: "触发价格区间条件"
-      - type: "limit"
-        action: "buy"
-        quantity: 100
-        price: 463.6
-
-  # 示例 3: Futu 行情触发，QMT 订单源下单。
-  # 使用前必须确认测试机已登录并连接迅投/miniQMT，QMT_ACCOUNT_ID 配置正确。
-  - id: futu_qmt_limit_order
-    enabled: false
-    description: "FUTU行情 + QMT订单: 限价买入示例"
-    symbol: "000001"
-    exchange: "SZ"
-    data_gateway: "FUTU"
-    order_gateway: "QMT"
-    conditions:
-      logical_operator: "AND"
-      items:
-        - variable: "datetime"
-          operator: ">="
-          value: "2000-01-01 00:00:00 +0800"
-        - variable: "last_price"
-          operator: ">="
-          value: 10.5
-    actions:
-      - type: "limit"
-        action: "buy"
-        quantity: 100
-        price: 10.5
-    cancel:
-      enabled: false
-      conditions:
-        logical_operator: "AND"
-        items:
-          - variable: "datetime"
-            operator: ">="
-            value: "2099-12-31 09:30:00 +0800"
-          - variable: "last_price"
-            operator: "<"
-            value: 10
-
-  # 示例 4: 复用 trends.py 的突破信号。
-  # 数据源、K线周期和缓存由 config.ini / get_kline_data 控制，不在订单YAML重复配置。
-  - id: futu_sim_breakout_signal
-    enabled: false
-    description: "FUTU行情 + trends.py signal.breakout"
-    symbol: "000001"
-    exchange: "SZ"
-    data_gateway: "FUTU"
-    order_gateway: "SIM"
-    conditions:
-      logical_operator: "AND"
-      items:
-        - variable: "signal.breakout"
-          operator: "contains"
-          value: "breakthrough"
-    actions:
-      - type: "notify"
-        message: "EMA突破信号触发"
+- id: hk_kdj_4h_j_once
+  enabled: false
+  symbol: '00700'
+  exchange: HK
+  data_gateway: FUTU
+  conditions:
+    variable: tools.KDJ
+    params: {N: 9, M1: 3, M2: 3}
+    output: J
+    timeframe: 4h
+    operator: '>='
+    value: 100
+  actions:
+  - {type: notify, message: 00700 4小时KDJ J>=100}
+- id: hk_rsi_1h_oversold
+  enabled: false
+  symbol: '00700'
+  exchange: HK
+  conditions:
+    variable: tools.RSI
+    params: {N: 14}
+    timeframe: 1h
+    operator: <=
+    value: 30
+  notification: {mode: on_enter, cooldown_seconds: 3600}
+  actions:
+  - {type: notify, message: 00700 1小时RSI超卖}
+- id: hk_rsi_3h_overbought
+  enabled: false
+  symbol: '00700'
+  exchange: HK
+  conditions:
+    variable: tools.RSI
+    params: {N: 7}
+    timeframe: 3h
+    operator: '>='
+    value: 80
+  notification: {mode: on_enter, cooldown_seconds: 1800}
+  actions:
+  - {type: notify, message: 00700 3小时RSI超买}
+- id: us_macd_1h_positive
+  enabled: false
+  symbol: AAPL
+  exchange: US
+  conditions:
+    variable: tools.MACD
+    params: {fast_period: 12, slow_period: 26, signal_period: 9}
+    output: HIST
+    timeframe: 1h
+    operator: '>'
+    value: 0
+  notification: {mode: on_enter, cooldown_seconds: 3600}
+  actions:
+  - {type: notify, message: AAPL 1小时MACD柱值为正}
+- id: cn_ma_2h
+  enabled: false
+  symbol: '600000'
+  exchange: SH
+  conditions:
+    variable: tools.MA
+    params: {N: 20}
+    timeframe: 2h
+    operator: '>='
+    value: 10
+  notification: {mode: on_enter}
+  actions:
+  - {type: notify, message: 600000 2小时MA>=10}
+- id: us_ema_rsi_combination
+  enabled: false
+  symbol: AAPL
+  exchange: US
+  conditions:
+    logical_operator: AND
+    items:
+    - variable: tools.EMA
+      params: {N: 20}
+      timeframe: 4h
+      operator: '>='
+      value: 200
+    - variable: tools.RSI
+      params: {N: 14}
+      timeframe: 1h
+      operator: <=
+      value: 30
+  notification: {mode: on_enter, cooldown_seconds: 3600}
+  actions:
+  - {type: notify, message: AAPL EMA与RSI组合满足}
+- id: hk_top_down_3h
+  enabled: false
+  symbol: '00700'
+  exchange: HK
+  conditions:
+    variable: signal.top_down
+    params: {rsi_period: 14, oversold: 20, overbought: 80}
+    timeframe: 3h
+    operator: contains
+    value: 📈
+  notification: {mode: on_enter, cooldown_seconds: 3600}
+  actions:
+  - {type: notify, message: 00700 RSI超卖侧信号}
+- id: hk_price_band_notice
+  enabled: false
+  symbol: '00700'
+  exchange: HK
+  data_gateway: FUTU
+  conditions:
+    logical_operator: OR
+    items:
+    - {variable: last_price, operator: '>=', value: 500}
+    - {variable: last_price, operator: <=, value: 400}
+  actions:
+  - {type: notify, message: 00700触发价格区间}
+- id: cn_rsi_limit_buy
+  enabled: false
+  symbol: '600000'
+  exchange: SH
+  data_gateway: FUTU
+  order_gateway: SIM
+  conditions:
+    logical_operator: AND
+    items:
+    - {variable: datetime, operator: '>=', value: '2026-10-09 09:30:00 +0800'}
+    - {variable: datetime, operator: <=, value: '2026-10-09 14:50:00 +0800'}
+    - variable: tools.RSI
+      params: {N: 14}
+      timeframe: 2h
+      operator: <=
+      value: 30
+  actions:
+  - {type: notify, message: 600000 RSI条件触发，提交限价买入}
+  - {type: limit, action: buy, quantity: 100, price: 10}
+  cancel:
+    enabled: true
+    conditions: {variable: datetime, operator: '>=', value: '2026-10-09 14:55:00 +0800'}
+- id: cn_sr_breakout
+  enabled: false
+  symbol: '000001'
+  exchange: SZ
+  data_gateway: FUTU
+  conditions: {variable: signal.breakout, operator: contains, value: breakout}
+  actions:
+  - {type: notify, message: 000001 SR突破信号触发}

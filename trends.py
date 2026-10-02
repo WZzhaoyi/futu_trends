@@ -95,7 +95,7 @@ def inside_MA(close, last_low, last_high): # 计算MA5,10,15中的最小值和�
     else:
         return True
 
-def is_reverse(df: pd.DataFrame, code: str, config: configparser.ConfigParser) -> str | None:
+def is_reverse(df: pd.DataFrame, code: str, config: configparser.ConfigParser, params: dict | None = None) -> str | None:
     """检查是否出现反转信号"""
     assert len(df) >= 90
     
@@ -108,7 +108,7 @@ def is_reverse(df: pd.DataFrame, code: str, config: configparser.ConfigParser) -
         print(f"No KD parameters found for {code}, using default parameters")
         data = default_stock_params('KD')
     
-    params = data['best_params']
+    params = {**default_stock_params('KD')['best_params'], **data['best_params'], **(params or {})}
     meta = data['meta_info']
     performance = data.get('performance', {})
             
@@ -136,7 +136,7 @@ def is_reverse(df: pd.DataFrame, code: str, config: configparser.ConfigParser) -
         msg += u'📉'
     return None if msg == '' else msg
 
-def is_continue(df:pd.DataFrame, code:str, config:configparser.ConfigParser)->str|None:# 检查macd趋势延续
+def is_continue(df:pd.DataFrame, code:str, config:configparser.ConfigParser, params: dict | None = None)->str|None:# 检查macd趋势延续
     assert len(df) >= 90
     
     # 从数据库读取参数
@@ -148,7 +148,7 @@ def is_continue(df:pd.DataFrame, code:str, config:configparser.ConfigParser)->st
         print(f"No MACD parameters found for {code}, using default parameters")
         data = default_stock_params('MACD')
     
-    params = data['best_params']
+    params = {**default_stock_params('MACD')['best_params'], **data['best_params'], **(params or {})}
     meta = data['meta_info']
     performance = data.get('performance', {})
             
@@ -176,7 +176,7 @@ def is_continue(df:pd.DataFrame, code:str, config:configparser.ConfigParser)->st
         msg += u'📉'
     return None if msg == '' else msg
 
-def is_breakout(df:pd.DataFrame, code:str, config:configparser.ConfigParser)->str|None:# 支撑阻力突破/跌破/触位确认
+def is_breakout(df:pd.DataFrame, code:str, config:configparser.ConfigParser, params: dict | None = None)->str|None:# 支撑阻力突破/跌破/触位确认
     assert len(df) >= 90
 
     db_path = config.get("CONFIG", "SR_PARAMS_DB", fallback=None)
@@ -185,7 +185,7 @@ def is_breakout(df:pd.DataFrame, code:str, config:configparser.ConfigParser)->st
         print(f"No SR parameters found for {code}, using default parameters")
         data = default_stock_params('SR')
 
-    params = data['best_params']
+    params = {**default_stock_params('SR')['best_params'], **data['best_params'], **(params or {})}
     if not params:
         print(f"No SR parameters found for {code}")
         return None
@@ -207,7 +207,7 @@ def is_breakout(df:pd.DataFrame, code:str, config:configparser.ConfigParser)->st
         messages.append(f"SR near{_format_sr_level(last_row, 'resistance')}📉")
     return ' | '.join(messages) if messages else None
 
-def is_top_down(df:pd.DataFrame, code:str, config:configparser.ConfigParser) -> str|None:# 顶部和底部
+def is_top_down(df:pd.DataFrame, code:str, config:configparser.ConfigParser, params: dict | None = None) -> str|None:# 顶部和底部
     assert len(df) >= 90
     # 从数据库读取参数
     db_path = config.get("CONFIG", "RSI_PARAMS_DB", fallback=None)
@@ -218,7 +218,7 @@ def is_top_down(df:pd.DataFrame, code:str, config:configparser.ConfigParser) -> 
         print(f"No RSI parameters found for {code}, using default parameters")
         data = default_stock_params('RSI')
     
-    params = data['best_params']
+    params = {**default_stock_params('RSI')['best_params'], **data['best_params'], **(params or {})}
     meta = data['meta_info']
     performance = data.get('performance', {})
             
