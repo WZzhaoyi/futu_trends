@@ -18,6 +18,7 @@ import configparser
 from futu_group import sync_futu_group
 from notification_engine import NotificationEngine
 from ft_config import get_config
+from trading_calendar import is_trading_day
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -41,6 +42,7 @@ EASTMONEY_CONCEPT_URLS = [
     "https://79.push2.eastmoney.com/api/qt/clist/get",
     "https://push2.eastmoney.com/api/qt/clist/get",
 ]
+
 
 # ================= 核心功能函数 =================
 
@@ -349,6 +351,13 @@ def select_futu_group(config, now=None):
     now = now or datetime.now()
     return groups[0] if now.hour < 12 else groups[1]
 
+def futu_connection(config):
+    """从配置读取 Futu OpenD 连接参数 (host, port)"""
+    return (
+        config.get("CONFIG", "FUTU_HOST"),
+        int(config.get("CONFIG", "FUTU_PORT")),
+    )
+
 def sync_ashare_concepts_to_futu_group(df, config):
     """将本次获得的A股标的同步到FUTU_GROUP目标分组"""
     if df.empty:
@@ -360,8 +369,7 @@ def sync_ashare_concepts_to_futu_group(df, config):
         print("[!] 未配置FUTU_GROUP，跳过同步futu group")
         return
 
-    host = config.get("CONFIG", "FUTU_HOST")
-    port = int(config.get("CONFIG", "FUTU_PORT"))
+    host, port = futu_connection(config)
     codes = [ashare_code_to_futu_code(code) for code in df['code'].tolist()]
     codes = [code for code in codes if code]
     if not codes:
@@ -462,10 +470,21 @@ def analyze_ashare_concepts(blacklist_file=None, top_n=TOP_N, min_amount=MIN_BID
     
     return df
     
-if __name__ == "__main__":
+def main():
+    """抓取并推送A股竞价主线概念；非A股交易日直接跳过：不抓数据、不同步分组、不推送"""
     config = get_config()
     blacklist_file = config.get("CONFIG", "CONCEPT_BLACKLIST_FILE", fallback=BLACKLIST_FILE)
-    
+
+    try:
+        trading_day = is_trading_day("CN", config=config)
+    except Exception as exc:
+        # 交易日历不可用时保持原有行为，避免交易日漏推
+        print(f"[!] A股交易日查询失败，按交易日继续执行: {exc}")
+        trading_day = True
+    if not trading_day:
+        print(f"[*] {datetime.now():%Y-%m-%d} 非A股交易日，跳过概念主线抓取与推送")
+        return 0
+
     now = datetime.now().strftime('%Y%m%d-%H:%M:%S')
 
     # 调用工具函数
@@ -499,3 +518,8 @@ if __name__ == "__main__":
     notification_engine.send_email("【金额排名详情】{}".format(now), msg)
     notification_engine.send_telegram_message(msg)
     notification_engine.send_webhook(msg)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -22,7 +22,12 @@ import futu as ft
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
-from tools import to_yfinance_code, futu_code_to_longbridge_code, futu_code_to_ib_contract
+from tools import (
+    futu_code_to_ib_contract,
+    futu_code_to_longbridge_code,
+    market_of_code,
+    to_yfinance_code,
+)
 import math
 import sys
 import threading
@@ -84,10 +89,6 @@ _state_cache = None
 _state_ts = 0
 _STATE_TTL = 300  # 5 分钟
 
-_MARKET_KEY_MAP = {
-    'SH': 'market_sh', 'SZ': 'market_sz',
-    'HK': 'market_hk', 'US': 'market_us',
-}
 _TRADING_STATES = {
     'MORNING', 'AFTERNOON', 'NIGHT', 'NIGHT_OPEN',
     'PRE_MARKET_BEGIN', 'AFTER_HOURS_BEGIN',
@@ -96,10 +97,10 @@ _TRADING_STATES = {
 
 def _is_trading(code, host, port):
     global _state_cache, _state_ts
-    market = code.split('.')[0].upper()
-    key = _MARKET_KEY_MAP.get(market)
-    if not key:
+    if market_of_code(code) is None:
         return True  # 未知市场无法查询交易状态，按盘中短缓存处理
+    # futu get_global_state 的字段名即 market_<交易所前缀>，沪/深各自独立取状态
+    key = f"market_{str(code).split('.', 1)[0].strip().lower()}"
 
     now = int(time_module.time())
     if (not _state_cache or now - _state_ts >= _STATE_TTL) and opend_alive(host, port):

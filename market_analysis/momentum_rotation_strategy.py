@@ -23,7 +23,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass, replace
-from datetime import date, datetime, time as datetime_time, timedelta
+from datetime import date, datetime, time as datetime_time
 from itertools import combinations
 from pathlib import Path
 from time import perf_counter
@@ -36,6 +36,7 @@ from live_runtime import (
     runtime_file_lock,
     write_json_atomic,
 )
+from trading_calendar import is_trading_day, latest_closed_date, now_in
 
 import pandas as pd
 
@@ -62,8 +63,6 @@ def calculate_momentum_score(data: np.ndarray) -> float:
 LIVE_STRATEGY = "momentum-rotation"
 LIVE_VERSION = "momentum-rotation-live-v8"
 LIVE_SCHEMA_VERSION = 3
-US_MARKET_TIMEZONE = ZoneInfo("America/New_York")
-CN_MARKET_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 DEFAULT_MODE = "backtest"
 DEFAULT_START = "2016-06-12"
@@ -119,16 +118,8 @@ LIVE_LEGS: tuple[LiveLeg, ...] = (
 )
 
 MARKET_SPECS: dict[str, dict[str, Any]] = {
-    "US": {
-        "timezone": US_MARKET_TIMEZONE,
-        "notification_time": datetime_time(16, 10),
-        "trading_symbol": "US.QQQ",
-    },
-    "CN": {
-        "timezone": CN_MARKET_TIMEZONE,
-        "notification_time": datetime_time(15, 10),
-        "trading_symbol": "SZ.159941",
-    },
+    "US": {"notification_time": datetime_time(16, 10)},
+    "CN": {"notification_time": datetime_time(15, 10)},
 }
 
 DEFAULT_BACKTEST_SYMBOLS = list(LIVE_LEGS[0].symbols)
@@ -1317,22 +1308,6 @@ def subscribe_live_klines(
         raise RuntimeError(f"Futu 日K订阅失败: {data}")
 
 
-def is_live_trading_day(
-    context: Any,
-    symbol: str,
-    trading_date: str,
-    ret_ok: Any,
-) -> bool:
-    ret, days = context.request_trading_days(
-        start=trading_date,
-        end=trading_date,
-        code=symbol,
-    )
-    if ret != ret_ok:
-        raise RuntimeError(f"Futu 交易日查询失败: {days}")
-    return any(str(day.get("time", ""))[:10] == trading_date for day in days)
-
-
 def fetch_live_market_data(
     context: Any,
     pairs: list[tuple[str, int]],
@@ -1452,8 +1427,7 @@ def run_live(args: argparse.Namespace) -> int:
         for market in markets:
             runtime = runtimes[market]
             spec = MARKET_SPECS[market]
-            market_timezone = spec["timezone"]
-            now = datetime.now(market_timezone)
+            now = now_in(market)
             today = now.date().isoformat()
             market_legs = tuple(legs_by_market[market])
             state = None
@@ -1463,9 +1437,7 @@ def run_live(args: argparse.Namespace) -> int:
                     if context is None:
                         context = OpenQuoteContext(host=host, port=port)
                         subscribed_markets.clear()
-                    if not is_live_trading_day(
-                        context, spec["trading_symbol"], today, RET_OK
-                    ):
+                    if not is_trading_day(market, today, context=context):
                         event = {
                             "type": "IDLE",
                             "strategy": LIVE_STRATEGY,
@@ -1493,10 +1465,10 @@ def run_live(args: argparse.Namespace) -> int:
                         RET_OK,
                         SubType,
                         AuType,
-                        (
-                            now.date()
-                            if now.time() >= spec["notification_time"]
-                            else now.date() - timedelta(days=1)
+                        latest_closed_date(
+                            market,
+                            spec["notification_time"],
+                            now,
                         ),
                     )
                     bar_dates = {
@@ -1568,7 +1540,7 @@ def run_live(args: argparse.Namespace) -> int:
                             "notification_time": spec[
                                 "notification_time"
                             ].strftime("%H:%M"),
-                            "timezone": str(market_timezone),
+                            "timezone": str(now.tzinfo),
                             "action": action,
                             "previous_symbol": lst["selected_symbol"],
                             "selected_symbol": selected_symbol,

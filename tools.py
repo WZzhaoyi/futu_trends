@@ -273,6 +273,17 @@ def code_in_futu_group(group_name:str, host='127.0.0.1', port=11111):
         print('error:', data)
         return None
 
+CODE_MARKETS: dict[str, str] = {"SH": "CN", "SZ": "CN", "HK": "HK", "US": "US"}
+
+def market_of_code(code: str) -> str | None:
+    """
+    由 futu 标的代码前缀判断所属市场（SH./SZ. -> CN，HK. -> HK，US. -> US）
+
+    非标的行（如报告中 0 轴分隔行）或未知前缀返回 None；
+    市场取值与 market_analysis/trading_calendar.py 的 MARKETS 一致。
+    """
+    return CODE_MARKETS.get(str(code).split(".", 1)[0].strip().upper())
+
 def convert_to_Nhour(df: pd.DataFrame,hour:2|4=4) -> pd.DataFrame:
     """
     将 60m 数据转换为 2h/4h 数据

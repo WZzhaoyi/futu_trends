@@ -29,6 +29,8 @@ momentum = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = momentum
 SPEC.loader.exec_module(momentum)
 
+import trading_calendar
+
 
 def market_legs(market: str):
     return tuple(leg for leg in momentum.LIVE_LEGS if leg.market == market)
@@ -67,6 +69,21 @@ class LiveConfigurationTest(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "DATA_SOURCE"):
                 momentum.resolve_live_connection(str(path), ["US.QQQ"])
+
+    def test_every_live_leg_market_resolves_to_its_own_calendar(self):
+        """加新市场的腿时，必须先有该市场的日历与通知配置，否则测试直接失败"""
+        markets = {leg.market for leg in momentum.LIVE_LEGS}
+
+        self.assertEqual(
+            markets - set(trading_calendar.MARKETS),
+            set(),
+            "缺少交易日历配置的市场",
+        )
+        self.assertEqual(
+            markets - set(momentum.MARKET_SPECS),
+            set(),
+            "缺少通知配置的市场",
+        )
 
 
 class LiveSignalTest(unittest.TestCase):
@@ -295,6 +312,7 @@ class FakeQuoteContext:
         self.host = host
         self.port = port
         self.subscriptions = []
+        self.calendar_requests = []
         self.closed = False
         self.__class__.instances.append(self)
 
@@ -303,6 +321,8 @@ class FakeQuoteContext:
         return 0, "ok"
 
     def request_trading_days(self, start, end, code):
+        # code 就是所问市场的日历锚点：用来断言调用方设对了市场
+        self.calendar_requests.append((start, end, code))
         return 0, [{"time": start, "trade_date_type": "WHOLE"}]
 
     def get_market_snapshot(self, symbols):
@@ -429,6 +449,14 @@ class HolidayQuoteContext(FakeQuoteContext):
 
 
 class LiveEndToEndTest(unittest.TestCase):
+    def setUp(self):
+        # 交易日历缓存改写到临时目录：假行情网关的结论不能落进仓库 data/calendar
+        cache = tempfile.TemporaryDirectory()
+        self.addCleanup(cache.cleanup)
+        patcher = patch.object(trading_calendar, "CACHE_DIR", Path(cache.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_evaluates_all_four_legs_independently(self):
         fake_futu = types.ModuleType("futu")
         fake_futu.AuType = types.SimpleNamespace(QFQ="QFQ")
@@ -511,6 +539,11 @@ class LiveEndToEndTest(unittest.TestCase):
         self.assertEqual(states["US"].last_snapshot["type"], "SIGNAL")
         self.assertEqual(states["CN"].last_snapshot["type"], "SIGNAL")
         self.assertEqual(len(context.subscriptions), 2)
+        # 每个市场都问自己的日历锚点：美股问 US.QQQ，A股问 SH.000001
+        self.assertEqual(
+            [request[2] for request in context.calendar_requests],
+            ["US.QQQ", "SH.000001"],
+        )
         self.assertEqual(
             set(context.subscriptions[0][0]),
             {"US.QQQ", "US.SPY", "US.FXI", "US.GLD", "US.UUP"},
@@ -689,6 +722,11 @@ class LiveEndToEndTest(unittest.TestCase):
         self.assertEqual(
             {event["leg"] for event in notifier.events},
             {"CN-A", "CN-B"},
+        )
+        # 只跑 CN 时不问美股日历
+        self.assertEqual(
+            [request[2] for request in context.calendar_requests],
+            ["SH.000001"],
         )
         self.assertEqual(len(context.subscriptions), 1)
         self.assertFalse(us_state_exists)

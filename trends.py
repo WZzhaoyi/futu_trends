@@ -4,6 +4,7 @@ import os
 
 import re as _re
 from ft_config import get_config
+from market_analysis import trading_calendar
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 from data import get_kline_data
@@ -15,7 +16,13 @@ import time
 from notification_engine import NotificationEngine
 from decimal import Decimal, ROUND_HALF_UP
 import pandas as pd
-from tools import MA, calc_momentum, calc_returns_score, code_in_futu_group
+from tools import (
+    MA,
+    calc_momentum,
+    calc_returns_score,
+    code_in_futu_group,
+    market_of_code,
+)
 
 PARAMS_CACHE_TTL_SECONDS = 6 * 60 * 60
 _params_cache = {}
@@ -394,8 +401,55 @@ def check_trends(code_in_group: pd.DataFrame, config: configparser.ConfigParser)
     else:
         return pd.DataFrame(columns=pd.Index(['futu_code', 'name', 'msg', 'momentum', 'high', 'low']))
 
-if __name__ == "__main__":
+def market_report_rows(
+    trends_df: pd.DataFrame,
+    closed_markets: set[str],
+) -> tuple[pd.DataFrame, set[str]]:
+    """剔除当日休市市场的标的行，返回 (报告用的 df, 实际剔除的市场集合)。
+
+    只剔除「已声明且今天休市」的市场：识别不出市场的行（0轴分隔行等）、
+    以及配置里没声明的市场一律保留，避免配置与分组不一致时悄悄丢数据。
+    当期快照仍按全量 df 保存，rank_rotation 的对比不受影响。
+    """
+    kept = []
+    skipped: set[str] = set()
+    for code in trends_df.index:
+        market = market_of_code(code)
+        if market is not None and market in closed_markets:
+            skipped.add(market)
+        else:
+            kept.append(code)
+    return trends_df.loc[kept], skipped
+
+
+def main() -> int:
+    """A股/美股/港股信号报告：非交易日（按各市场当地日期）跳过，不抓数据、不推送"""
     config = get_config()
+
+    # 交易日闸门：所属市场来自 CONFIG/MARKET（必须显式声明，本仓库不设兜底默认值）；
+    # 多市场配置（如 A股+港股混合组）只要有一个市场开市就照常出报告
+    markets = trading_calendar.markets_from_config(config)
+    if not trading_calendar.trading_day_gate_enabled(config):
+        # 闸门被显式关闭：不做交易日判断，也不按市场剔行
+        print("[*] 已关闭交易日闸门，照常出报告")
+        open_markets = markets
+    else:
+        try:
+            open_markets = tuple(
+                market for market in markets
+                if trading_calendar.is_trading_day(market, config=config)
+            )
+        except Exception as exc:
+            # 交易日历不可用时保持原有行为，避免交易日漏推
+            print(f"[!] {'/'.join(markets)} 交易日查询失败，按交易日继续: {exc}")
+            open_markets = markets
+        if not open_markets:
+            print(
+                f"[*] {trading_calendar.today_in(markets[0])} "
+                f"{'/'.join(markets)} 非交易日，跳过信号计算与推送"
+            )
+            return 0
+
     host = config.get("CONFIG", "FUTU_HOST")
     port = int(config.get("CONFIG", "FUTU_PORT"))
     group = config.get("CONFIG", "FUTU_GROUP", fallback='')
@@ -416,20 +470,31 @@ if __name__ == "__main__":
 
     if code_pd.empty:
         print('warning: no code in config')
-        exit()
+        return 0
 
     assert isinstance(code_pd, pd.DataFrame), "code_pd must be a DataFrame"
     trends_df = check_trends(code_pd,config)
     if trends_df.empty:
         print('warning: no trends data')
-        exit()
+        return 0
     # 保存当期快照
     from rank_rotation import save_snapshot, SNAPSHOT_DIR
     _snapshot_dir = config.get('CONFIG', 'SNAPSHOT_DIR', fallback=SNAPSHOT_DIR)
     save_snapshot(trends_df, group or 'default', push_type, _snapshot_dir)
 
+    # 当日休市的市场不进报告：混合分组里 A股休市就只推港股那几个标的
+    closed_markets = set(markets) - set(open_markets)
+    report_df, skipped_markets = market_report_rows(trends_df, closed_markets)
+    if not any(market_of_code(code) is not None for code in report_df.index):
+        print(f"[*] {'/'.join(sorted(skipped_markets))} 今日休市，没有可报的标的，跳过推送")
+        return 0
+
     header = '名称 | 信号 | 动量 | 1D% | 20D% | 60D%'
-    raw_msg = '{} {} {}:\n{}\n{}'.format(datetime.datetime.now().strftime('%Y-%m-%d'), group if group else '', push_type, header, '\n'.join(trends_df['msg']))
+    notice = f'休市跳过: {"/".join(sorted(skipped_markets))}' if skipped_markets else ''
+    raw_msg = '{} {} {}:\n{}{}\n{}'.format(
+        datetime.datetime.now().strftime('%Y-%m-%d'), group if group else '', push_type,
+        (notice + '\n') if notice else '', header, '\n'.join(report_df['msg']),
+    )
 
     # 全量消息仅用于 Telegram 和邮件（去除到价区间 [low,high]）
     raw_msg_clean = _re.sub(r'\[\d+\.?\d*,\d+\.?\d*\]', '', raw_msg)
@@ -440,9 +505,9 @@ if __name__ == "__main__":
 
     _futu_keywords = [k.strip() for k in _futu_kw_str.split(',') if k.strip()]
     if _futu_keywords:
-        filter_df = trends_df[trends_df['msg'].apply(lambda msg: any(kw in msg for kw in _futu_keywords))]
+        filter_df = report_df[report_df['msg'].apply(lambda msg: any(kw in msg for kw in _futu_keywords))]
     else:
-        filter_df = trends_df.iloc[0:0]
+        filter_df = report_df.iloc[0:0]
 
     if len(filter_df) > 0:
         # futu分组/到价提醒
@@ -456,3 +521,8 @@ if __name__ == "__main__":
         notification.send_google_sheet_message(filter_msg)
         # feishu sheet
         notification.send_feishu_sheet_message(filter_msg)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

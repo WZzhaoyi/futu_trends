@@ -20,6 +20,25 @@ class FakeQuoteContext:
         self.closed = True
 
 
+class MarketOfCodeTest(unittest.TestCase):
+    def test_code_prefix_maps_to_market(self):
+        for code, market in (
+            ("SH.510300", "CN"),
+            ("SZ.159941", "CN"),
+            ("HK.00700", "HK"),
+            ("US.QQQ", "US"),
+            ("us.btc-usd", "US"),
+            ("  hk.00700  ", "HK"),
+        ):
+            with self.subTest(code=code):
+                self.assertEqual(tools.market_of_code(code), market)
+
+    def test_rows_without_a_market_return_none(self):
+        for code in ("ZERO_AXIS", "XX.123", "", None):
+            with self.subTest(code=code):
+                self.assertIsNone(tools.market_of_code(code))
+
+
 class GetConstituentsTest(unittest.TestCase):
     def test_resolves_alias_and_reuses_context(self):
         context = FakeQuoteContext(
