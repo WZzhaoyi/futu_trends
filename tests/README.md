@@ -20,6 +20,14 @@ FUTU_TEST_ARTIFACT_DIR=/tmp/futu-tests-final \
 
 检查命令退出码和日志末尾的 `OK`。`momentum-daily.csv`、`momentum-trades.json` 来自合成行情的真实网格/回测计算，可核对只建仓一次的成交记录。它们不代表连接券商的实盘 E2E；外部行情、下单及通知仍由测试替身隔离。
 
+测试绝不允许真的发出通知。想验证这一点（或在改过通知/下单代码后复查），用网络闸门再跑一遍：
+
+```sh
+conda run --no-capture-output -n futu_trends python -m tests.offline_guard
+```
+
+它把 socket 层非本地连接全部拦掉并计数，任何直连 webhook/Telegram/邮件的用例都会当场失败，而不是把消息发出去。当前基线：153 个用例通过，拦截记录只有 1 条 —— `xtquant` 导入时的 pypi.org 版本检查（第三方行为，与通知无关）。单用例里也可以 `with offline() as blocked:` 包住，断言 `blocked == []`。
+
 本次保留的关键故障判据：
 
 - 零价会命中止损条件但必须被忽略；有效价格仍能触发。等待 tick 处理完成，重启前停止旧实例并确认状态落盘。
