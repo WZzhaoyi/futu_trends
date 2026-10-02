@@ -172,6 +172,17 @@ class ConditionEngineTestCase(unittest.TestCase):
         with open(self.state_path, encoding="utf-8") as f:
             return json.load(f)
 
+    def read_event_kinds(self):
+        """审计日志里的事件类型；正在写入的不完整行直接跳过"""
+        kinds = []
+        with open(self.events_path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    kinds.append(json.loads(line)["kind"])
+                except (json.JSONDecodeError, KeyError):
+                    continue
+        return kinds
+
 
 class TestTriggerLifecycle(ConditionEngineTestCase):
 
@@ -192,12 +203,18 @@ class TestTriggerLifecycle(ConditionEngineTestCase):
         state = self.read_state()
         self.assertIn("t1", state["triggered"])
         # SIM立即全成 → 终态归档: 内存释放、terminal_orders落盘
+        # 归档是先清内存再写状态文件，落盘要单独等，不能拿到内存释放就断言文件
         self.assertTrue(self.wait_until(lambda: not engine.managed_orders))
         self.assertFalse(engine.order_snapshots)
-        self.assertEqual(len(self.read_state()["terminal_orders"]), 1)
-        # 审计日志有订单与成交记录
-        with open(self.events_path, encoding="utf-8") as f:
-            kinds = [json.loads(line)["kind"] for line in f]
+        self.assertTrue(
+            self.wait_until(lambda: len(self.read_state()["terminal_orders"]) == 1)
+        )
+        # 审计日志有订单与成交记录；成交事件排在归档事件之后处理，同样要等它落盘
+        self.assertTrue(
+            self.wait_until(lambda: "trade" in self.read_event_kinds()),
+            "成交记录未写入审计日志",
+        )
+        kinds = self.read_event_kinds()
         self.assertIn("order", kinds)
         self.assertIn("trade", kinds)
 
