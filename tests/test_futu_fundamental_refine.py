@@ -289,7 +289,7 @@ class FutuFundamentalRefineTest(unittest.TestCase):
 
         expected_statements = {
             sepa_screener: [],
-            pr_screener: [],
+            pr_screener: [1, 2],
             growth_value_screener: [1, 2, 3],
             deep_value_screener: [1, 2],
         }
@@ -315,9 +315,53 @@ class FutuFundamentalRefineTest(unittest.TestCase):
                 if strategy in (growth_value_screener, deep_value_screener):
                     self.assertTrue(candidate["l2"]["ok"])
                     self.assertTrue(passes(candidate))
+                elif strategy is pr_screener:
+                    self.assertIn("l2", candidate)
+                    self.assertIsNotNone(passes)
                 else:
                     self.assertNotIn("l2", candidate)
                     self.assertIsNone(passes)
+
+    def test_pr_l2_requires_three_annual_reports_above_the_floor(self):
+        """近 3 期年报 ROE 每一年都要 ≥ 8%；历史不足 3 期一律剔除。"""
+
+        def history(*roes):
+            """净资产恒为 100、净利润 = 当年 ROE 的年报序列（family 5 字段族）。"""
+            periods = [
+                (f"{2025 - i}-12-31", 7, f"{2025 - i}/FY", {5045: roe})
+                for i, roe in enumerate(roes)
+            ]
+            return fs.FutuFinancials({
+                "income": fs._parse_financial_reports(
+                    "income", statement_data(periods),
+                ),
+                "balance": fs._parse_financial_reports(
+                    "balance",
+                    statement_data([(d, t, p, {5109: 100}) for d, t, p, _ in periods]),
+                ),
+            })
+
+        cases = {
+            (20.0, 18.0, 15.0): True,
+            (20.0, 18.0, 8.0): True,      # 卡在门槛上算通过
+            (20.0, 18.0, 7.9): False,     # 最近一期低于门槛
+            (20.0, -3.0, 15.0): False,    # 中间一年亏损
+            (20.0, 18.0): False,          # 年报不足 3 期
+        }
+        for roes, expected in cases.items():
+            with self.subTest(roes=roes):
+                candidate = {"code": "HK.TEST", "l2": pr_screener.refine_futu(
+                    {"code": "HK.TEST"}, history(*roes),
+                )}
+
+                self.assertTrue(candidate["l2"]["ok"])
+                self.assertEqual(pr_screener.l2_passes(candidate), expected)
+
+    def test_pr_l2_rejects_candidates_without_annual_reports(self):
+        candidate = {"code": "HK.TEST", "l2": {"ok": False, "note": "no annual"}}
+
+        self.assertEqual(pr_screener.l2_reject_reason(candidate), "l2_unavailable")
+        self.assertFalse(pr_screener.l2_passes(candidate))
 
     def test_growth_value_l2_enforces_p_over_fcf_ceiling(self):
         """P/FCF ≤ 11 是硬门槛，且边界要卡在 11 上（含等于）。
@@ -530,6 +574,99 @@ class FutuFundamentalRefineTest(unittest.TestCase):
         """增速下限统一用 POSITIVE_MIN：百分比口径上 0.01 即 0.01%，仍是桶底。"""
         self.assertEqual(growth_value_screener.REV_GROWTH_MIN, fs.POSITIVE_MIN)
         self.assertEqual(growth_value_screener.PROFIT_GROWTH_MIN, fs.POSITIVE_MIN)
+
+    def test_pr_metric_is_derived_from_pe_and_annual_roe(self):
+        """PR = PE_TTM ÷ ROE%，四个策略共用同一处定义，值可直接横向比较。"""
+        self.assertEqual(
+            fs.derive_pr({"pe_ttm": 10.0, "return_on_equity_rate": 25.0}), 0.4,
+        )
+        for broken in (
+            {"pe_ttm": None, "return_on_equity_rate": 25.0},
+            {"pe_ttm": 10.0, "return_on_equity_rate": None},
+            {"pe_ttm": 10.0, "return_on_equity_rate": 0.0},
+            {"pe_ttm": -1.0, "return_on_equity_rate": 25.0},
+        ):
+            with self.subTest(candidate=broken):
+                self.assertIsNone(fs.derive_pr(broken))
+
+    def test_every_strategy_returns_the_fields_pr_needs(self):
+        """每个策略的 filter_list 都要含 PE_TTM 与 ROE，PR 才每行都算得出。"""
+        for strategy in (pr_screener, growth_value_screener, deep_value_screener,
+                         sepa_screener):
+            with self.subTest(strategy=strategy.NAME):
+                fields = {getattr(item, "stock_field", None)
+                          for item in strategy.build_filters("A", fs.ft)}
+                self.assertIn(fs.ft.StockField.PE_TTM, fields)
+                self.assertIn(fs.ft.StockField.RETURN_ON_EQUITY_RATE, fields)
+
+    def test_pr_only_fields_are_requested_without_filtering(self):
+        """为展示 PR 而补的字段必须 is_no_filter 且不带区间，否则会改变候选集。"""
+        placeholders = {
+            deep_value_screener: (fs.ft.StockField.RETURN_ON_EQUITY_RATE,),
+            sepa_screener: (fs.ft.StockField.PE_TTM,
+                            fs.ft.StockField.RETURN_ON_EQUITY_RATE),
+        }
+        for strategy, expected in placeholders.items():
+            with self.subTest(strategy=strategy.NAME):
+                actual = [item for item in strategy.build_filters("A", fs.ft)
+                          if getattr(item, "stock_field", None) in expected]
+                self.assertEqual(len(actual), len(expected))
+                for item in actual:
+                    self.assertTrue(item.is_no_filter)
+                    self.assertIsNone(item.filter_min)
+                    self.assertIsNone(item.filter_max)
+
+    def test_candidate_row_exposes_pr_alongside_pe_and_pb(self):
+        """展示口径：candidate 里直接带 pr，前端与 PE/PB 一样拿去排序。"""
+        row = types.SimpleNamespace(
+            stock_code="HK.TEST", stock_name="Test", pe_ttm=12.0,
+        )
+        row.__dict__[("return_on_equity_rate", "annual")] = 30.0
+        row.__dict__[("equity_multiplier", "annual")] = 2.0
+
+        candidate = fs._candidate_from_filter_row(row, "HK")
+        self.assertEqual(candidate["pr"], 0.4)
+        # 判据与展示同源
+        self.assertEqual(pr_screener.candidate_from_filter_row(row, "HK")["pr"], 0.4)
+
+    def test_daily_average_filter_converts_to_the_accumulate_window(self):
+        """日均 → 累计的换算只能发生在这一个 helper 里。"""
+        f = fs.daily_average_filter(fs.ft.StockField.TURNOVER, 35e6, days=20)
+
+        self.assertIsInstance(f, fs.ft.AccumulateFilter)
+        self.assertEqual(f.days, 20)
+        self.assertEqual(f.filter_min, 7e8)
+        self.assertFalse(f.is_no_filter)
+
+    def test_daily_turnover_thresholds_convert_to_the_accumulate_window(self):
+        """按日均口径写阈值的策略，下发时都要乘上窗口天数。"""
+        expectations = {
+            pr_screener: {"US": 100e6, "HK": 35e6, "A": 100e6},
+            sepa_screener: {"US": 50e6, "HK": 35e6, "A": 50e6},
+        }
+        for strategy, daily_min in expectations.items():
+            with self.subTest(strategy=strategy.NAME):
+                self.assertEqual(strategy.TURNOVER_DAILY_MIN, daily_min)
+                for market, daily in daily_min.items():
+                    turnover = next(
+                        item for item in strategy.build_filters(market, fs.ft)
+                        if getattr(item, "stock_field", None) == fs.ft.StockField.TURNOVER
+                    )
+                    self.assertEqual(turnover.days, strategy.TURNOVER_WINDOW_DAYS)
+                    self.assertEqual(
+                        turnover.filter_min, daily * strategy.TURNOVER_WINDOW_DAYS,
+                    )
+
+    def test_remaining_strategies_keep_their_cumulative_turnover_thresholds(self):
+        """growth_value / deep_value 的门槛仍是累计值，原样下发（不是日均）。"""
+        for strategy in (growth_value_screener, deep_value_screener):
+            with self.subTest(strategy=strategy.NAME):
+                turnover = next(
+                    item for item in strategy.build_filters("HK", fs.ft)
+                    if getattr(item, "stock_field", None) == fs.ft.StockField.TURNOVER
+                )
+                self.assertEqual(turnover.filter_min, strategy.TURNOVER_MIN["HK"])
+                self.assertEqual(turnover.days, strategy.TURNOVER_WINDOW_DAYS)
 
     def test_financial_api_failure_is_not_retried(self):
         class FakeContext:

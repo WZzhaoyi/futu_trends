@@ -23,7 +23,7 @@ DESCRIPTION = "Deep-value fundamental screener"
 FUTU_L2_STATEMENT_TYPES = ("income", "balance")
 
 MARKET_CAP_MIN = 1e9
-TURNOVER_AVG_DAYS = 20
+TURNOVER_WINDOW_DAYS = 20
 TURNOVER_MIN = {"US": 50e6, "HK": 5e6, "A": 50e6}
 PE_MIN = POSITIVE_MIN
 PE_MAX = 13.0
@@ -41,10 +41,11 @@ def build_filters(market: str, ft):
     return [
         simple_filter(sf.MARKET_VAL, MARKET_CAP_MIN),
         accumulate_filter(
-            sf.TURNOVER, TURNOVER_MIN[market], days=TURNOVER_AVG_DAYS,
+            sf.TURNOVER, TURNOVER_MIN[market], days=TURNOVER_WINDOW_DAYS,
         ),
         simple_filter(sf.PE_TTM, PE_MIN, PE_MAX),
         simple_filter(sf.PB_RATE, POSITIVE_MIN, PB_MAX, sort=ft.SortDir.ASCEND),
+        financial_filter(sf.RETURN_ON_EQUITY_RATE, quarter=q, is_no_filter=True),
         financial_filter(sf.NET_PROFIT, POSITIVE_MIN, quarter=q),
         financial_filter(sf.CASH_AND_CASH_EQUIVALENTS, CASH_MIN, quarter=q),
         financial_filter(sf.DEBT_ASSET_RATE, max_=DEBT_ASSET_MAX, quarter=q),
