@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import configparser
+import io
 import types
 import unittest
+from datetime import date, timedelta
 from unittest import mock
 
 from fundamental_analysis import deep_value_screener
@@ -748,6 +750,100 @@ class FutuFundamentalRefineTest(unittest.TestCase):
         self.assertFalse(result["l2_filtered"])
         self.assertEqual(result["returned"], 2)
         self.assertEqual(result["candidates"], candidates)
+
+    def test_new_listing_threshold_is_uniform_across_strategies(self):
+        """四策略三市场共用 runner 里的一年默认值，不必各自重复声明。"""
+        for strategy in (pr_screener, sepa_screener, growth_value_screener,
+                         deep_value_screener):
+            with self.subTest(strategy=strategy.NAME):
+                self.assertFalse(hasattr(strategy, "MIN_LISTING_DAYS"))
+                self.assertEqual(fs.strategy_min_listing_days(strategy), 365)
+        self.assertEqual(
+            fs.strategy_min_listing_days(types.SimpleNamespace(MIN_LISTING_DAYS=0)), 0,
+        )
+
+    def test_new_listing_drop_counts_calendar_days_and_keeps_unknown_dates(self):
+        as_of = date(2026, 10, 12)
+        listing = {
+            "HK.FRESH": "2026-10-01",
+            "HK.EDGE": "2025-10-12",  # 恰好满 365 天，不剔
+            "HK.OLD": "2015-01-01",
+        }
+        candidates = [{"code": code} for code in
+                      ("HK.FRESH", "HK.EDGE", "HK.OLD", "HK.NODATE")]
+
+        kept, counts = fs.drop_ineligible(candidates, "HK", listing, {}, 365, as_of)
+
+        self.assertEqual([c["code"] for c in kept], ["HK.EDGE", "HK.OLD", "HK.NODATE"])
+        self.assertEqual(counts["new_listing"], 1)
+        self.assertEqual(counts["unknown_listing_date"], 1)
+        self.assertEqual(counts["otc"], 0)
+
+    def test_us_otc_is_dropped_after_new_listing_filter_is_turned_off(self):
+        as_of = date(2026, 10, 12)
+        exchange = {"US.OK": "US_NASDAQ", "US.PINK": "US_OTC"}
+        listing = {"US.OK": "2010-01-01", "US.PINK": "2010-01-01"}
+
+        kept, counts = fs.drop_ineligible(
+            [{"code": "US.OK"}, {"code": "US.PINK"}], "US", listing, exchange, 0, as_of,
+        )
+
+        self.assertEqual([c["code"] for c in kept], ["US.OK"])
+        self.assertEqual(counts["otc"], 1)
+        self.assertEqual(counts["new_listing"], 0)
+
+    def test_run_l1_drops_new_listings_before_snapshot(self):
+        as_of = date.today()
+        fresh, old = (as_of - timedelta(days=10)), (as_of - timedelta(days=4000))
+
+        class FakeContext:
+            def __init__(self):
+                self.basicinfo = 0
+
+            def get_stock_filter(self, market, filter_list, begin, num):
+                rows = [types.SimpleNamespace(stock_code="HK.FRESH", stock_name="fresh"),
+                        types.SimpleNamespace(stock_code="HK.OLD", stock_name="old")]
+                return fs.ft.RET_OK, (True, len(rows), rows)
+
+            def get_stock_basicinfo(self, market, stock_type):
+                self.basicinfo += 1
+                return fs.ft.RET_OK, {
+                    "code": ["HK.FRESH", "HK.OLD"],
+                    "listing_date": [fresh.isoformat(), old.isoformat()],
+                    "exchange_type": ["HK_MAIN", "HK_MAIN"],
+                }
+
+            def close(self):
+                pass
+
+        strategy = types.SimpleNamespace(NAME="test", build_filters=lambda market, ft: [])
+        ctx = FakeContext()
+        stats = {}
+        config = configparser.ConfigParser()
+        config["CONFIG"] = {"FUTU_HOST": "127.0.0.1", "FUTU_PORT": "11111"}
+
+        with mock.patch.object(fs.ft, "OpenQuoteContext", return_value=ctx), \
+                mock.patch.object(fs.sys, "stderr", io.StringIO()) as stderr:
+            kept = fs.run_l1(strategy, "HK", config, drop_stats=stats)
+
+        self.assertEqual([c["code"] for c in kept], ["HK.OLD"])
+        self.assertEqual(ctx.basicinfo, 1)
+        self.assertEqual(stats["new_listing"], 1)
+        self.assertIn("dropped 1 candidates listed < 365 days", stderr.getvalue())
+
+    def test_screen_reports_new_listing_drops(self):
+        def fake_run_l1(strategy, market, config, min_listing_days=None, drop_stats=None):
+            drop_stats.update({"new_listing": 2, "otc": 0, "unknown_listing_date": 0})
+            return [{"code": "HK.KEPT"}]
+
+        with mock.patch.object(fs, "run_l1", side_effect=fake_run_l1):
+            result = fs.screen(types.SimpleNamespace(NAME="test"), "HK",
+                               configparser.ConfigParser(), snapshot=False)
+
+        self.assertEqual(result["min_listing_days"], 365)
+        self.assertEqual(result["filtered_new_listing"], 2)
+        self.assertEqual(result["l1_count"], 1)
+        self.assertEqual([c["code"] for c in result["candidates"]], ["HK.KEPT"])
 
 
 if __name__ == "__main__":

@@ -192,6 +192,7 @@ def cmd_screen(args, config) -> dict:
         strategy, args.market, config,
         snapshot=not args.no_snapshot,
         refine=args.refine,
+        min_listing_days=args.min_listing_days,
     )
 
 
@@ -501,6 +502,10 @@ def _build_parser() -> argparse.ArgumentParser:
     ps.add_argument(
         "--refine", action="store_true",
         help="运行策略显式声明的 Futu F10 L2 精算",
+    )
+    ps.add_argument(
+        "--min-listing-days", type=int, default=None,
+        help=f"剔除上市不足 N 个自然日的标的，0 关闭（默认 {fs.MIN_LISTING_DAYS}）",
     )
     ps.set_defaults(func=cmd_screen)
 

@@ -161,6 +161,7 @@ screen --market US|HK|A [--strategy sepa|pr|growth_value|deep_value] [--refine]
 ```
 - `--strategy`：默认 `sepa`；也可选 `pr`、`growth_value`、`deep_value`。
 - `--no-snapshot`：只跑 `get_stock_filter`，不做 snapshot 富集/排序。
+- `--min-listing-days`：剔除上市不足 N 个自然日的标的（默认 365，0 关闭）。Futu 选股字段里没有任何日期类字段，这个条件下发不了服务端，只能在 L1 结果上按 `get_stock_basicinfo` 的 `listing_date` 剔除（A 股该接口不跨交易所，需 SH+SZ 两次合并）；`listing_date` 缺失的放行并计数，不静默误杀。美股顺手在同一次调用里剔 OTC 粉单。
 - `--refine`：仅对显式声明专属 L2 的策略运行 Futu F10 原生精算；没有专属 L2 的策略视为跳过。流量表统一查询累计口径（Q1/H1/Q9/FY）；美股资产负债表按 Q1/Q2/Q3/FY 查询，并与累计流量表按截止日对齐。当前值采用所需报表的**最近共同已发布报告期**；多年均值仍只使用年报。定义了 L2 门槛的策略会在此步直接按门槛过滤：
   - `growth_value`：8 项均有 Futu 原生字段数据，且 Piotroski 式质量分 ≥ 4；
   - `deep_value`：剔除报表币种≠交易币种、无法直接比较市值与报表金额的候选，并仅保留 `市值 < NCAV`(流动资产−总负债) 的 Graham 烟蒂；
@@ -170,6 +171,7 @@ screen --market US|HK|A [--strategy sepa|pr|growth_value|deep_value] [--refine]
 - F10 请求在单进程内串行执行，每次调用后固定等待 1.1 秒，满足 30 次/30 秒的接口限制；失败不自动重试。
 ```json
 { "market": "HK", "strategy": "sepa", "l1_count": 26,
+  "min_listing_days": 365, "filtered_new_listing": 3,
   "snapshot_enriched": true, "l2_refined": 0, "returned": 26,
   "candidates": [
     { "code": "HK.00981", "name": "中芯国际", "market": "HK",
@@ -207,7 +209,10 @@ screen --market US|HK|A [--strategy sepa|pr|growth_value|deep_value] [--refine]
   净利润 ≥ 0；资产负债率 ≤ 50%；流动比率 ≥ 1.5。排序=账面折价主导；
   `--refine` 精算 NCAV=流动资产−总负债、净现金等，并剔除中概/ADR、只留 `市值 < NCAV`。
 
-阈值常量定义在 `fundamental_analysis/<strategy>_screener.py` 头部，调整只改常量。
+四策略三市场统一在 L1 之后剔除上市不足 365 个自然日的新股，停牌股则由快照阶段剔除。
+
+阈值常量定义在 `fundamental_analysis/<strategy>_screener.py` 头部，调整只改常量；
+新股门槛为四策略共用，放在 `futu_fundamental_screener.py` 的 `MIN_LISTING_DAYS`。
 
 ### 3) `signals` — 单/多只指标信号 + detect + L2
 ```bash

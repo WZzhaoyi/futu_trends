@@ -20,6 +20,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,19 @@ FILTER_MARKETS = {
 # OTC(粉单)无行情权限，get_market_snapshot 会整批报错，需在 L1 后剔除
 US_ALLOWED_EXCHANGES = {"US_NYSE", "US_NASDAQ", "US_AMEX"}
 PAGE_SIZE = 200
+
+# ---- 新股剔除 ----
+# 四策略三市场统一按「上市满 365 个自然日」筛。get_stock_filter 的 StockField 里没有
+# 任何日期类字段，这个条件下发不了服务端，只能在 L1 结果上按 get_stock_basicinfo 的
+# listing_date 剔除。策略可用 MIN_LISTING_DAYS 覆盖（<= 0 关闭）。
+MIN_LISTING_DAYS = 365
+# get_stock_basicinfo 不跨交易所：A 股只查 SH 拿不到 SZ，而 get_stock_filter 的
+# Market.SH 返回的却是整个 A 股，故必须 SH+SZ 合并。
+BASICINFO_MARKETS = {
+    "US": (ft.Market.US,),
+    "HK": (ft.Market.HK,),
+    "A": (ft.Market.SH, ft.Market.SZ),
+}
 
 # ---- 「要求为正」的下限 ----
 # Futu 的 filter_min 是闭区间，且实测对 1e-9 及以下的下限会量化成 0：
@@ -235,19 +249,71 @@ def _candidate_from_filter_row(row, market: str) -> dict[str, Any]:
     return out
 
 
-def _drop_us_otc(ctx, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    # 不做"失败保留全部"兜底：混入 OTC 会让后续 get_market_snapshot 整批报错
-    data = _futu_call("get_stock_basicinfo", lambda: ctx.get_stock_basicinfo(
-        ft.Market.US, ft.SecurityType.STOCK))
-    exchange = dict(zip(data["code"], data["exchange_type"]))
-    kept = [c for c in candidates if exchange.get(c["code"]) in US_ALLOWED_EXCHANGES]
-    if len(kept) < len(candidates):
-        print(f"[info] dropped {len(candidates) - len(kept)} US OTC candidates",
-              file=sys.stderr)
-    return kept
+def strategy_min_listing_days(strategy) -> int:
+    """策略可用 MIN_LISTING_DAYS 覆盖统一默认值；<= 0 关闭该剔除。"""
+    return int(getattr(strategy, "MIN_LISTING_DAYS", MIN_LISTING_DAYS))
 
 
-def run_l1(strategy, market: str, config) -> list[dict[str, Any]]:
+def listing_age_days(listing_date, as_of: date) -> int | None:
+    """上市天数；缺值或格式异常返回 None，由调用方决定。"""
+    try:
+        return (as_of - date.fromisoformat(str(listing_date).strip())).days
+    except (TypeError, ValueError):
+        return None
+
+
+def drop_ineligible(candidates: list[dict[str, Any]], market: str,
+                    listing: dict[str, str], exchange: dict[str, str],
+                    min_days: int, as_of: date) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """L1 之后的资格剔除：上市不足 min_days 的新股，以及 US 的 OTC。
+
+    listing_date 缺失时**放行**并计数：那是数据缺口，剔掉等于静默误杀。
+    OTC 例外相反，判定必须依赖 get_stock_basicinfo 成功（失败会在调用处抛错终止）。
+    """
+    kept, counts = [], {"new_listing": 0, "otc": 0, "unknown_listing_date": 0}
+    for candidate in candidates:
+        if market == "US" and exchange.get(candidate["code"]) not in US_ALLOWED_EXCHANGES:
+            counts["otc"] += 1
+            continue
+        if min_days > 0:
+            age = listing_age_days(listing.get(candidate["code"]), as_of)
+            if age is None:
+                counts["unknown_listing_date"] += 1
+            elif age < min_days:
+                counts["new_listing"] += 1
+                continue
+        kept.append(candidate)
+    return kept, counts
+
+
+def _basicinfo_maps(ctx, market: str) -> tuple[dict[str, str], dict[str, str]]:
+    """全市场 code → 上市日期 / 交易所。"""
+    listing, exchange = {}, {}
+    for index, futu_market in enumerate(BASICINFO_MARKETS[market]):
+        if index:
+            time.sleep(FILTER_THROTTLE_SEC)
+        data = _futu_call(
+            "get_stock_basicinfo",
+            lambda m=futu_market: ctx.get_stock_basicinfo(m, ft.SecurityType.STOCK),
+        )
+        listing.update(dict(zip(data["code"], data["listing_date"])))
+        exchange.update(dict(zip(data["code"], data["exchange_type"])))
+    return listing, exchange
+
+
+def _report_drops(counts: dict[str, int], min_days: int) -> None:
+    if counts["otc"]:
+        print(f"[info] dropped {counts['otc']} US OTC candidates", file=sys.stderr)
+    if counts["new_listing"]:
+        print(f"[info] dropped {counts['new_listing']} candidates listed "
+              f"< {min_days} days", file=sys.stderr)
+    if counts["unknown_listing_date"]:
+        print(f"[info] kept {counts['unknown_listing_date']} candidates without "
+              f"listing_date", file=sys.stderr)
+
+
+def run_l1(strategy, market: str, config, min_listing_days: int | None = None,
+           drop_stats: dict[str, int] | None = None) -> list[dict[str, Any]]:
     host = config.get("CONFIG", "FUTU_HOST", fallback="127.0.0.1")
     port = int(config.get("CONFIG", "FUTU_PORT", fallback=11111))
     filters = strategy.build_filters(market, ft)
@@ -276,8 +342,20 @@ def run_l1(strategy, market: str, config) -> list[dict[str, Any]]:
                 time.sleep(FILTER_THROTTLE_SEC)
             if market_idx < len(futu_markets) - 1:
                 time.sleep(FILTER_THROTTLE_SEC)
-        if market == "US":
-            out = _drop_us_otc(ctx, out)
+
+        min_days = (strategy_min_listing_days(strategy) if min_listing_days is None
+                    else min_listing_days)
+        # US 始终要交易所（剔 OTC）；其余市场只在启用新股剔除时取。
+        if min_days > 0 or market == "US":
+            listing, exchange = _basicinfo_maps(ctx, market)
+        else:
+            listing, exchange = {}, {}
+        out, counts = drop_ineligible(
+            out, market, listing, exchange, min_days, date.today(),
+        )
+        if drop_stats is not None:
+            drop_stats.update(counts)
+        _report_drops(counts, min_days)
         return out
     finally:
         ctx.close()
@@ -901,8 +979,10 @@ def sanitize(obj):
 
 
 def screen(strategy, market: str, config, snapshot: bool = True,
-           refine: bool = False) -> dict[str, Any]:
-    candidates = run_l1(strategy, market, config)
+           refine: bool = False,
+           min_listing_days: int | None = None) -> dict[str, Any]:
+    drop_stats: dict[str, int] = {}
+    candidates = run_l1(strategy, market, config, min_listing_days, drop_stats)
     l1_count = len(candidates)
     if snapshot:
         candidates = enrich_snapshot(candidates, strategy, config)
@@ -935,6 +1015,9 @@ def screen(strategy, market: str, config, snapshot: bool = True,
         "market": market,
         "strategy": strategy.NAME,
         "l1_count": l1_count,
+        "min_listing_days": (strategy_min_listing_days(strategy)
+                             if min_listing_days is None else min_listing_days),
+        "filtered_new_listing": drop_stats.get("new_listing", 0),
         "snapshot_enriched": bool(snapshot),
         "l2_refined": l2_refined,
         "l2_filtered": l2_filtered,
@@ -955,6 +1038,10 @@ def parser(strategy) -> argparse.ArgumentParser:
         "--refine", action="store_true",
         help="运行策略显式声明的 Futu F10 L2 精算",
     )
+    ap.add_argument(
+        "--min-listing-days", type=int, default=strategy_min_listing_days(strategy),
+        help="剔除上市不足 N 个自然日的标的，0 关闭（默认 %(default)s）",
+    )
     ap.add_argument("--out", help="输出 JSON 文件")
     ap.add_argument("--out-root", help=f"按协议路径输出：<root>/<date>/<strategy>_<market>.json，如 {OUT_ROOT}")
     ap.add_argument("--date", help="配合 --out-root 的结果日期 YYYYMMDD，默认今天")
@@ -971,7 +1058,7 @@ def main(strategy):
 
     result = screen(
         strategy, args.market, config, snapshot=not args.no_snapshot,
-        refine=args.refine,
+        refine=args.refine, min_listing_days=args.min_listing_days,
     )
     if args.out_root:
         date = args.date or time.strftime("%Y%m%d")
