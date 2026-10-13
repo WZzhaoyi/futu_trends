@@ -50,7 +50,7 @@ NAME = "growth_value"
 DESCRIPTION = "Growth-value fundamental screener (P/FCF <= 11)"
 
 MARKET_CAP_MIN = {"US": 10e9, "HK": 10e9, "A": 10e9}
-TURNOVER_AVG_DAYS = 20
+TURNOVER_WINDOW_DAYS = 20
 TURNOVER_MIN = {"US": 50e6, "HK": 5e6, "A": 50e6}
 PE_MIN = POSITIVE_MIN
 PE_MAX = 35.0
@@ -84,7 +84,7 @@ def build_filters(market: str, ft):
     return [
         simple_filter(sf.MARKET_VAL, MARKET_CAP_MIN[market]),
         accumulate_filter(
-            sf.TURNOVER, TURNOVER_MIN[market], days=TURNOVER_AVG_DAYS,
+            sf.TURNOVER, TURNOVER_MIN[market], days=TURNOVER_WINDOW_DAYS,
         ),
         simple_filter(sf.PE_TTM, PE_MIN, PE_MAX),
         simple_filter(sf.PB_RATE, POSITIVE_MIN, PB_MAX),

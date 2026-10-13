@@ -94,7 +94,8 @@ FILTER_FIELDS = (
 
 
 def simple_filter(field, min_: float | None = None, max_: float | None = None,
-                  sort=None):
+                  sort=None, is_no_filter: bool = False):
+    # is_no_filter=True：只请求该字段的返回值，不参与服务端筛选。
     f = ft.SimpleFilter()
     f.stock_field = field
     if min_ is not None:
@@ -103,12 +104,16 @@ def simple_filter(field, min_: float | None = None, max_: float | None = None,
         f.filter_max = max_
     if sort is not None:
         f.sort = sort
-    f.is_no_filter = False
+    f.is_no_filter = is_no_filter
     return f
 
 
 def accumulate_filter(field, min_: float | None = None, max_: float | None = None,
                       days: int = 5, sort=None):
+    """近 days 日的**累计值**筛选：阈值直接和累计值比较，不是日均（枚举名的「日均」是误导）。
+
+    想按日均表达请用 :func:`daily_average_filter`，别在这里直接乘。
+    """
     f = ft.AccumulateFilter()
     f.stock_field = field
     f.days = days
@@ -120,6 +125,11 @@ def accumulate_filter(field, min_: float | None = None, max_: float | None = Non
         f.sort = sort
     f.is_no_filter = False
     return f
+
+
+def daily_average_filter(field, daily_min: float, days: int, sort=None):
+    """按**日均**阈值筛选：把日均值 × days 换算成接口要的累计值再下发。"""
+    return accumulate_filter(field, daily_min * days, days=days, sort=sort)
 
 
 def financial_filter(field, min_: float | None = None, max_: float | None = None,
@@ -203,9 +213,25 @@ def _filter_page(ctx, futu_market, filters: list[Any], begin: int):
     ))
 
 
+# ---- 派生指标（仅展示）----
+
+def derive_pr(candidate: dict[str, Any]) -> float | None:
+    """市赚率 PR = PE_TTM ÷ ROE%（年报口径百分数），各策略共用的展示口径。
+
+    仅用于展示与前端排序，不参与筛选；两个字段都取自 get_stock_filter 的返回列，
+    未请求或非正时返回 None（前端自动隐藏该列）。
+    """
+    pe = num(candidate.get("pe_ttm"))
+    roe = num(candidate.get("return_on_equity_rate"))
+    if pe is None or roe is None or pe <= 0 or roe <= 0:
+        return None
+    return round(pe / roe, 4)
+
+
 def _candidate_from_filter_row(row, market: str) -> dict[str, Any]:
     out = {"code": row.stock_code, "name": row.stock_name, "market": market}
     out.update({field: row_value(row, field) for field in FILTER_FIELDS})
+    out["pr"] = derive_pr(out)
     return out
 
 

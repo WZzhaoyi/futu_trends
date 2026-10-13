@@ -7,7 +7,9 @@ PR ≤ 0.5 视为「半价买入优质公司」。
 L1 筛选 get_stock_filter 服务端首筛 + 返回字段的 Python 精确计算：
 
 服务端筛选（年报口径财务字段）：
-  - 市值 ≥ 100 亿（本位币）、20 日均成交额达到市场门槛、PB > 0、PE_TTM ∈ (0, 11]
+  - 市值 ≥ 100 亿（本位币）
+  - 近 20 日日均成交额 ≥ 美股 1 亿美元 / 港股 3500 万港币 / A 股 1 亿人民币
+  - PB > 0、PE_TTM > 0
   - ROE ≥ 8%、ROA_TTM ≥ 1%、权益乘数 ∈ [1, 4]（净资产 ≥ 总资产 25%）
   - 净利润 > 0、经营现金流 TTM > 0、资产负债率 ≤ 65%
 
@@ -17,11 +19,12 @@ Python 精确计算（get_stock_filter 无法做字段间比值）：
   - cash_coverage = 经营现金流 TTM / 净利润：作为报告字段提示一次性/纸面利润，
     不做硬过滤 —— 珠宝/零售等存货型企业的覆盖率天然 <1，一刀切会误杀
 
+L2 精算（--refine，F10 利润表 + 资产负债表）：近 3 期年报 ROE 都 ≥ 8%，取不到即剔除。
+它取代原先的「PE_TTM ≤ 11」—— 绝对倍数上限会连带砍掉高 ROE 的好公司，而多年 ROE
+下限砍掉的才是周期顶点/一次性利润（当期 ROE 高、历史年份亏损）。
+
 金融/保险 ROE 失真：L1 无行业字段，靠权益乘数 + 资产负债率过滤——
 杠杆性 ROE 失真正是需求要点，银行/多数保险/地产在此被排除。
-
-周期/一次性收益：L1 只有当期 ROE，无多年历史，
-完整检测需要外部多年数据；L1 以 OCF>0 + cash_coverage 字段作提示。
 """
 
 from __future__ import annotations
@@ -33,9 +36,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from futu_fundamental_screener import (  # noqa: E402
+    FINANCIAL_ANNUAL_TYPE,
     POSITIVE_MIN,
     _candidate_from_filter_row,
-    accumulate_filter,
+    daily_average_filter,
     financial_filter,
     main,
     num,
@@ -46,20 +50,16 @@ from futu_fundamental_screener import (  # noqa: E402
 )
 
 NAME = "pr"
-DESCRIPTION = "市赚率 (PR=PE/ROE/100, PR<=0.5) value screener — L1"
+DESCRIPTION = "市赚率 (PR=PE/ROE/100, PR<=0.5) value screener"
 
 # ---- L1 服务端筛选常量（年报口径） ----
 # 市值下限 100 亿（各市场本位币），剔除小盘股；停牌股由 snapshot 阶段剔除
 MARKET_CAP_MIN = 1e10
-TURNOVER_AVG_DAYS = 20
-TURNOVER_MIN = {"US": 50e6, "HK": 5e6, "A": 50e6}
+# 流动性：近 20 日**日均**成交额（本位币），由 daily_average_filter 换算成接口的
+# 累计口径后下发 —— 这里只写日均值，别在别处再乘一次。
+TURNOVER_WINDOW_DAYS = 20
+TURNOVER_DAILY_MIN = {"US": 100e6, "HK": 35e6, "A": 100e6}
 PE_MIN = POSITIVE_MIN
-# PE 绝对上限 11。注意它与 PR<=0.5 的作用方向相反：
-# PR<=0.5 ⇔ PE <= ROE%*0.5，ROE=8% 时只允许 PE<=4，但 ROE=78% 时允许 PE<=39。
-# 故 PE_MAX=11 只在 ROE% > 22 时真正生效，效果是**取消高 ROE 的估值豁免**——
-# 例如 ROE 78%、PR 仅 0.169 的标的（PR 判定极便宜）会被这条砍掉。
-# 这是刻意的：PR 度量的是「相对盈利能力的便宜度」，PE<=11 加上的是「绝对盈利倍数」上限。
-PE_MAX = 11.0
 ROE_MIN = 8.0
 ROA_MIN = 1.0
 DEBT_ASSET_MAX = 65.0
@@ -72,17 +72,24 @@ PR_MAX = 0.5
 EQUITY_MULTIPLIER_MIN = 1.0
 EQUITY_MULTIPLIER_MAX = 4.0
 
+# ---- L2：多年 ROE 稳定性（--refine，F10 利润表 + 资产负债表）----
+# 取代原先的 PE ≤ 11 绝对倍数上限：近 ROE_ANNUAL_PERIODS 期年报 ROE 每一年都
+# ≥ ROE_ANNUAL_MIN，取不到年报数据一律剔除。
+FUTU_L2_STATEMENT_TYPES = ("income", "balance")
+ROE_ANNUAL_MIN = 8.0
+ROE_ANNUAL_PERIODS = 3
+
 
 def build_filters(market: str, ft):
     sf = ft.StockField
     q = ft.FinancialQuarter.ANNUAL
     return [
         simple_filter(sf.MARKET_VAL, MARKET_CAP_MIN),
-        accumulate_filter(
-            sf.TURNOVER, TURNOVER_MIN[market], days=TURNOVER_AVG_DAYS,
+        daily_average_filter(
+            sf.TURNOVER, TURNOVER_DAILY_MIN[market], days=TURNOVER_WINDOW_DAYS,
         ),
         simple_filter(sf.PB_RATE, POSITIVE_MIN),  # PB<=0（净资产为负/失真）直接剔除
-        simple_filter(sf.PE_TTM, PE_MIN, PE_MAX, sort=ft.SortDir.ASCEND),
+        simple_filter(sf.PE_TTM, PE_MIN, sort=ft.SortDir.ASCEND),
         financial_filter(sf.RETURN_ON_EQUITY_RATE, ROE_MIN, quarter=q),
         financial_filter(sf.ROA_TTM, ROA_MIN, quarter=q),
         financial_filter(sf.EQUITY_MULTIPLIER,
@@ -98,12 +105,10 @@ def build_filters(market: str, ft):
 def candidate_from_filter_row(row, market):
     """算 PR 并按 PR<=0.5 / 权益乘数剔除；不合格返回 None（runner 跳过）。"""
     cand = _candidate_from_filter_row(row, market)
-    pe = num(cand.get("pe_ttm"))
-    roe = num(cand.get("return_on_equity_rate"))  # 百分数，如 15.2 表示 15.2%
-    if pe is None or roe is None or pe <= 0 or roe <= 0:
-        return None  # 缺 PE/ROE 无法验证，丢弃
-    pr = pe / roe  # PR = PE / (ROE%*100) * 100 = PE / ROE%
-    cand["pr"] = round(pr, 4)
+    # PR 由 derive_pr 统一算出；这里只做判据，用展示值保证「筛的」就是「显示的」。
+    pr = num(cand.get("pr"))
+    if pr is None:
+        return None  # 缺 PE/ROE 或非正，无法验证 PR，丢弃
     if pr > PR_MAX:
         return None
 
@@ -143,6 +148,58 @@ def score_snapshot(candidate, snap):
     pr_score = min(0.5 / pr, 4.0) if pr else 0  # PR 越小越好：0.125→4，0.5→1
     score = pr_score * 50 + earnings_yield * 1.5 + book_discount * 5 + dividend + liquidity * 0.2
     return {"snapshot_pr": round(pr, 4), "snapshot_score": round(score, 3)}
+
+
+# ---- L2 精算 ----
+
+def refine_futu(candidate, financials):
+    """算近几期年报 ROE：净利润 ÷ 期末净资产，与 L1 的 ROE 字段同源。"""
+    annual = financials.aligned(
+        "income", "balance", financial_type=FINANCIAL_ANNUAL_TYPE,
+    )
+    if not annual:
+        return {"ok": False, "source": "futu",
+                "note": "no common annual period across income and balance"}
+    roes, periods = [], []
+    for income_report, balance_report in annual:
+        fields = financials.fields_for(income_report, balance_report)
+        value = ratio(income_report.value(fields.net_income),
+                      balance_report.value(fields.equity))
+        if value is None:
+            continue
+        roes.append(round(value * 100, 4))
+        periods.append(income_report.period_text)
+    if not roes:
+        return {"ok": False, "source": "futu",
+                "note": "annual reports carry no usable net_income/equity"}
+    recent = roes[:ROE_ANNUAL_PERIODS]
+    return {
+        "ok": True,
+        "source": "futu",
+        "report_period": periods[0],
+        "financial_currency": annual[0][0].currency_code,
+        "roe_periods": len(roes),
+        "annual_roe_pct": roes[:6],
+        "roe_recent_min_pct": min(recent),
+        "roe_recent_avg_pct": round(sum(recent) / len(recent), 4),
+    }
+
+
+def l2_reject_reason(candidate) -> str | None:
+    """L2 被拒的第一条原因；None 表示通过。仅用于计数与归因。"""
+    l2 = candidate.get("l2") or {}
+    if not l2.get("ok"):
+        return "l2_unavailable"
+    if (l2.get("roe_periods") or 0) < ROE_ANNUAL_PERIODS:
+        return "roe_history_short"
+    if l2["roe_recent_min_pct"] < ROE_ANNUAL_MIN:
+        return "roe_below_floor"
+    return None
+
+
+def l2_passes(candidate) -> bool:
+    """--refine L2 门槛：近 3 期年报 ROE 都 ≥ 8%，取不到即剔除。"""
+    return l2_reject_reason(candidate) is None
 
 
 if __name__ == "__main__":
