@@ -26,6 +26,8 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from zoneinfo import ZoneInfo
 
+from sheet_notifications import queued_sheet_event, send_sheet_signal
+
 from live_runtime import (
     BackgroundWorker,
     close_futu_context,
@@ -562,7 +564,7 @@ class LiveNotifier:
         if now - self.recent.get(key, -1e12) < 300:
             return
         self.recent[key] = now
-        if not self.worker.submit(dict(event)):
+        if not self.worker.submit(queued_sheet_event(event)):
             eprint(f"通知队列已满，丢弃事件: {key}")
 
     def format_event(self, event: dict[str, Any]) -> tuple[str, str]:
@@ -592,6 +594,8 @@ class LiveNotifier:
     def _deliver(self, event: dict[str, Any]) -> None:
         subject, message = self.format_event(event)
         self._send(subject, message)
+
+        send_sheet_signal(self.engine, "premium", event)
 
     def _send(self, subject: str, message: str) -> None:
         for send in (

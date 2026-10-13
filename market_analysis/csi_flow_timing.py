@@ -35,6 +35,8 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Optional
 
+from sheet_notifications import queued_sheet_event, send_sheet_signal
+
 from live_runtime import (
     BackgroundWorker,
     close_futu_context,
@@ -2124,7 +2126,7 @@ class LiveEventNotifier:
         if now - self.last_enqueued.get(key, -math.inf) < 300:
             return
         self.last_enqueued[key] = now
-        if not self.worker.submit(dict(event)):
+        if not self.worker.submit(queued_sheet_event(event)):
             eprint(f"通知队列已满，丢弃事件: {key}")
 
     def format_event(self, event: dict[str, Any]) -> tuple[str, str]:
@@ -2167,6 +2169,8 @@ class LiveEventNotifier:
     def _deliver(self, event: dict[str, Any]) -> None:
         subject, message = self.format_event(event)
         self._send(subject, message)
+
+        send_sheet_signal(self.engine, "m1", event)
 
     def _send(self, subject: str, message: str) -> None:
         senders = (

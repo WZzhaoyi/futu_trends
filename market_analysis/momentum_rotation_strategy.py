@@ -30,6 +30,8 @@ from time import perf_counter
 from typing import Any, Iterable, Optional
 from zoneinfo import ZoneInfo
 
+from sheet_notifications import queued_sheet_event, send_sheet_signal
+
 from live_runtime import (
     BackgroundWorker,
     close_futu_context,
@@ -1171,7 +1173,7 @@ class LiveNotifier:
         if now - self.recent.get(key, -1e12) < 300:
             return
         self.recent[key] = now
-        if not self.worker.submit(dict(event)):
+        if not self.worker.submit(queued_sheet_event(event)):
             eprint(f"通知队列已满，丢弃事件: {key}")
 
     @staticmethod
@@ -1240,6 +1242,8 @@ class LiveNotifier:
                 send(message)
             except Exception as exc:
                 eprint(f"通知发送失败: {exc}")
+
+        send_sheet_signal(self.engine, "rotation", event)
 
     def close(self, timeout: float = 10.0) -> None:
         if not self.worker.close(timeout):

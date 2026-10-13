@@ -54,3 +54,24 @@ FUTU_TEST_ARTIFACT_DIR=/tmp/futu-indicator-e2e \
 - `tick-notification-modes.json`、`restart.json`、`modes.json`、`indicator-order.json`：通知模式、冷却、重启状态及一次性模拟成交。
 
 JSON 记录输入行情、Tick 时间、规则配置、日历请求、收到的 HTTP 内容、审计记录和持久化状态。上述命令可重复生成产物；合成收盘报价验证引擎处理能力，不证明供应商必定发送收盘报价，也不验证真实历史行情权限。
+
+## 策略表格通知端到端验证
+
+```sh
+conda run --no-capture-output -n futu_trends \
+  python tests/e2e_strategy_sheets.py --output /tmp/futu-strategy-sheets/local.json
+```
+
+本地 HTTP E2E 验证三个策略的单行摘要、动作与状态过滤、两种溢价、触发日期、月历定位、跨进程追加与去重，以及单个平台失败时的独立投递。JSON 保存实际写入和最终单元格内容；脚本需单独运行。
+
+线上验证会在当天单元格追加一条“非交易信号”验证行，保留原文并核验重复投递：
+
+```sh
+conda run --no-capture-output -n futu_trends \
+  python tests/e2e_strategy_sheets.py --live-config env/signal_cn.ini \
+  --output /tmp/futu-strategy-sheets/live.json
+```
+
+`live.json` 包含线上单元格原文，应留在本地。验证不修改配置，不发送其他通知渠道。
+
+写入锁位于 `.cache/sheet-locks/`，按平台和工作簿区分，覆盖建月表、读取、去重、追加和回读。所有写入进程必须运行新版代码、使用同一仓库路径；独立主机、独立 checkout、旧版进程和人工编辑不参与此锁。更新后重启常驻策略进程，运行期间保留锁文件目录。通知按完整文本去重；投递失败只记录日志，没有持久化补发队列。

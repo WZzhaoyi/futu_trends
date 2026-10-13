@@ -35,6 +35,7 @@ from google_auth_httplib2 import AuthorizedHttp
 from futu_group import sync_futu_group
 
 from .delivery_log import log_delivery, log_delivery_exception
+from .sheet_lock import sheet_write_lock
 from .webhook import WebhookNotifier, HookResult
 
 logger = logging.getLogger(__name__)
@@ -57,21 +58,21 @@ def _column_index_to_letter(column_index):
     return ''.join(reversed(letters))
 
 
-def _calendar_sheet_position(cell_origin):
+def _calendar_sheet_position(cell_origin, sheet_date=None):
     match = re.match(r'^([A-Z]+)(\d+)$', cell_origin)
     if not match:
         raise ValueError("Invalid cell origin format, expected like 'B2'")
 
     start_col_letter, start_row = match.groups()
     start_row = int(start_row)
-    today = date.today()
+    today = sheet_date if sheet_date is not None else date.today()
     sheet_name = today.strftime('%y-%m')
 
     start_col = _column_letter_to_index(start_col_letter)
     first_day_of_month = datetime(today.year, today.month, 1)
     first_weekday = first_day_of_month.weekday() # （0=周一，6=周日）
     day, weekday = today.day, today.weekday()
-    week = (day + first_weekday) // 7
+    week = (day - 1 + (first_weekday + 1) % 7) // 7
     col_offset = (weekday + 1) % 7
     target_col = _column_index_to_letter(start_col + col_offset)
     target_row = start_row + week + 1
@@ -85,6 +86,10 @@ def _calendar_sheet_position(cell_origin):
         "target_col": target_col,
         "target_row": target_row,
     }
+
+
+def _sheet_contains_message(existing, message):
+    return f"\n\n{message}\n\n" in f"\n\n{existing}\n\n"
 
 
 def _valid_target_prices(recent_high, recent_low):
@@ -527,133 +532,154 @@ class NotificationEngine:
         values = data.get("data", {}).get("valueRange", {}).get("values", [])
         return _feishu_cell_value_to_text(values)
 
-    def send_feishu_sheet_message(self, message):
+    def send_feishu_sheet_message(self, message, *, sheet_date=None):
         """更新飞书电子表格"""
+        if not message or not message.strip():
+            return False
         if not all([self.feishu_spreadsheet_token, self.feishu_sheet_cell_origin]):
             logger.warning('飞书电子表格配置不完整，跳过发送')
-            return
+            return False
 
         try:
-            position = _calendar_sheet_position(self.feishu_sheet_cell_origin)
-            sheet_name = position["sheet_name"]
+            with sheet_write_lock("feishu", self.feishu_spreadsheet_token):
+                position = _calendar_sheet_position(self.feishu_sheet_cell_origin, sheet_date)
+                sheet_name = position["sheet_name"]
 
-            sheets = self._get_feishu_sheets()
-            sheet_id = next((sheet.get("sheet_id") for sheet in sheets if sheet.get("title") == sheet_name), "")
-            if not sheet_id:
-                sheet_id = self._create_feishu_sheet(sheet_name)
-                header_range = (
-                    f'{sheet_id}!{position["start_col_letter"]}{position["start_row"]}:'
-                    f'{position["header_end_col"]}{position["start_row"]}'
+                sheets = self._get_feishu_sheets()
+                sheet_id = next((sheet.get("sheet_id") for sheet in sheets if sheet.get("title") == sheet_name), "")
+                if not sheet_id:
+                    sheet_id = self._create_feishu_sheet(sheet_name)
+                    header_range = (
+                        f'{sheet_id}!{position["start_col_letter"]}{position["start_row"]}:'
+                        f'{position["header_end_col"]}{position["start_row"]}'
+                    )
+                    self._write_feishu_values(header_range, [['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']])
+
+                target_cell = f'{sheet_id}!{position["target_col"]}{position["target_row"]}:{position["target_col"]}{position["target_row"]}'
+                existing_content = self._read_feishu_value(target_cell)
+                if _sheet_contains_message(existing_content, message):
+                    return True
+                updated_content = f"{existing_content}\n\n{message}" if existing_content else message
+                self._write_feishu_values(target_cell, [[updated_content]])
+                if self._read_feishu_value(target_cell) != updated_content:
+                    raise RuntimeError("Feishu sheet readback mismatch")
+                log_delivery(
+                    'feishu_sheet',
+                    'update',
+                    ok=True,
+                    sheet=sheet_name,
+                    cell=f'{position["target_col"]}{position["target_row"]}',
                 )
-                self._write_feishu_values(header_range, [['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']])
-
-            target_cell = f'{sheet_id}!{position["target_col"]}{position["target_row"]}:{position["target_col"]}{position["target_row"]}'
-            existing_content = self._read_feishu_value(target_cell)
-            updated_content = f"{existing_content}\n\n{message}" if existing_content else message
-            self._write_feishu_values(target_cell, [[updated_content]])
-            log_delivery(
-                'feishu_sheet',
-                'update',
-                ok=True,
-                sheet=sheet_name,
-                cell=f'{position["target_col"]}{position["target_row"]}',
-            )
+                return True
 
         except Exception as exc:
             log_delivery_exception('feishu_sheet', 'update', exc)
+            return False
 
-    def send_google_sheet_message(self, message):
+    def send_google_sheet_message(self, message, *, sheet_date=None):
         """更新Google Sheet"""
+        if not message or not message.strip():
+            return False
         if not all([self.google_sheet_id, os.path.exists(self.google_api_json), self.google_sheet_cell_origin]):
             logger.warning('Google Sheet配置不完整，跳过发送')
-            return
+            return False
 
         try:
-            # 获取Google Sheet服务
-            SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
-            creds = Credentials.from_service_account_file(self.google_api_json, scopes=SCOPES)
+            with sheet_write_lock("google", self.google_sheet_id):
+                # 获取Google Sheet服务
+                SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+                creds = Credentials.from_service_account_file(self.google_api_json, scopes=SCOPES)
 
-            # 配置HTTP客户端
-            if self.PROXIES.get('http'):
-                proxy_url = self.PROXIES['http'].split('://', 1)[1]
-                proxy_host, proxy_port = proxy_url.rsplit(':', 1)
-                http_client = httplib2.Http(
-                    proxy_info=httplib2.ProxyInfo(
-                        proxy_type=httplib2.socks.PROXY_TYPE_HTTP,
-                        proxy_host=proxy_host,
-                        proxy_port=int(proxy_port),
-                    ),
-                    timeout=30,
-                    disable_ssl_certificate_validation=False
-                )
-            else:
-                http_client = httplib2.Http(timeout=30)
+                # 配置HTTP客户端
+                if self.PROXIES.get('http'):
+                    proxy_url = self.PROXIES['http'].split('://', 1)[1]
+                    proxy_host, proxy_port = proxy_url.rsplit(':', 1)
+                    http_client = httplib2.Http(
+                        proxy_info=httplib2.ProxyInfo(
+                            proxy_type=httplib2.socks.PROXY_TYPE_HTTP,
+                            proxy_host=proxy_host,
+                            proxy_port=int(proxy_port),
+                        ),
+                        timeout=30,
+                        disable_ssl_certificate_validation=False
+                    )
+                else:
+                    http_client = httplib2.Http(timeout=30)
 
-            http = AuthorizedHttp(creds, http_client)
-            service = build('sheets', 'v4', http=http)
+                http = AuthorizedHttp(creds, http_client)
+                service = build('sheets', 'v4', http=http)
 
-            position = _calendar_sheet_position(self.google_sheet_cell_origin)
-            start_col_letter = position["start_col_letter"]
-            start_row = position["start_row"]
-            cell_sheet_name = position["sheet_name"]
-            target_col = position["target_col"]
-            target_row = position["target_row"]
-            target_cell = f'{cell_sheet_name}!{target_col}{target_row}'
+                position = _calendar_sheet_position(self.google_sheet_cell_origin, sheet_date)
+                start_col_letter = position["start_col_letter"]
+                start_row = position["start_row"]
+                cell_sheet_name = position["sheet_name"]
+                target_col = position["target_col"]
+                target_row = position["target_row"]
+                target_cell = f'{cell_sheet_name}!{target_col}{target_row}'
 
-            # 确保工作表存在
-            sheet_metadata = self._execute_google_request(service.spreadsheets().get, spreadsheetId=self.google_sheet_id)
-            if not any(sheet['properties']['title'] == cell_sheet_name for sheet in sheet_metadata.get('sheets', [])):
-                # 创建新工作表并初始化日历模板
-                self._execute_google_request(
-                    service.spreadsheets().batchUpdate,
+                # 确保工作表存在
+                sheet_metadata = self._execute_google_request(service.spreadsheets().get, spreadsheetId=self.google_sheet_id)
+                if not any(sheet['properties']['title'] == cell_sheet_name for sheet in sheet_metadata.get('sheets', [])):
+                    # 创建新工作表并初始化日历模板
+                    self._execute_google_request(
+                        service.spreadsheets().batchUpdate,
+                        spreadsheetId=self.google_sheet_id,
+                        body={'requests': [{'addSheet': {'properties': {'title': cell_sheet_name}}}]}
+                    )
+
+                    # 设置表头
+                    header_range = f'{cell_sheet_name}!{start_col_letter}{start_row}:{position["header_end_col"]}{start_row}'
+                    self._execute_google_request(
+                        service.spreadsheets().values().update,
+                        spreadsheetId=self.google_sheet_id,
+                        range=header_range,
+                        valueInputOption='RAW',
+                        body={'values': [['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']]}
+                    )
+
+                existing_result = self._execute_google_request(
+                    service.spreadsheets().values().get,
                     spreadsheetId=self.google_sheet_id,
-                    body={'requests': [{'addSheet': {'properties': {'title': cell_sheet_name}}}]}
+                    range=target_cell
                 )
+                values = existing_result.get("values", [])
+                existing_content = str(values[0][0]) if values and values[0] else ""
+                if _sheet_contains_message(existing_content, message):
+                    return True
 
-                # 设置表头
-                header_range = f'{cell_sheet_name}!{start_col_letter}{start_row}:{position["header_end_col"]}{start_row}'
-                self._execute_google_request(
+                # 更新单元格
+                updated_content = f"{existing_content}\n\n{message}" if existing_content else message
+                update_result = self._execute_google_request(
                     service.spreadsheets().values().update,
                     spreadsheetId=self.google_sheet_id,
-                    range=header_range,
+                    range=target_cell,
                     valueInputOption='RAW',
-                    body={'values': [['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']]}
+                    body={'values': [[updated_content]]}
                 )
-
-            # 读取现有内容
-            existing_content = ""
-            existing_result = self._execute_google_request(
-                service.spreadsheets().values().get,
-                spreadsheetId=self.google_sheet_id,
-                range=target_cell
-            )
-            existing_content += existing_result.get('values', [[]])[0][0] if existing_result.get('values') else ""
-
-            # 更新单元格
-            updated_content = f"{existing_content}\n\n{message}" if existing_content else message
-            update_result = self._execute_google_request(
-                service.spreadsheets().values().update,
-                spreadsheetId=self.google_sheet_id,
-                range=target_cell,
-                valueInputOption='RAW',
-                body={'values': [[updated_content]]}
-            )
-            updated_cells = (
-                update_result.get('updatedCells')
-                if isinstance(update_result, dict)
-                else None
-            )
-            log_delivery(
-                'google_sheet',
-                'update',
-                ok=True,
-                sheet=cell_sheet_name,
-                cell=f'{target_col}{target_row}',
-                updated_cells=updated_cells,
-            )
+                updated_cells = (
+                    update_result.get('updatedCells')
+                    if isinstance(update_result, dict)
+                    else None
+                )
+                readback = self._execute_google_request(
+                    service.spreadsheets().values().get,
+                    spreadsheetId=self.google_sheet_id, range=target_cell,
+                ).get("values", [])
+                if not readback or not readback[0] or readback[0][0] != updated_content:
+                    raise RuntimeError("Google sheet readback mismatch")
+                log_delivery(
+                    'google_sheet',
+                    'update',
+                    ok=True,
+                    sheet=cell_sheet_name,
+                    cell=f'{target_col}{target_row}',
+                    updated_cells=updated_cells,
+                )
+                return True
 
         except Exception as exc:
             log_delivery_exception('google_sheet', 'update', exc)
+            return False
 
     def send_webhook(self, content: str) -> HookResult:
         """通过 Webhook 发送"""
