@@ -154,12 +154,8 @@ logs/
 sync/
 config.ini
 
-# Electron
-gui/electron/out/
-gui/electron/release/
-gui/electron/node_modules/
-gui/electron/dist/
-gui/electron/.vite/
-gui/electron/electron/*.js
-gui/electron/*.log
+# Agent
 .alma-snapshots
+.claude
+.codex
+.workbuddy
