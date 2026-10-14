@@ -149,6 +149,65 @@ class LiveRuntimeTest(unittest.TestCase):
 
         live_runtime.close_futu_context(None)
 
+    def test_managed_futu_context_closes_on_error(self) -> None:
+        closed = []
+
+        class Context:
+            def __init__(self, host: str, port: int) -> None:
+                self.args = (host, port)
+
+            def close(self) -> None:
+                closed.append(self.args)
+
+        with self.assertRaises(RuntimeError):
+            with live_runtime.managed_futu_context(Context, host="h", port=1):
+                raise RuntimeError("boom")
+        self.assertEqual(closed, [("h", 1)])
+
+    def test_event_notifier_filters_throttles_and_records_sheet(self) -> None:
+        class Engine:
+            def __init__(self) -> None:
+                self.webhooks: list[str] = []
+                self.emails: list[tuple[str, str]] = []
+                self.sheets: list[str] = []
+
+            def send_webhook(self, message: str) -> None:
+                self.webhooks.append(message)
+
+            def send_telegram_message(self, message: str, link: str) -> None:
+                raise RuntimeError("telegram down")
+
+            def send_email(self, subject: str, message: str) -> None:
+                self.emails.append((subject, message))
+
+            def send_google_sheet_message(self, message: str, sheet_date: object) -> None:
+                self.sheets.append(message)
+
+            def send_feishu_sheet_message(self, message: str, sheet_date: object) -> None:
+                pass
+
+        sys.path.insert(0, str(MODULE_PATH.parent))
+        engine = Engine()
+        notifier = live_runtime.EventNotifier(
+            engine, lambda e: (f"M2 {e.get('action', e['type'])}", f"text {e.get('bar_key', '')}"),
+            name="test-notifier", sheet_strategy="m2",
+        )
+        base = {"symbol": "SH.000902", "strategy": "m2"}
+        buy = {**base, "type": "SIGNAL", "action": "BUY", "bar_key": "2026-05-06 10:30:00",
+               "strength": {"ranking": [{"symbol": "SH.510500"}]}}
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            notifier.notify({**base, "type": "SIGNAL", "action": "NONE", "bar_key": "x"})
+            notifier.notify(buy)
+            notifier.notify(buy)                                  # throttled
+            notifier.notify({**base, "type": "READY"})           # lifecycle is opt-in
+            notifier.notify({**base, "type": "ERROR", "message": "feed"})
+            notifier.close()
+        self.assertEqual(len(engine.webhooks), 2)
+        self.assertEqual(engine.emails[0][0], "M2 BUY")
+        self.assertIn("telegram down", stderr.getvalue())
+        self.assertEqual(len(engine.sheets), 1)
+        self.assertIn("M2 SH.000902 BUY 首选SH.510500", engine.sheets[0])
 
 if __name__ == "__main__":
     unittest.main()

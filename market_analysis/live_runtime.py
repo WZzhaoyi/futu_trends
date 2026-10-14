@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import queue
 import signal
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Generic, Iterator, TypeVar, cast
@@ -139,3 +141,92 @@ def close_futu_context(context: Any) -> None:
         context.close()
     except Exception as exc:  # noqa: BLE001 - SDKs expose varied errors
         print(f"警告: 关闭 Futu context 失败: {exc}", file=sys.stderr, flush=True)
+
+
+@contextmanager
+def managed_futu_context(factory: Callable[..., Any], *, host: str, port: int) -> Iterator[Any]:
+    """Open one Futu context and close it on every exit path without masking errors."""
+    context = factory(host=host, port=port)
+    try:
+        yield context
+    finally:
+        close_futu_context(context)
+
+
+class EventNotifier:
+    """Deliver trading signals, errors and optional lifecycle events off the Futu callback thread.
+
+    Strategy-specific text comes from ``format_event(event) -> (subject, message)``; the same
+    event within ``throttle_seconds`` is dropped. ``sheet_strategy`` enables the compact
+    shared-sheet record from ``sheet_notifications``.
+    """
+
+    LIFECYCLE = frozenset({"READY", "STOPPED", "THRESHOLD_READY"})
+
+    def __init__(
+        self,
+        engine: Any,
+        format_event: Callable[[dict[str, Any]], tuple[str, str]],
+        *,
+        name: str,
+        sheet_strategy: str | None = None,
+        notify_lifecycle: bool = False,
+        throttle_seconds: float = 300.0,
+        link: str = "https://www.futunn.com/",
+        maxsize: int = 100,
+    ) -> None:
+        self.engine = engine
+        self.format_event = format_event
+        self.sheet_strategy = sheet_strategy
+        self.notify_lifecycle = notify_lifecycle
+        self.throttle_seconds = throttle_seconds
+        self.link = link
+        self.last_enqueued: dict[str, float] = {}
+        self.worker = BackgroundWorker[dict[str, Any]](
+            self._deliver,
+            name=name,
+            maxsize=maxsize,
+            on_error=lambda exc: print(f"通知处理失败: {exc}", file=sys.stderr, flush=True),
+        )
+
+    def wanted(self, event: dict[str, Any]) -> bool:
+        kind = event.get("type")
+        if kind == "ERROR":
+            return True
+        if kind == "SIGNAL":
+            return event.get("action") in {"BUY", "SELL"}
+        return self.notify_lifecycle and kind in self.LIFECYCLE
+
+    def notify(self, event: dict[str, Any]) -> None:
+        if not self.wanted(event):
+            return
+        now = time.monotonic()
+        key = "|".join(str(event.get(name, "")) for name in ("type", "action", "bar_key", "message"))
+        if now - self.last_enqueued.get(key, -math.inf) < self.throttle_seconds:
+            return
+        self.last_enqueued[key] = now
+        from sheet_notifications import queued_sheet_event
+
+        if not self.worker.submit(queued_sheet_event(event)):
+            print(f"通知队列已满，丢弃事件: {key}", file=sys.stderr, flush=True)
+
+    def _deliver(self, event: dict[str, Any]) -> None:
+        subject, message = self.format_event(event)
+        senders = (
+            self.engine.send_webhook,
+            lambda text: self.engine.send_telegram_message(text, self.link),
+            lambda text: self.engine.send_email(subject, text),
+        )
+        for send in senders:
+            try:
+                send(message)
+            except Exception as exc:  # noqa: BLE001 - one channel must not block the others
+                print(f"通知发送失败: {exc}", file=sys.stderr, flush=True)
+        if self.sheet_strategy:
+            from sheet_notifications import send_sheet_signal
+
+            send_sheet_signal(self.engine, self.sheet_strategy, event)
+
+    def close(self, timeout: float = 10.0) -> None:
+        if not self.worker.close(timeout):
+            print("通知队列未清空，退出时无法等待全部通知", file=sys.stderr, flush=True)
