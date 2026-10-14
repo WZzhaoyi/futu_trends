@@ -978,6 +978,27 @@ def sanitize(obj):
     return obj
 
 
+_SCALARS = (bool, int, float, str)
+
+
+def strategy_thresholds(strategy) -> dict[str, Any]:
+    """策略模块的大写常量（门槛快照），随结果落盘，跨期统计时区分规则变化。
+
+    改了常量以外的判据逻辑时，在策略模块里递增 VERSION，使快照（及其哈希）随之变化。
+    """
+    out = {}
+    for key, value in vars(strategy).items():
+        if not key.isupper() or key in ("NAME", "DESCRIPTION"):
+            continue
+        if isinstance(value, _SCALARS):
+            out[key] = value
+        elif isinstance(value, (tuple, list)) and all(isinstance(v, _SCALARS) for v in value):
+            out[key] = list(value)
+        elif isinstance(value, dict) and all(isinstance(v, _SCALARS) for v in value.values()):
+            out[key] = {str(k): v for k, v in value.items()}
+    return out
+
+
 def screen(strategy, market: str, config, snapshot: bool = True,
            refine: bool = False,
            min_listing_days: int | None = None) -> dict[str, Any]:
@@ -1022,6 +1043,7 @@ def screen(strategy, market: str, config, snapshot: bool = True,
         "l2_refined": l2_refined,
         "l2_filtered": l2_filtered,
         "l2_reject_reasons": l2_reject_reasons,
+        "thresholds": strategy_thresholds(strategy),
         "returned": len(candidates),
         "candidates": candidates,
     })
@@ -1044,8 +1066,25 @@ def parser(strategy) -> argparse.ArgumentParser:
     )
     ap.add_argument("--out", help="输出 JSON 文件")
     ap.add_argument("--out-root", help=f"按协议路径输出：<root>/<date>/<strategy>_<market>.json，如 {OUT_ROOT}")
-    ap.add_argument("--date", help="配合 --out-root 的结果日期 YYYYMMDD，默认今天")
+    ap.add_argument("--date", help="结果日期 YYYYMMDD（--out-root / --upload 用），默认今天")
+    ap.add_argument(
+        "--upload", action="store_true",
+        help="单次运行后上传精简结果到 [CONFIG] SCREENER_DB；"
+             "批量任务应在全部跑完后用 python -m db_engine.screener --config <ini> --date <YYYYMMDD> 一次上传",
+    )
     return ap
+
+
+def upload_result(config, result: dict, date: str) -> None:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from db_engine.screener import config_uri, upload
+
+    try:
+        db_uri = config_uri(config)
+    except ValueError as e:
+        sys.exit(str(e))
+    result = dict(result, date=date, generated_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+    print(f"已上传 {upload(db_uri, result)}", file=sys.stderr)
 
 
 def main(strategy):
@@ -1060,17 +1099,20 @@ def main(strategy):
         strategy, args.market, config, snapshot=not args.no_snapshot,
         refine=args.refine, min_listing_days=args.min_listing_days,
     )
+    date = args.date or time.strftime("%Y%m%d")
     if args.out_root:
-        date = args.date or time.strftime("%Y%m%d")
         path = result_path(args.out_root, date, strategy.NAME, args.market)
         write_result(path, result, date)
         print(f"已写入 {path}（L1={result['l1_count']}, 返回={result['returned']}）",
               file=sys.stderr)
-        return
-    text = json.dumps(result, ensure_ascii=False, indent=2)
-    if args.out:
-        Path(args.out).write_text(text, encoding="utf-8")
-        print(f"已写入 {args.out}（L1={result['l1_count']}, 返回={result['returned']}）",
-              file=sys.stderr)
     else:
-        print(text)
+        text = json.dumps(result, ensure_ascii=False, indent=2)
+        if args.out:
+            Path(args.out).write_text(text, encoding="utf-8")
+            print(f"已写入 {args.out}（L1={result['l1_count']}, 返回={result['returned']}）",
+                  file=sys.stderr)
+        else:
+            print(text)
+    # 本地结果落盘后再上传，网络失败不丢结果
+    if args.upload:
+        upload_result(config, result, date)

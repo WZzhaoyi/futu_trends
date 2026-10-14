@@ -8,7 +8,7 @@ from market_analysis import trading_calendar
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 from data import get_kline_data
-from params_db import ParamsDB
+from db_engine.params import ParamsDB
 from signal_analysis import get_target_price, MACD, KD, RSI, SupportResistance, default_stock_params  # 默认参数单一来源
 import datetime
 import configparser

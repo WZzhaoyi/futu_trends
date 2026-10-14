@@ -23,7 +23,7 @@ sys.path.append(str(PROJECT_ROOT))
 
 from data import get_kline_data, opend_alive
 from tools import EMA, code_in_futu_group
-from params_db import ParamsDB
+from db_engine.params import ParamsDB
 # 选股结果的路径/格式协议与生产端共用单一来源
 from fundamental_analysis.futu_fundamental_screener import (
     OUT_ROOT as SCREENER_OUT_ROOT,

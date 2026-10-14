@@ -23,7 +23,7 @@ futu_trends 统一功能导出 CLI（只读，面向终端 / 上层 agent，输�
 
   运行：python -m cli <command> …   或   python cli/main.py <command> …
 
-与 gui/backend/api.py 共用同一逻辑底座（data / signal_analysis / tools / params_db /
+与 gui/backend/api.py 共用同一逻辑底座（data / signal_analysis / tools / db_engine /
 fundamental_analysis screeners / indicator_service），但不依赖其 HTTP/FastAPI 外壳。
 
 == market-sense 子命令（输出 JSON）==

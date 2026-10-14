@@ -416,7 +416,7 @@ class IndicatorOrdersE2E(unittest.TestCase):
             rules.append(rule)
         signal = self.rule('top_down', 'SH.600003', variable='signal.top_down',
                            params={'oversold': 90})
-        from params_db import ParamsDB
+        from db_engine.params import ParamsDB
         params_path = self.root / 'params.json'
         params_path.write_text(json.dumps({'SH.600003': {
             'best_params': {'rsi_period': 5, 'oversold': 30, 'overbought': 95},

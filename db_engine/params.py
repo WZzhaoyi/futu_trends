@@ -3,13 +3,14 @@ import sqlite3
 import json
 import logging
 import argparse
-import threading
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass
 import os
-from pymongo import MongoClient, ASCENDING, DESCENDING
+from pymongo import ASCENDING, DESCENDING
+
+from db_engine.conn import is_mongo_uri, mongo_database
 
 # 配置日志
 logging.basicConfig(
@@ -17,20 +18,6 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-
-# MongoClient 进程级复用：pymongo 客户端线程安全、自带连接池与后台监控线程，
-# 同一 URI 全进程只建一个；每次 ParamsDB(...) 都新建 client 会泄漏连接池。
-_mongo_clients: Dict[str, MongoClient] = {}
-_mongo_clients_lock = threading.Lock()
-
-
-def _shared_mongo_client(uri: str, **options) -> MongoClient:
-    with _mongo_clients_lock:
-        client = _mongo_clients.get(uri)
-        if client is None:
-            client = MongoClient(uri, **options)
-            _mongo_clients[uri] = client
-        return client
 
 
 @dataclass
@@ -52,7 +39,7 @@ class ParamsDB:
         Args:
             db_uri: 数据库连接URI，支持以下格式：
                    - SQLite: "sqlite:///path/to/database.db"
-                   - MongoDB: "mongodb+srv://username:password@host:port/database"
+                   - MongoDB: "mongodb[+srv]://username:password@host/database"（库名必填）
         """
         self.db_uri = db_uri
         if self.db_uri.startswith('sqlite:///'):
@@ -60,22 +47,9 @@ class ParamsDB:
             self.db_path = self.db_uri.replace('sqlite:///', '')
             if init_db:
                 self._init_sqlite()
-        elif self.db_uri.startswith('mongodb+srv://'):
-            # MongoDB数据库 连接错误和重试
-            mongo_options = {
-                'serverSelectionTimeoutMS': 30000,  # 服务器选择超时
-                'connectTimeoutMS': 20000,          # 连接超时
-                'socketTimeoutMS': 30000,           # Socket超时
-                'retryWrites': True,                # 启用重试写入
-                'retryReads': True,                 # 启用重试读取
-                'readPreference': 'secondaryPreferred',  # 优先从节点，提高可用性
-            }
-            
-            self.mongo_client = _shared_mongo_client(self.db_uri, **mongo_options)
-            
-            # 从URI中提取数据库名称
-            db_name = self.db_uri.split('/')[-1]
-            self.mongo_db = self.mongo_client[db_name]
+        elif is_mongo_uri(self.db_uri):
+            # 库名必须写在 URI 路径中（各指标各用一库，不设默认，缺失即报错）
+            self.mongo_db = mongo_database(self.db_uri)
             if init_db:
                 self._init_mongo()
             else:
@@ -204,7 +178,7 @@ class ParamsDB:
                 ))
 
                 logger.info(f"Updated SQLite parameters for {params.stock_code}")
-        elif self.db_uri.startswith('mongodb+srv://'):
+        elif is_mongo_uri(self.db_uri):
             # MongoDB更新
             # 检查是否需要更新
             current_doc = self.params_collection.find_one({'stock_code': params.stock_code})
@@ -234,7 +208,7 @@ class ParamsDB:
         Returns:
             Dict[str, Any] | None: 包含best_params等参数的字典，如果未找到返回None
         """
-        if self.db_uri.startswith('mongodb+srv://'):
+        if is_mongo_uri(self.db_uri):
             try:
                 result = self.params_collection.find_one({'stock_code': stock_code})
                 
@@ -282,7 +256,7 @@ class ParamsDB:
             
             # 获取所有数据
             data = {}
-            if self.db_uri.startswith('mongodb+srv://'):
+            if is_mongo_uri(self.db_uri):
                 # MongoDB备份
                 for doc in self.params_collection.find():
                     # 转换ObjectId和datetime为字符串

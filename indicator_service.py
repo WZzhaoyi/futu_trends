@@ -34,7 +34,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from signal_analysis import KD, MACD, RSI, SupportResistance  # noqa: E402
-from params_db import ParamsDB  # noqa: E402
+from db_engine.params import ParamsDB  # noqa: E402
 from signal_analysis.defaults import (  # noqa: E402,F401  默认参数单一来源，re-export 供调用方复用
     DEFAULT_PARAMS, DEFAULT_META, default_stock_params,
 )
