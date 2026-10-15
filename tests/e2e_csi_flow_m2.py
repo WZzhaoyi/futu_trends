@@ -5,7 +5,7 @@ Checks:
 * entry gates, entry clocks and cooldown on every BUY; ETF ranking recomputed with polyfit;
 * an index-only run produces the same signals; a shorter snapshot reproduces earlier signals;
 * missing ETF bars, missing or leaking monthly thresholds, and missing or invalid index bars are rejected.
-Inputs are read-only snapshots; only temporary copies are altered.
+Inputs are the synthetic snapshot from csi_flow_m2_fixture, written under OUT/inputs; no local market data needed.
 """
 import hashlib
 import json
@@ -19,20 +19,25 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / 'output/csi_flow_m2_e2e'
 ENGINE = ROOT / 'market_analysis/csi_flow_timing_m2.py'
-BARS = ROOT / 'data/csi_flow_15m_research_20261014.json'
-PANEL = ROOT / 'data/etf_strength_15m_20261014.json'
+sys.path[:0] = [str(ROOT / 'market_analysis'), str(ROOT / 'tests')]
+import csi_flow_m2_fixture as fixture  # noqa: E402
+import csi_flow_timing as m1  # noqa: E402
 
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
+    generated = fixture.write(OUT / 'inputs')
+    BARS, PANEL, THRESHOLDS = generated['bars'], generated['panel'], generated['thresholds']
 
-    def run(name, *extra, success=True, panel=True):
+    def run(name, *extra, success=True, panel=True, reason=None):
         dest = OUT / name
-        inputs = ['--bars', str(BARS)] + (['--etf-panel', str(PANEL)] if panel else [])
+        inputs = ['--bars', str(BARS), '--start', fixture.START, '--thresholds', str(THRESHOLDS)] + \
+            (['--etf-panel', str(PANEL)] if panel else [])
         result = subprocess.run([sys.executable, str(ENGINE), 'backtest', *inputs,
                                  '--output', str(dest), *extra], capture_output=True, text=True)
         (OUT / f'{name}.log').write_text(result.stdout + result.stderr)
         assert (result.returncode == 0) == success, result.stderr
+        assert reason is None or reason in result.stderr, result.stderr
         return dest
 
     out = run('full')
@@ -103,7 +108,7 @@ def main():
     assert only['etf_execution'] is None and np.isclose(only['total_return'], stats['total_return'])
     assert (pd.read_csv(index_only / 'trades.csv').signal.tolist() == fills.signal.tolist())
 
-    end = '2024-09-24 10:30:00'
+    end = '2026-03-10 10:30:00'
     obj = json.loads(BARS.read_text())
     obj['bars'] = [r for r in obj['bars'] if r['time_key'] <= end]
     prefix = OUT / 'prefix.json'; prefix.write_text(json.dumps(obj))
@@ -112,21 +117,27 @@ def main():
     pd.testing.assert_frame_equal(small, sig.loc[small.index], check_exact=False,
                                   atol=1e-10, rtol=1e-10)
 
-    missing = json.loads(PANEL.read_text()); missing['panel']['SH.510300'].pop(1000)
+    missing = json.loads(PANEL.read_text()); missing['panel']['SH.510300'].pop(-100)
     bad_panel = OUT / 'missing-etf.json'; bad_panel.write_text(json.dumps(missing))
-    run('missing_etf', '--etf-panel', str(bad_panel), success=False)
+    run('missing_etf', '--etf-panel', str(bad_panel), success=False, reason='不完整或非法交易时段')
     months = OUT / 'future-threshold'; months.mkdir(exist_ok=True)
-    meta = json.loads((ROOT / 'data/csi_flow_thresholds/threshold_2023-02.json').read_text())
-    meta['window_end'] = '2023-02-28'
-    (months / 'threshold_2023-02.json').write_text(json.dumps(meta))
-    run('future_training', '--thresholds', str(months), '--end', '2023-02-28 15:00:00', success=False)
-    run('missing_month', '--thresholds', str(months / 'absent'), success=False)
+    meta = json.loads((THRESHOLDS / 'threshold_2026-02.json').read_text())
+    meta['window_end'] = meta['data_audit']['last_training_bar'] = '2026-02-27'   # 训练窗含生效月
+    train = [b for b in m1.load_bars(BARS) if meta['window_start'] <= b.trading_date <= meta['window_end']]
+    meta['data_audit']['training_bars_sha256'] = m1.sha256_bars(train)          # 哈希一致，只剩泄露可拒绝
+    (months / 'threshold_2026-02.json').write_text(json.dumps(meta))
+    run('future_training', '--thresholds', str(months), '--end', '2026-02-27 15:00:00', success=False,
+        reason='训练窗口、月份或策略来源非法')
+    partial = OUT / 'missing-month'; partial.mkdir(exist_ok=True)
+    for month in ('2026-01', '2026-02'):
+        (partial / f'threshold_{month}.json').write_text((THRESHOLDS / f'threshold_{month}.json').read_text())
+    run('missing_month', '--thresholds', str(partial), success=False, reason="缺少月度阈值：['2026-03']")
     invalid = json.loads(BARS.read_text()); invalid['bars'][100]['turnover'] = 0
     bad = OUT / 'invalid-index.json'; bad.write_text(json.dumps(invalid))
-    run('invalid_index', '--bars', str(bad), success=False)
-    invalid = json.loads(BARS.read_text()); invalid['bars'].pop(100)
+    run('invalid_index', '--bars', str(bad), success=False, reason='非正价格/成交额')
+    invalid = json.loads(BARS.read_text()); invalid['bars'].pop(-100)   # 测试区间内，早于各阈值训练窗末
     bad.write_text(json.dumps(invalid))
-    run('missing_index', '--bars', str(bad), success=False)
+    run('missing_index', '--bars', str(bad), success=False, reason='不完整或非法交易时段')
     checks = ['independent_index_NAV', 'index_only_same_signals', 'independent_ETF_cash_units_NAV', 'all_fill_prices', 'all_rankings',
               'signal_gates', 'next_bar_execution', 'T+1', 'cooldown',
               'prefix_causality', 'missing_ETF_rejection', 'future_training_rejection',

@@ -1,7 +1,8 @@
-"""M2 在线引擎测试：不连接 Futu，用历史快照逐根推送。
+"""M2 在线引擎测试：不连接 Futu，用合成快照（csi_flow_m2_fixture）逐根推送。
 
 检查：
-* 在线假定成交与回测 replay 逐笔一致（信号根、执行根、方向、ETF），含 T+1 卖出、ATR 保护、冷却与跨月换阈值；
+* 在线假定成交与回测 replay 逐笔一致（信号根、执行根、方向、ETF），含跨长假持仓、同日止损延至次日的 T+1 卖出、
+  冷却期内的买入信号与跨月换阈值；
 * 中途重启后成交不变，停机期间的 K 线只报告、不补发信号；
 * 当月阈值缺失时拒绝判定，强度排名不可用时不发买入；
 * 拒绝其他策略或版本的状态文件，初始持仓参数不全时拒绝启动。
@@ -13,12 +14,29 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / 'market_analysis'))
+sys.path[:0] = [str(ROOT / 'market_analysis'), str(ROOT / 'tests')]
+import csi_flow_m2_fixture as fixture  # noqa: E402
 import csi_flow_timing_m2 as m2  # noqa: E402
 
-BARS = ROOT / 'data/csi_flow_15m_research_20261014.json'
-PANEL = ROOT / 'data/etf_strength_15m_20261014.json'
-START, END = '2026-04-20 09:45:00', '2026-06-12 15:00:00'
+START = fixture.START
+INPUTS = ROWS = KEYS = SCHEDULE = PANEL = EXPECTED = None
+_tmp = None
+
+
+def setUpModule():
+    global _tmp, INPUTS, ROWS, KEYS, SCHEDULE, PANEL, EXPECTED
+    _tmp = tempfile.TemporaryDirectory()
+    INPUTS = fixture.write(Path(_tmp.name))
+    ROWS = json.loads(INPUTS['bars'].read_text())['bars']
+    KEYS = [r['time_key'] for r in ROWS]
+    SCHEDULE = m2.schedule_for(INPUTS['thresholds'])
+    PANEL = m2.load_etf_panel(INPUTS['panel'])
+    _, trades, _, _ = m2.replay(INPUTS['bars'], START, thresholds=INPUTS['thresholds'], etf_panel=PANEL)
+    EXPECTED = [(t.side, t.signal, t.execution_bar_end, t.symbol) for t in trades.itertuples()]
+
+
+def tearDownModule():
+    _tmp.cleanup()
 
 
 class ScheduleProvider:
@@ -30,11 +48,6 @@ class ScheduleProvider:
         if month in self.missing or month not in self.schedule:
             raise ValueError(f'缺少 {month} 阈值')
         return self.schedule[month]
-
-
-def load_rows():
-    rows = json.loads(BARS.read_text())['bars']
-    return [r for r in rows if r['time_key'] <= END]
 
 
 def run_engine(rows, start_index, stop_index, state_path, provider, panel, events):
@@ -67,17 +80,9 @@ def fills(events):
 class LiveReplayEquivalenceTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.rows = load_rows()
-        cls.keys = [r['time_key'] for r in cls.rows]
+        cls.rows, cls.keys, cls.schedule, cls.panel, cls.expected = ROWS, KEYS, SCHEDULE, PANEL, EXPECTED
         cls.start = cls.keys.index(START)
-        cls.schedule = m2.schedule_for()
-        cls.panel = m2.load_etf_panel(PANEL)
         cls.tmp = tempfile.TemporaryDirectory()
-        prefix = Path(cls.tmp.name) / 'prefix.json'
-        obj = json.loads(BARS.read_text()); obj['bars'] = cls.rows
-        prefix.write_text(json.dumps(obj))
-        stat, trades, _, _ = m2.replay(prefix, START, END, etf_panel=cls.panel)
-        cls.expected = [(t.side, t.signal, t.execution_bar_end, t.symbol) for t in trades.itertuples()]
         cls.events = []
         cls.engine = run_engine(cls.rows, cls.start, len(cls.rows), Path(cls.tmp.name) / 'state.json',
                                 ScheduleProvider(cls.schedule), cls.panel, cls.events)
@@ -86,12 +91,16 @@ class LiveReplayEquivalenceTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
-    def test_fills_match_replay_including_t1_stop_and_month_switch(self):
+    def test_fills_match_replay_including_holiday_t1_and_month_switch(self):
         got = fills(self.events)
-        self.assertGreaterEqual(len(self.expected), 4)
         self.assertEqual(got, self.expected)
-        deferred = [f for f in got if f[0] == 'SELL' and f[1].startswith('2026-05-21')]
-        self.assertEqual(deferred[0][2][:10], '2026-05-22')     # T+1：同日止损延至次日开盘
+        pairs = list(zip(got[::2], got[1::2]))
+        self.assertGreaterEqual(len(pairs), 4)
+        self.assertEqual({b[1][:7] for b, _ in pairs}, {'2026-02', '2026-03'})
+        self.assertTrue(any(b[2] < '2026-02-16' and s[2] > '2026-02-20' for b, s in pairs))   # 跨长假持仓
+        deferred = [s for b, s in pairs if s[1][:10] == b[2][:10]]           # 入场当日的卖出信号
+        self.assertTrue(deferred)
+        self.assertTrue(all(s[2][:10] > s[1][:10] for s in deferred))      # T+1：延至下一交易日开盘
 
     def test_signal_events_are_emitted_once_per_fill(self):
         signals = [(e['action'], e['bar_key']) for e in self.events if e['type'] == 'SIGNAL' and e['action'] != 'NONE']
@@ -102,8 +111,7 @@ class LiveReplayEquivalenceTest(unittest.TestCase):
     def test_restart_mid_run_reproduces_the_uninterrupted_fills(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp) / 'state.json'; events = []
-            middle = self.keys.index('2026-05-21 13:00:00') if '2026-05-21 13:00:00' in self.keys else \
-                self.keys.index('2026-05-21 13:15:00')               # 持仓中、待T+1卖出之前重启
+            middle = self.keys.index('2026-03-19 13:15:00')               # 持仓中、待T+1卖出之前重启
             run_engine(self.rows, self.start, middle, state, ScheduleProvider(self.schedule), self.panel, events)
             restarted = []
             run_engine(self.rows, middle - 1, len(self.rows), state, ScheduleProvider(self.schedule), self.panel, restarted)
@@ -123,10 +131,8 @@ class LiveReplayEquivalenceTest(unittest.TestCase):
 
 class FailClosedTest(unittest.TestCase):
     def setUp(self):
-        self.rows = load_rows()
-        self.start = [r['time_key'] for r in self.rows].index(START)
-        self.schedule = m2.schedule_for()
-        self.panel = m2.load_etf_panel(PANEL)
+        self.rows, self.schedule, self.panel = ROWS, SCHEDULE, PANEL
+        self.start = KEYS.index(START)
         self.tmp = tempfile.TemporaryDirectory()
 
     def tearDown(self):
@@ -135,12 +141,13 @@ class FailClosedTest(unittest.TestCase):
     def test_missing_current_month_threshold_raises(self):
         with self.assertRaises(ValueError):
             run_engine(self.rows, self.start, self.start + 3, Path(self.tmp.name) / 's.json',
-                       ScheduleProvider(self.schedule, missing={'2026-04'}), self.panel, [])
+                       ScheduleProvider(self.schedule, missing={'2026-02'}), self.panel, [])
 
     def test_buy_without_strength_ranking_is_not_published(self):
         empty = {s: self.panel[s][:m2.STRENGTH_N] for s in m2.STRENGTH_SYMBOLS}   # 只有最早的几根，排名必然失败
         events = []
-        engine = run_engine(self.rows, self.start, len(self.rows), Path(self.tmp.name) / 's.json',
+        first_buy = KEYS.index(next(f[1] for f in EXPECTED if f[0] == 'BUY'))
+        engine = run_engine(self.rows, self.start, first_buy + 3, Path(self.tmp.name) / 's.json',
                             ScheduleProvider(self.schedule), empty, events)
         self.assertFalse([e for e in events if e['type'] == 'EXECUTION_ASSUMED'])
         self.assertTrue([e for e in events if e['type'] == 'ERROR' and '强度排名不可用' in e['message']])
