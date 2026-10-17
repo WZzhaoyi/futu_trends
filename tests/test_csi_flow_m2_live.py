@@ -1,11 +1,11 @@
 """M2 在线引擎测试：不连接 Futu，用合成快照（csi_flow_m2_fixture）逐根推送。
 
 检查：
-* 在线假定成交与回测 replay 逐笔一致（信号根、执行根、方向、ETF），含跨长假持仓、同日止损延至次日的 T+1 卖出、
-  冷却期内的买入信号与跨月换阈值；
+* 在线假定成交与回测 replay 逐笔一致（信号根、执行根、方向、ETF），含跨长假持仓、同日止损延至次日的 T+1 卖出
+  与跨月换阈值；买入只看 M 与入场时点，卖出后可立即再入场；
 * 中途重启后成交不变，停机期间的 K 线只报告、不补发信号；
 * 当月阈值缺失时拒绝判定，强度排名不可用时不发买入；
-* 拒绝其他策略或版本的状态文件，初始持仓参数不全时拒绝启动。
+* 拒绝其他策略或版本的状态文件；初始持仓参数不全时拒绝启动。
 """
 import json
 import sys
@@ -164,9 +164,47 @@ class FailClosedTest(unittest.TestCase):
             m2.LiveState(Path(self.tmp.name) / 'long.json', 'long', '2026-05-20', None)
 
 
+class EtfHaltTest(unittest.TestCase):
+    """ETF 停牌：未持有的 ETF 整日缺根不影响账本；持有中的 ETF 缺根拒绝回放。"""
+
+    def test_halt_of_unheld_etf_is_ignored_and_held_etf_is_rejected(self):
+        _, trades, curve, _ = m2.replay(INPUTS['bars'], START, thresholds=INPUTS['thresholds'], etf_panel=PANEL)
+        days = list(dict.fromkeys(curve.index.strftime('%Y-%m-%d')))
+        rows = trades.to_dict('records')
+        buy, sell = next((b, s) for b, s in zip(rows[::2], rows[1::2])
+                         if days.index(s['execution_bar_end'][:10]) - days.index(b['execution_bar_end'][:10]) >= 2)
+        day = days[days.index(buy['execution_bar_end'][:10]) + 1]     # 整日持有、无成交
+        held = buy['symbol']; other = next(s for s in m2.STRENGTH_SYMBOLS if s != held)
+
+        def halted(symbol):
+            return {s: [b for b in PANEL[s] if s != symbol or b['time_key'][:10] != day] for s in PANEL}
+        _, _, unheld_curve, _ = m2.replay(INPUTS['bars'], START, thresholds=INPUTS['thresholds'],
+                                          etf_panel=halted(other))
+        self.assertTrue(unheld_curve.etf_equity.equals(curve.etf_equity))
+        with self.assertRaisesRegex(ValueError, '缺根'):
+            m2.replay(INPUTS['bars'], START, thresholds=INPUTS['thresholds'], etf_panel=halted(held))
+
+
+class RuleTest(unittest.TestCase):
+    """入场只看 M 与入场时点；卖出后同一交易日即可再次入场。"""
+
+    def test_buy_is_m_at_entry_clocks(self):
+        bars = m2.load_data(INPUTS['bars'])
+        sig = m2.build_signals(bars, SCHEDULE)
+        clock = sig.index.strftime('%H:%M')
+        self.assertTrue((sig.buy == (sig.M & clock.isin(m2.ENTRY_CLOCKS))).all())
+        self.assertTrue(sig.buy.any())
+
+    def test_reentry_right_after_exit(self):
+        n = 6; op = cl = [10.0] * n; sessions = [0, 0, 1, 1, 1, 2]
+        buy = [1, 0, 0, 0, 1, 0]; sell = [0, 0, 1, 0, 0, 0]; atr = [float('nan')] * n
+        _, pos, trades = m2.simulate(op, cl, sessions, buy, sell, atr)
+        self.assertEqual([(t[0], t[1], t[2]) for t in trades], [('BUY', 0, 1), ('SELL', 2, 3), ('BUY', 4, 5)])
+
+
 class FormatTest(unittest.TestCase):
     def test_buy_and_sell_messages(self):
-        base = dict(type='SIGNAL', bar_key='2026-05-21 10:30:00', position_before=0, reason='M成立且D或P至少一票',
+        base = dict(type='SIGNAL', bar_key='2026-05-21 10:30:00', position_before=0, reason='M成立（z30、z60达到当月阈值）',
                     threshold={'month': '2026-05'}, signals=dict(z30=1.2, z60=1.6, D=1.1, P=0.8, strong=True))
         subject, text = m2.format_event({**base, 'action': 'BUY', 'strength': {'ranking': [
             {'rank': 1, 'symbol': 'SH.510500', 'score': 0.012}]}})

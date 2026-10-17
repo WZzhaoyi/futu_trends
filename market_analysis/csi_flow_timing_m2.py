@@ -32,12 +32,11 @@ from live_runtime import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "M2-m-required-trendhold-atrvalve-cool3-etf-leader-causal"
+VERSION = "M2-m-only-trendhold-atrvalve-nocool-etf-leader-causal"
 SYMBOL = "SH.000902"
 STRENGTH_SYMBOLS = ("SH.510300", "SH.510500", "SH.510050", "SH.512100")
 
 TRAIL_K = 1.5                 # 峰值收盘回撤止损倍数（日 ATR(20)）
-COOLDOWN_SESSIONS = 3         # 出场后冷却的交易日数
 ENTRY_CLOCKS = ("10:30", "14:00")
 EXIT_CLOCKS = ("10:00", "10:30", "14:00")
 STRENGTH_N = 9
@@ -52,6 +51,7 @@ MARKET_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 M_THRESHOLD_SOURCE = "M1-LF-held-downside-exact-grid-strength-t1-defer-v2"
 DEFAULT_THRESHOLDS = ROOT / 'data/csi_flow_thresholds'   # 回测默认目录；在线运行使用运行目录
 INCOMPLETE_WINDOW_TOLERANCE_DAYS = 7   # 训练窗末日距月末容许的最大缺口（周末/假期）
+BACKTEST_START = '2021-01-04'           # 默认评价起点：阈值训练窗需此前 9 个月 15 分钟行情（快照自 2020-01）
 
 
 
@@ -146,7 +146,7 @@ def daily_atr(bars: pd.DataFrame, window=20) -> np.ndarray:
 
 # ============================ 信号 ============================
 def build_signals(bars: pd.DataFrame, schedule, m1_bars=None) -> pd.DataFrame:
-    """M/D/P 三票、入场、普通退出与多头趋势态；只用已完成 K 线，回测与在线共用。"""
+    """M 票与入场、D/P 普通退出、多头趋势态；只用已完成 K 线，回测与在线共用。"""
     day = bars.index.normalize()
     sessions = pd.factorize(day)[0]
     prev = bars.close.shift(1)
@@ -166,11 +166,8 @@ def build_signals(bars: pd.DataFrame, schedule, m1_bars=None) -> pd.DataFrame:
         raise ValueError('生产解析器与快照根数不一致')
     M = np.array([bool(th and f and f.z30 >= th.entry_z30 and f.z60 >= th.entry_z60)
                   for f, th in zip(feats, (schedule.get(b.trading_date[:7]) for b in lbs))])
-    D_up = (center >= 1).to_numpy()
-    P_up = (channel >= 0.75).to_numpy()
-    votes = M.astype(int) + D_up.astype(int) + P_up.astype(int) >= 2
     clock = bars.index.strftime('%H:%M').to_numpy()
-    buy = M & (D_up | P_up) & np.isin(clock, ENTRY_CLOCKS)
+    buy = M & np.isin(clock, ENTRY_CLOCKS)
     regular_exit = ((center <= -1) | (channel <= 0.25)).to_numpy() & np.isin(clock, EXIT_CLOCKS)
 
     daily = bars.close.groupby(day).last()
@@ -183,26 +180,25 @@ def build_signals(bars: pd.DataFrame, schedule, m1_bars=None) -> pd.DataFrame:
     return pd.DataFrame(dict(
         z30=[f.z30 if f else np.nan for f in feats],
         z60=[f.z60 if f else np.nan for f in feats],
-        D_value=center, P_value=channel, M=M, D_up=D_up, P_up=P_up, votes=votes,
+        D_value=center, P_value=channel, M=M,
         buy=buy, regular_exit=regular_exit, strong=strong, exit_trend_hold=regular_exit & ~strong,
         atr_daily=daily_atr(bars)), index=bars.index)
 
 
 # ============================ 执行 / 回测 ============================
 class Executor:
-    """回测与在线共用的执行状态机：下一根开盘成交、T+1 卖出延后、峰值回撤止损、出场后冷却。
+    """回测与在线共用的执行状态机：下一根开盘成交、T+1 卖出延后、峰值回撤止损。
 
     session 为交易日序号（相邻交易日相差 1）；bar 为 K 线序号。调用顺序固定：
     每根 K 线先 open_bar（处理到期的待成交单），再 close_bar（更新峰值、决定新的待成交单）。
     """
 
-    def __init__(self, lag=LAG_BARS, trail_k=TRAIL_K, cooldown=COOLDOWN_SESSIONS):
-        if lag < 1 or trail_k < 0 or cooldown < 0:
+    def __init__(self, lag=LAG_BARS, trail_k=TRAIL_K):
+        if lag < 1 or trail_k < 0:
             raise ValueError('参数非法')
-        self.lag, self.trail_k, self.cooldown = lag, trail_k, cooldown
+        self.lag, self.trail_k = lag, trail_k
         self.position = 0
         self.entered = None          # 买入成交所在交易日序号
-        self.block_until = None      # 不早于该交易日序号才允许新的入场信号
         self.peak = None             # 持仓以来最高收盘（含买入成交根）
         self.pending = ''            # 'BUY' / 'SELL'
         self.due = None              # 待成交单最早成交的 K 线序号
@@ -219,7 +215,6 @@ class Executor:
             self.position, self.entered = 1, session
         else:
             self.position, self.entered, self.peak = 0, None, None
-            self.block_until = session + self.cooldown
         return side
 
     def close_bar(self, bar, session, close, buy, sell, atr, decide=True):
@@ -230,7 +225,7 @@ class Executor:
             return ''
         stopped = bool(self.position and self.trail_k > 0 and np.isfinite(atr)
                        and close < self.peak - self.trail_k * atr)
-        if not self.position and buy and (self.block_until is None or session >= self.block_until):
+        if not self.position and buy:
             side = 'BUY'
         elif self.position and (sell or stopped):
             side = 'SELL'
@@ -244,12 +239,11 @@ class Executor:
                     and close < self.peak - self.trail_k * atr)
 
 
-def simulate(op, cl, sessions, buy, sell, atr, cost_bps=COST_BPS, lag=LAG_BARS,
-             trail_k=TRAIL_K, cooldown=COOLDOWN_SESSIONS):
+def simulate(op, cl, sessions, buy, sell, atr, cost_bps=COST_BPS, lag=LAG_BARS, trail_k=TRAIL_K):
     """二元全仓回放，规则由 Executor 执行；返回净值、仓位与成交 (side, 信号根, 成交根, 开盘价)。"""
     if not 0 <= cost_bps < 10000:
         raise ValueError('参数非法')
-    ex = Executor(lag, trail_k, cooldown)
+    ex = Executor(lag, trail_k)
     eq = np.empty(len(op)); pos = np.zeros(len(op), int)
     cash, units, trades = 1.0, 0.0, []
     fee = 1 - cost_bps / 10000
@@ -285,7 +279,7 @@ def metrics(eq, pos, trades, sessions, index, cost_bps=COST_BPS, lag=LAG_BARS) -
                 cost_bps_per_side=cost_bps, lag_bars=lag)
 
 
-def replay(bars_path, start='2023-02-01', end=None, thresholds=None,
+def replay(bars_path, start=BACKTEST_START, end=None, thresholds=None,
            cost_bps=COST_BPS, lag=LAG_BARS, etf_panel=None):
     """指数口径回放；给出 etf_panel 时另算 ETF 执行账本（信号、成交时点与 T+1 完全相同）。"""
     bars = load_data(bars_path)
@@ -325,11 +319,18 @@ def replay(bars_path, start='2023-02-01', end=None, thresholds=None,
 
 
 def etf_ledger(test, trades, panel, cost_bps=COST_BPS):
-    """ETF 执行模块：入场时用 etf_leader 选头名并持有至卖出；成交取该 ETF 执行根开盘价。"""
+    """ETF 执行模块：入场时用 etf_leader 选头名并持有至卖出；成交取该 ETF 执行根开盘价。
+
+    只要求持有中或当根成交的 ETF 有该根行情；未持有的 ETF 停牌缺根不影响账本。
+    持有或成交的 ETF 缺根时报错，不补值、不回退指数。
+    """
     frames = {s: frame_from_rows(panel[s], require_turnover=False) for s in STRENGTH_SYMBOLS}
-    for f in frames.values():
-        if not test.index.isin(f.index).all():
-            raise ValueError('ETF缺根，不补值、不回退指数')
+
+    def bar_of(symbol, ts):
+        if ts not in frames[symbol].index:
+            raise ValueError(f'{symbol} 在 {ts} 缺根（持有或成交中），不补值、不回退指数')
+        return frames[symbol].loc[ts]
+
     eq = np.empty(len(test)); cash, units, held = 1., 0., None
     by_bar = {t[2]: t for t in trades}; fee = 1 - cost_bps / 10000; fills = []
     for i, ts in enumerate(test.index):
@@ -339,16 +340,16 @@ def etf_ledger(test, trades, panel, cost_bps=COST_BPS):
             if side == 'BUY':
                 rank = etf_leader(panel, test.index[src])
                 held, observation_end = rank['ranking'][0]['symbol'], rank['observation_end']
-                price = float(frames[held].loc[ts, 'open'])
+                price = float(bar_of(held, ts)['open'])
                 units, cash = cash * fee / price, 0.
             else:
-                price = float(frames[held].loc[ts, 'open'])
+                price = float(bar_of(held, ts)['open'])
                 cash, units = units * price * fee, 0.
             fills.append(dict(side=side, signal=str(test.index[src]), execution_bar_end=str(ts),
                               execution_time=str(ts - pd.Timedelta(minutes=15)), index_price=index_price,
                               symbol=held, price=price, cash=cash, units=units,
                               ranking_observation_end=observation_end))
-        eq[i] = cash + (units * frames[held].loc[ts, 'close'] if units else 0.)
+        eq[i] = cash + (units * bar_of(held, ts)['close'] if units else 0.)
     return eq, fills
 
 
@@ -466,7 +467,7 @@ STATE_SCHEMA = 1
 HISTORY_BARS = 1000          # Futu get_cur_kline 单次上限
 MIN_SESSIONS = 26            # 20 日均线、此前 5 日新高与日 ATR(20) 所需的完整交易日
 RETAINED_BARS = 1200
-OLD_SESSION = -10 ** 6       # 早于保留历史的交易日：T+1 与冷却均已满足
+OLD_SESSION = -10 ** 6       # 早于保留历史的交易日：T+1 已满足
 
 
 def bar_key(value, shift_minutes=0) -> str:
@@ -569,8 +570,6 @@ class LiveEngine:
         ex.position = st.position
         ex.entered = lookup(st.entry_date) if st.position else None
         ex.peak = st.peak_close
-        if st.exit_date:
-            ex.block_until = lookup(st.exit_date) + COOLDOWN_SESSIONS
         if st.pending:
             ex.pending, ex.due = st.pending['side'], -1      # 信号根之后的任意一根均已到期
         return ex
@@ -673,8 +672,7 @@ class LiveEngine:
                 st.last_decided_bar = bar['time_key']; st.save()
                 self.emit(dict(type='ERROR', bar_key=bar['time_key'], message=f'强度排名不可用，BUY信号未发布: {exc}'))
                 return lookup
-            event.update(strength=ranking, reason='M成立且D或P至少一票',
-                         route='M' + ('D' if row.D_up else '') + ('P' if row.P_up else ''))
+            event.update(strength=ranking, reason='M成立（z30、z60达到当月阈值）')
             st.pending = dict(side='BUY', signal_bar=bar['time_key'], etf=ranking['ranking'][0]['symbol'])
         elif side == 'SELL':
             normal = bool(row.exit_trend_hold)
@@ -871,7 +869,7 @@ def cli(argv=None) -> int:
     p = sub.add_parser('backtest', help='指数口径回测；给出 --etf-panel 时另算ETF执行账本')
     p.add_argument('--bars', type=Path, required=True)
     p.add_argument('--etf-panel', type=Path, default=None)
-    p.add_argument('--start', default='2023-02-01'); p.add_argument('--end', default=None)
+    p.add_argument('--start', default=BACKTEST_START); p.add_argument('--end', default=None)
     p.add_argument('--thresholds', type=Path, default=None)
     p.add_argument('--cost-bps', type=float, default=COST_BPS)
     p.add_argument('--lag', type=int, default=LAG_BARS)

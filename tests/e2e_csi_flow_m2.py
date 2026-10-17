@@ -2,7 +2,8 @@
 
 Checks:
 * index NAV and ETF ledger rebuilt from raw bars and exported fills (next-bar open, costs, T+1);
-* entry gates, entry clocks and cooldown on every BUY; ETF ranking recomputed with polyfit;
+* entry gate (M) and entry clocks on every BUY; every flat stretch re-enters on its first M entry bar;
+  ETF ranking recomputed with polyfit;
 * an index-only run produces the same signals; a shorter snapshot reproduces earlier signals;
 * missing ETF bars, missing or leaking monthly thresholds, and missing or invalid index bars are rejected.
 Inputs are the synthetic snapshot from csi_flow_m2_fixture, written under OUT/inputs; no local market data needed.
@@ -57,7 +58,8 @@ def main():
     ix = curve.index
     sessions = pd.factorize(ix.normalize())[0]
     cash, units, held, j = 1., 0., None, 0
-    entered, last_sell = -1, None
+    entered, flat_from = -1, 0
+    gate = sig.loc[ix]; gate = (gate.M.astype(bool) & ix.strftime('%H:%M').isin(['10:30', '14:00'])).to_numpy()
     nav, index_nav = [], []
     icash, iunits = 1., 0.
     fee = 1 - stats['cost_bps_per_side'] / 10000
@@ -72,9 +74,8 @@ def main():
             if fill.side == 'BUY':
                 assert units == 0 and fill.signal[11:16] in ('10:30', '14:00')
                 row = sig.loc[fill.signal]
-                assert row.M and (row.D_up or row.P_up)
-                if last_sell is not None:
-                    assert sessions[src] >= last_sell + 3
+                assert row.M
+                assert src == flat_from + int(np.argmax(gate[flat_from:]))     # 空仓后第一根 M 入场根即买入
                 # polyfit 与 etf_leader 的中心化点积公式相互独立。
                 common = set.intersection(*(set(f.index[f.index <= fill.signal]) for f in frames.values()))
                 keys = sorted(common)[-9:]
@@ -89,7 +90,7 @@ def main():
                 assert fill.side == 'SELL' and held == fill.symbol and sessions[i] > entered
                 cash, units = units * fill.price * fee, 0.
                 icash, iunits = iunits * fill.index_price * fee, 0.
-                last_sell = sessions[i]
+                flat_from = i                                                   # 卖出成交根收盘即可再判定入场
             j += 1
         nav.append(cash + (units * frames[held].loc[str(ts), 'close'] if units else 0.))
         index_nav.append(icash + iunits * index_frame.loc[str(ts), 'close'])
@@ -139,7 +140,7 @@ def main():
     bad.write_text(json.dumps(invalid))
     run('missing_index', '--bars', str(bad), success=False, reason='不完整或非法交易时段')
     checks = ['independent_index_NAV', 'index_only_same_signals', 'independent_ETF_cash_units_NAV', 'all_fill_prices', 'all_rankings',
-              'signal_gates', 'next_bar_execution', 'T+1', 'cooldown',
+              'signal_gates', 'next_bar_execution', 'T+1', 'first_reentry',
               'prefix_causality', 'missing_ETF_rejection', 'future_training_rejection',
               'missing_threshold_rejection', 'invalid_index_rejection', 'missing_bar_rejection']
     evidence = dict(status='PASS', checks=checks, fills=len(fills), bars=len(curve),
