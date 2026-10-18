@@ -40,11 +40,9 @@ class PM2ServiceTest(unittest.TestCase):
         cases = (
             ("order-engine", "start", "order_engine/__main__.py", {}),
             ("signal-api", "restart", "gui/backend/api.py", {"--port": "18001"}),
-            ("csi-flow", "start", "market_analysis/csi_flow_timing.py", {
-                "--runtime-dir": runtime, "--symbol": "SH.000300",
-                "--initial-position": "long", "--entry-date": "2026-09-01",
-                "--notification-mode": "position-independent",
-                "--window-months": "10", "--t1-sell-mode": "ignore-same-day",
+            ("csi-flow", "start", "market_analysis/csi_flow_timing_m3.py", {
+                "--runtime-dir": runtime, "--preset": "m1",
+                "--initial-layers": "1", "--entry-date": "2026-09-01", "--held-etf": "SH.510500",
             }),
             ("etf-premium", "start", "market_analysis/etf_premium_rate.py", {
                 "--runtime-dir": runtime, "--symbol": "510300",
@@ -120,8 +118,9 @@ class PM2ServiceTest(unittest.TestCase):
             ("signal-api", str(self.config), {"port": 65536}, "端口超出范围"),
             ("csi-flow", str(self.config), {"runtime_dir": "relative/path"}, "绝对路径"),
             ("csi-flow", str(self.config), {
-                "runtime_dir": runtime, "initial_position": "long",
+                "runtime_dir": runtime, "initial_layers": "0,0,1",
             }, "entry-date"),
+            ("csi-flow", str(self.config), {"runtime_dir": runtime, "preset": "m4"}, "preset"),
             ("etf-premium", str(self.config), {
                 "runtime_dir": "relative/path", "symbol": "159941", "initial_position": "base",
             }, "绝对路径"),

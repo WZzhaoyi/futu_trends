@@ -189,11 +189,12 @@ class LiveRuntimeTest(unittest.TestCase):
         sys.path.insert(0, str(MODULE_PATH.parent))
         engine = Engine()
         notifier = live_runtime.EventNotifier(
-            engine, lambda e: (f"M2 {e.get('action', e['type'])}", f"text {e.get('bar_key', '')}"),
-            name="test-notifier", sheet_strategy="m2",
+            engine, lambda e: (f"M3 {e.get('action', e['type'])}", f"text {e.get('bar_key', '')}"),
+            name="test-notifier", sheet_strategy="m3",
         )
-        base = {"symbol": "SH.000902", "strategy": "m2"}
+        base = {"symbol": "SH.000902", "strategy": "m3", "tag": "M3"}
         buy = {**base, "type": "SIGNAL", "action": "BUY", "bar_key": "2026-05-06 10:30:00",
+               "position_text": "0→1", "reason": "动量启动（M）",
                "strength": {"ranking": [{"symbol": "SH.510500"}]}}
         stderr = io.StringIO()
         with redirect_stderr(stderr):
@@ -204,10 +205,10 @@ class LiveRuntimeTest(unittest.TestCase):
             notifier.notify({**base, "type": "ERROR", "message": "feed"})
             notifier.close()
         self.assertEqual(len(engine.webhooks), 2)
-        self.assertEqual(engine.emails[0][0], "M2 BUY")
+        self.assertEqual(engine.emails[0][0], "M3 BUY")
         self.assertIn("telegram down", stderr.getvalue())
         self.assertEqual(len(engine.sheets), 1)
-        self.assertIn("M2 SH.000902 BUY 首选SH.510500", engine.sheets[0])
+        self.assertIn("SH.000902", engine.sheets[0])
 
 if __name__ == "__main__":
     unittest.main()

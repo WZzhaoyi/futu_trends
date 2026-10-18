@@ -27,7 +27,7 @@ PM2 管理命令的配置参数属于具体服务子命令：
 ```bash
 <PYTHON> <REPO>/cli/main.py pm2 order-engine <ACTION> --config <ABS_CONFIG>
 <PYTHON> <REPO>/cli/main.py pm2 signal-api <ACTION> --config <ABS_CONFIG> [--port 8001]
-<PYTHON> <REPO>/cli/main.py pm2 csi-flow <ACTION> --config <ABS_CONFIG> --runtime-dir <ABS_RUNTIME>
+<PYTHON> <REPO>/cli/main.py pm2 csi-flow <ACTION> --config <ABS_CONFIG> --runtime-dir <ABS_RUNTIME> [--preset m3|m1|m2]
 <PYTHON> <REPO>/cli/main.py pm2 etf-premium <ACTION> --config <ABS_CONFIG> --runtime-dir <ABS_RUNTIME>
 <PYTHON> <REPO>/cli/main.py pm2 momentum-rotation <ACTION> --mode live \
   --config <ABS_CONFIG> --runtime-dir <ABS_RUNTIME>
@@ -245,7 +245,7 @@ web [--port <PORT>] [--forever]
 ```bash
 pm2 order-engine start|restart|stop|delete|logs|status --config <ABS_CONFIG>
 pm2 signal-api start|restart|stop|delete|logs|status --config <ABS_CONFIG> [--port <PORT>]
-pm2 csi-flow start|restart|stop|delete|logs|status --config <ABS_CONFIG> --runtime-dir <ABS_RUNTIME>
+pm2 csi-flow start|restart|stop|delete|logs|status --config <ABS_CONFIG> --runtime-dir <ABS_RUNTIME> [--preset m3|m1|m2]
 pm2 etf-premium start|restart|stop|delete|logs|status --config <ABS_CONFIG> --runtime-dir <ABS_RUNTIME>
 pm2 momentum-rotation start|restart|stop|delete|logs|status --mode live \
   --config <ABS_CONFIG> --runtime-dir <ABS_RUNTIME>
@@ -255,7 +255,9 @@ pm2 save
 - 五类服务都必须显式传 `--config`，无默认配置；文件不存在时退出码为 `2`。
 - `signal-api` 端口默认 `8001`，配置绝对路径与端口共同确定 PM2 实例名。
 - `order-engine` 由配置绝对路径确定 PM2 实例名。
-- `csi-flow` 还必须传绝对 `--runtime-dir`；`live` 在其中自动维护行情、阈值、状态和实例锁。
+- `csi-flow` 运行 `market_analysis/csi_flow_timing_m3.py`，还必须传绝对 `--runtime-dir`；`live` 在其中自动维护行情、阈值、状态和实例锁。
+  `--preset` 选择权重预设（默认 `m3`，`m1`、`m2` 分别等同 M1、M2），配置路径、运行目录与预设共同确定实例名；
+  同时运行多个预设时各用一个运行目录。已有持仓时用 `--initial-layers`（各启用层 0/1）加 `--entry-date`、`--held-etf` 声明。
 - `etf-premium` 也必须传绝对 `--runtime-dir`；默认标的 `159941`。交易信号只使用 T-1
   单位净值溢价，Futu IOPV 溢价只写入快照和通知作为盘中提示。
 - `momentum-rotation` 也必须传绝对 `--runtime-dir`：PM2 `cron_restart` 定时触发

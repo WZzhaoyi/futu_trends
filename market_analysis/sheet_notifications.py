@@ -22,10 +22,12 @@ def send_sheet_signal(engine, strategy, event):
         if not event.get('market') or not event.get('leg'):
             return
         summary = f"轮动 {event['leg']} {action} {previous}→{target}"
-    elif strategy in ('m1', 'm2'):
+    elif strategy == 'm3':
         if not event.get('symbol'):
             return
-        summary = f"{strategy.upper()} {event['symbol']} {action}"
+        reason = str(event.get('reason', '')).replace('（', '(').replace('）', ')')
+        summary = (f"{event.get('tag', 'M3')} {event['symbol']} {'进场' if action == 'BUY' else '离场'} "
+                   f"{event.get('position_text', '')} {reason}")
         ranking = (event.get('strength') or {}).get('ranking') or []
         if action == 'BUY' and ranking and ranking[0].get('symbol'):
             summary += f" 首选{ranking[0]['symbol']}"

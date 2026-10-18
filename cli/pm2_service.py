@@ -79,9 +79,9 @@ def build_service_spec(
     symbol: str = "SH.000902",
     initial_position: str = "flat",
     entry_date: str | None = None,
-    notification_mode: str = "position-aware",
-    window_months: int = 9,
-    t1_sell_mode: str = "defer-next-open",
+    preset: str = "m3",
+    initial_layers: str | None = None,
+    held_etf: str | None = None,
     strategy_file: str | None = None,
     cache_dir: str | None = None,
     interval: float = 60.0,
@@ -129,41 +129,30 @@ def build_service_spec(
         if not runtime_dir:
             raise PM2ConfigError("csi-flow 必须指定 --runtime-dir")
         runtime_path = _resolved_runtime_dir(runtime_dir)
-        if initial_position not in {"flat", "long"}:
-            raise PM2ConfigError("initial-position 只能是 flat 或 long")
-        if initial_position == "long" and not entry_date:
-            raise PM2ConfigError(
-                "initial-position=long 必须同时指定 --entry-date"
-            )
-        if notification_mode not in {"position-aware", "position-independent"}:
-            raise PM2ConfigError("notification-mode 无效")
-        if window_months < 1:
-            raise PM2ConfigError("window-months 必须不小于 1")
-        if t1_sell_mode not in {"defer-next-open", "ignore-same-day"}:
-            raise PM2ConfigError("t1-sell-mode 无效")
+        if preset not in {"m3", "m1", "m2"}:
+            raise PM2ConfigError("preset 只能是 m3、m1 或 m2")
+        if initial_layers and "1" in initial_layers.split(",") and not (entry_date and held_etf):
+            raise PM2ConfigError("初始持仓必须同时指定 --entry-date 与 --held-etf")
         digest_input = "\0".join(
-            (
-                identity,
-                _identity_path(runtime_path, platform),
-                symbol.upper(),
-            )
+            (identity, _identity_path(runtime_path, platform), preset)
         )
         digest = hashlib.sha256(digest_input.encode()).hexdigest()[:8]
         environment = {
             "CSI_FLOW_CONFIG": str(config_path),
             "CSI_FLOW_RUNTIME_DIR": str(runtime_path),
-            "CSI_FLOW_SYMBOL": symbol.upper(),
-            "CSI_FLOW_INITIAL_POSITION": initial_position,
-            "CSI_FLOW_NOTIFICATION_MODE": notification_mode,
-            "CSI_FLOW_WINDOW_MONTHS": str(window_months),
-            "CSI_FLOW_T1_SELL_MODE": t1_sell_mode,
+            "CSI_FLOW_PRESET": preset,
         }
-        if entry_date:
-            environment["CSI_FLOW_ENTRY_DATE"] = entry_date
+        for key, value in (
+            ("CSI_FLOW_INITIAL_LAYERS", initial_layers),
+            ("CSI_FLOW_ENTRY_DATE", entry_date),
+            ("CSI_FLOW_HELD_ETF", held_etf),
+        ):
+            if value:
+                environment[key] = value
         return ServiceSpec(
             service=service,
             config_path=config_path,
-            instance_name=f"futu-csi-flow-{digest}",
+            instance_name=f"futu-csi-flow-{preset}-{digest}",
             ecosystem_path=(
                 PROJECT_ROOT
                 / "market_analysis"
@@ -339,7 +328,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     csi_flow = targets.add_parser(
         "csi-flow",
-        help="管理中证流通 M1 长期信号服务",
+        help="管理中证流通择时信号服务（M3 脚本，按预设运行 m3/m1/m2）",
     )
     csi_flow.add_argument("action", choices=MANAGED_ACTIONS)
     csi_flow.add_argument(
@@ -350,26 +339,12 @@ def _build_parser() -> argparse.ArgumentParser:
     csi_flow.add_argument(
         "--runtime-dir",
         required=True,
-        help="live 运行目录绝对路径",
+        help="live 运行目录绝对路径；每个预设各用一个",
     )
-    csi_flow.add_argument("--symbol", default="SH.000902")
-    csi_flow.add_argument(
-        "--initial-position",
-        choices=("flat", "long"),
-        default="flat",
-    )
+    csi_flow.add_argument("--preset", choices=("m3", "m1", "m2"), default="m3")
+    csi_flow.add_argument("--initial-layers", help="各启用层初始持仓 0/1，逗号分隔")
     csi_flow.add_argument("--entry-date")
-    csi_flow.add_argument(
-        "--notification-mode",
-        choices=("position-aware", "position-independent"),
-        default="position-aware",
-    )
-    csi_flow.add_argument("--window-months", type=int, default=9)
-    csi_flow.add_argument(
-        "--t1-sell-mode",
-        choices=("defer-next-open", "ignore-same-day"),
-        default="defer-next-open",
-    )
+    csi_flow.add_argument("--held-etf")
 
     etf_premium = targets.add_parser(
         "etf-premium",
@@ -423,13 +398,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             symbol=getattr(args, "symbol", "SH.000902"),
             initial_position=getattr(args, "initial_position", "flat"),
             entry_date=getattr(args, "entry_date", None),
-            notification_mode=getattr(
-                args, "notification_mode", "position-aware"
-            ),
-            window_months=getattr(args, "window_months", 9),
-            t1_sell_mode=getattr(
-                args, "t1_sell_mode", "defer-next-open"
-            ),
+            preset=getattr(args, "preset", "m3"),
+            initial_layers=getattr(args, "initial_layers", None),
+            held_etf=getattr(args, "held_etf", None),
             strategy_file=getattr(args, "strategy_file", None),
             cache_dir=getattr(args, "cache_dir", None),
             interval=getattr(args, "interval", 60.0),

@@ -18,7 +18,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / 'market_analysis')]
 import notification_engine.engine as owner
 from notification_engine import NotificationEngine
-from market_analysis import csi_flow_timing as m1
+from market_analysis import csi_flow_timing_m3 as m3
+from live_runtime import EventNotifier
 from market_analysis import momentum_rotation_strategy as rotation
 from market_analysis import etf_premium_rate as premium
 
@@ -93,10 +94,14 @@ def writer(endpoint, index):
             assert send(f'并发信号{index}', sheet_date=date(2026, 10, 13))
 
 
+def m3_notifier(engine, **options):
+    return EventNotifier(engine, m3.format_event, name='m3-sheet-e2e', sheet_strategy='m3', **options)
+
+
 def events():
     stamp = '2026-10-13T23:59:59-04:00'
     return [
-        (m1.LiveEventNotifier, {'type': 'SIGNAL', 'action': 'BUY', 'symbol': 'SH.000906', 'bar_key': '2026-10-13 14:45:00', 'feature': {}, 'threshold': {}, 'strength': {'ranking': [{'symbol': 'SH.510500', 'score': .03}]}, 'emitted_at': stamp}),
+        (m3_notifier, {'type': 'SIGNAL', 'action': 'BUY', 'symbol': 'SH.000902', 'tag': 'M3', 'bar_key': '2026-10-13 14:45:00', 'position_before': 0, 'position_after': 1, 'position_text': '0→1', 'reason': '动量启动（M）', 'strength': {'ranking': [{'symbol': 'SH.510500', 'score': .03}]}, 'emitted_at': stamp}),
         (rotation.LiveNotifier, {'type': 'SIGNAL', 'action': 'ROTATE', 'market': 'US', 'leg': 'US-A', 'previous_symbol': 'US.SPY', 'target_symbol': 'US.QQQ', 'selected_symbol': 'US.QQQ', 'evaluation_date': '2026-10-13', 'timezone': 'America/New_York', 'ranking': [{'symbol': 'US.QQQ', 'window': 3, 'score': .12}], 'emitted_at': stamp}),
         (premium.LiveNotifier, {'type': 'SIGNAL', 'action': 'BUY', 'symbol': 'SZ.159941', 'price': 1.2345, 'unit_nav': 1.25, 'nav_date': '2026-10-12', 'nav_age_days': 1, 't1_premium': -.0124, 'iopv_premium': .0234, 'buy_threshold': -.01, 'sell_threshold': .01, 'target_position': 1., 'emitted_at': stamp}),
     ]
@@ -152,9 +157,11 @@ def offline(output):
                                      'previous_symbol': previous, 'target_symbol': target,
                                      'emitted_at': f'2026-10-13T23:59:{seconds}-04:00'})
                     notifier.close(30)
-                notifier = m1.LiveEventNotifier(engine, notify_lifecycle=True)
-                notifier.notify({**events()[0][1], 'action': 'SELL', 'emitted_at': '2026-10-13T23:59:52-04:00'})
-                notifier.notify({'type': 'READY', 'symbol': 'SH.000906', 'position': 0,
+                notifier = m3_notifier(engine, notify_lifecycle=True)
+                notifier.notify({**events()[0][1], 'action': 'SELL', 'position_before': 1, 'position_after': .5,
+                                 'position_text': '1→½', 'reason': '动量转弱（M1）', 'strength': None,
+                                 'emitted_at': '2026-10-13T23:59:52-04:00'})
+                notifier.notify({'type': 'READY', 'symbol': 'SH.000902', 'tag': 'M3', 'position': 0,
                                  'emitted_at': '2026-10-13T23:59:51-04:00'})
                 notifier.close(30)
                 Provider.reject_google = True
@@ -169,7 +176,7 @@ def offline(output):
                 Provider.reject_feishu = False
             for provider, cell in [('google', '26-10!D5'), ('feishu', 'tab!D5:D5')]:
                 content = Provider.cells[(provider, cell)]
-                for label in ('M1', '轮动', 'ETF溢价'):
+                for label in ('M3', '轮动', 'ETF溢价'):
                     lines = [line for line in content.splitlines() if label in line and line.startswith('23:59:59 ')]
                     assert len(lines) == 1, (provider, label, lines)
                     assert lines[0].startswith('23:59:59 ')
@@ -178,7 +185,8 @@ def offline(output):
                 assert '轮动 US-B INITIAL CASH→US.QQQ' in content
                 assert '轮动 CN-A BUY CASH→SH.510300' in content
                 assert '轮动 CN-B SELL SZ.159941→CASH' in content
-                assert '23:59:52 M1 SH.000906 SELL' in content
+                assert '23:59:59 M3 SH.000902 进场 0→1 动量启动(M) 首选SH.510500' in content
+                assert '23:59:52 M3 SH.000902 离场 1→½ 动量转弱(M1)' in content
                 assert 'READY' not in content
                 assert ('23:59:56 ETF溢价' in content) == (provider == 'feishu')
                 assert ('23:59:58 ETF溢价' in content) == (provider == 'google')
