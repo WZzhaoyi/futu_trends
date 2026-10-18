@@ -46,6 +46,9 @@ COST_BPS = 5.0
 LAG_BARS = 1
 MARKET_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
+# 退出前等待通知排空的上限；单条通知串行投递 webhook/Telegram/邮件/Google/飞书，约 10 秒。
+NOTIFY_DRAIN_TIMEOUT = 60.0
+
 # 动量阈值取自 csi_flow_timing 按月发布的 threshold_YYYY-MM.json。加载时逐个校验发布口径等于
 # M_THRESHOLD_SOURCE，拒绝其他策略或口径的发布；校准口径变化时须同时升级本策略版本。
 M_THRESHOLD_SOURCE = "M1-LF-held-downside-exact-grid-strength-t1-defer-v2"
@@ -952,6 +955,8 @@ def run_live(args) -> int:
     def stamp(**event):
         return dict(strategy=STRATEGY, version=VERSION, symbol=SYMBOL, tag=tag,
                     emitted_at=datetime.now(MARKET_TZ).isoformat(timespec='seconds'), **event)
+    exit_code = 0
+    notifications_drained = True
     try:
         runtime = m1.LiveRuntimePaths.from_argument(args.runtime_dir)
         runtime.prepare()
@@ -960,15 +965,16 @@ def run_live(args) -> int:
             hashes = {p: m1.sha256_file(p) for p in scripts}
             month, generated = m1.ensure_live_threshold(threshold_args(args), runtime)
             emit(stamp(type='THRESHOLD_READY', month=month, generated=generated))
-            if stopped.is_set():
-                return 0
-            return _run_live(args, emit, runtime, hashes, stopped, weights, tag)
+            if not stopped.is_set():
+                exit_code = _run_live(args, emit, runtime, hashes, stopped, weights, tag)
     except Exception as exc:
         emit(stamp(type='ERROR', message=repr(exc)))
         raise
     finally:
         if notifier is not None:
-            notifier.close()
+            notifications_drained = notifier.close(timeout=NOTIFY_DRAIN_TIMEOUT)
+    # 通知未排空时以非 0 退出，交由 PM2 重跑
+    return exit_code if notifications_drained else 2
 
 
 def cli(argv=None) -> int:

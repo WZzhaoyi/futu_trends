@@ -53,6 +53,63 @@ class LiveRuntimeTest(unittest.TestCase):
         self.assertFalse(worker._thread.is_alive())
         self.assertEqual(processed, [1, 2])
 
+    def test_background_worker_close_reports_undrained_queue(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+
+        def handle(value: int) -> None:
+            started.set()
+            release.wait(timeout=5.0)
+
+        worker = live_runtime.BackgroundWorker[int](
+            handle,
+            name="test-background-worker-drain",
+            maxsize=10,
+        )
+        self.addCleanup(release.set)
+        self.addCleanup(lambda: worker.close(timeout=5.0))
+        self.assertTrue(worker.submit(1))
+        self.assertTrue(started.wait(timeout=1.0))
+        self.assertTrue(worker.submit(2))
+
+        # 超时即未排空，不能报告成功
+        self.assertFalse(worker.close(timeout=0.01))
+        self.assertTrue(worker._thread.is_alive())
+        self.assertFalse(worker.submit(3))
+
+        release.set()
+        self.assertTrue(worker.close(timeout=5.0))
+        self.assertFalse(worker._thread.is_alive())
+        self.assertEqual(worker.pending(), 0)
+
+    def test_event_notifier_close_reports_dropped_delivery(self) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        def format_event(_event):
+            entered.set()
+            release.wait(timeout=5.0)
+            return "subject", "message"
+
+        notifier = live_runtime.EventNotifier(
+            object(),
+            format_event,
+            name="test-event-notifier",
+        )
+        self.addCleanup(release.set)
+        self.addCleanup(notifier.close)
+        self.assertTrue(notifier.worker.submit({"type": "SIGNAL", "action": "BUY"}))
+        self.assertTrue(entered.wait(timeout=1.0))
+        self.assertTrue(notifier.worker.submit({"type": "SIGNAL", "action": "SELL"}))
+
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            self.assertFalse(notifier.close(timeout=0.01))
+        self.assertIn("通知未排空", stderr.getvalue())
+
+        release.set()
+        self.assertTrue(notifier.close(timeout=5.0))
+
     def test_background_worker_reports_error_and_continues(self) -> None:
         processed = []
         errors = []

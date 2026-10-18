@@ -22,6 +22,7 @@ import re
 import smtplib
 from email.mime.text import MIMEText
 from email.header import Header
+import threading
 import time
 import os
 import json
@@ -145,6 +146,8 @@ class NotificationEngine:
         self.google_sheet_id = config.get("CONFIG", "GOOGLE_SHEET_ID", fallback="")
         self.google_api_json = config.get("CONFIG", "GOOGLE_API_JSON", fallback="")
         self.google_sheet_cell_origin = config.get("CONFIG", "GOOGLE_SHEET_CELL_ORIGIN", fallback="B2")
+        self._google_service = None
+        self._google_service_lock = threading.Lock()
 
         # Feishu Sheet configuration
         self.feishu_app_id = config.get("CONFIG", "FEISHU_APP_ID", fallback="")
@@ -576,6 +579,36 @@ class NotificationEngine:
             log_delivery_exception('feishu_sheet', 'update', exc)
             return False
 
+    def google_sheets_service(self):
+        """返回按需创建并复用的 Sheets 客户端。"""
+        with self._google_service_lock:
+            if self._google_service is not None:
+                return self._google_service
+
+            creds = Credentials.from_service_account_file(
+                self.google_api_json,
+                scopes=['https://www.googleapis.com/auth/spreadsheets'],
+            )
+            if self.PROXIES.get('http'):
+                proxy_url = self.PROXIES['http'].split('://', 1)[1]
+                proxy_host, proxy_port = proxy_url.rsplit(':', 1)
+                http_client = httplib2.Http(
+                    proxy_info=httplib2.ProxyInfo(
+                        proxy_type=httplib2.socks.PROXY_TYPE_HTTP,
+                        proxy_host=proxy_host,
+                        proxy_port=int(proxy_port),
+                    ),
+                    timeout=30,
+                    disable_ssl_certificate_validation=False
+                )
+            else:
+                http_client = httplib2.Http(timeout=30)
+
+            self._google_service = build(
+                'sheets', 'v4', http=AuthorizedHttp(creds, http_client)
+            )
+            return self._google_service
+
     def send_google_sheet_message(self, message, *, sheet_date=None):
         """更新Google Sheet"""
         if not message or not message.strip():
@@ -586,28 +619,7 @@ class NotificationEngine:
 
         try:
             with sheet_write_lock("google", self.google_sheet_id):
-                # 获取Google Sheet服务
-                SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
-                creds = Credentials.from_service_account_file(self.google_api_json, scopes=SCOPES)
-
-                # 配置HTTP客户端
-                if self.PROXIES.get('http'):
-                    proxy_url = self.PROXIES['http'].split('://', 1)[1]
-                    proxy_host, proxy_port = proxy_url.rsplit(':', 1)
-                    http_client = httplib2.Http(
-                        proxy_info=httplib2.ProxyInfo(
-                            proxy_type=httplib2.socks.PROXY_TYPE_HTTP,
-                            proxy_host=proxy_host,
-                            proxy_port=int(proxy_port),
-                        ),
-                        timeout=30,
-                        disable_ssl_certificate_validation=False
-                    )
-                else:
-                    http_client = httplib2.Http(timeout=30)
-
-                http = AuthorizedHttp(creds, http_client)
-                service = build('sheets', 'v4', http=http)
+                service = self.google_sheets_service()
 
                 position = _calendar_sheet_position(self.google_sheet_cell_origin, sheet_date)
                 start_col_letter = position["start_col_letter"]

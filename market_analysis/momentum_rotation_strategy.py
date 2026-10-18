@@ -66,6 +66,9 @@ LIVE_STRATEGY = "momentum-rotation"
 LIVE_VERSION = "momentum-rotation-live-v8"
 LIVE_SCHEMA_VERSION = 3
 
+# 退出前等待通知排空的上限；单条通知串行投递 webhook/Telegram/邮件/Google/飞书，约 10 秒。
+NOTIFY_DRAIN_TIMEOUT = 60.0
+
 DEFAULT_MODE = "backtest"
 DEFAULT_START = "2016-06-12"
 DEFAULT_END = date.today().isoformat()
@@ -1245,9 +1248,14 @@ class LiveNotifier:
 
         send_sheet_signal(self.engine, "rotation", event)
 
-    def close(self, timeout: float = 10.0) -> None:
+    def close(self, timeout: float = 30.0) -> bool:
+        """Flush queued notifications; return False when the timeout cut them short."""
         if not self.worker.close(timeout):
-            eprint("通知队列未清空，退出时无法等待全部通知")
+            eprint(
+                f"通知未排空（剩余 {self.worker.pending()} 条），退出将丢弃未投递渠道"
+            )
+            return False
+        return True
 
 
 def build_live_notifier(config_path: Optional[str]) -> Optional[LiveNotifier]:
@@ -1426,6 +1434,7 @@ def run_live(args: argparse.Namespace) -> int:
     notifier = build_live_notifier(args.config)
     context = None
     subscribed_markets: set[str] = set()
+    notifications_drained = True
 
     try:
         for market in markets:
@@ -1595,8 +1604,9 @@ def run_live(args: argparse.Namespace) -> int:
     finally:
         close_futu_context(context)
         if notifier is not None:
-            notifier.close()
-    return 0
+            notifications_drained = notifier.close(timeout=NOTIFY_DRAIN_TIMEOUT)
+    # 通知未排空时以非 0 退出，交由 PM2 重跑
+    return 0 if notifications_drained else 2
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:

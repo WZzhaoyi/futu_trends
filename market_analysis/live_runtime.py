@@ -20,7 +20,10 @@ _STOP_TASK = object()
 
 
 class BackgroundWorker(Generic[_Task]):
-    """Run bounded best-effort tasks on one daemon thread."""
+    """Run bounded best-effort tasks on one daemon thread.
+
+    ``close(timeout)`` returns whether every accepted task finished before the deadline.
+    """
 
     def __init__(
         self,
@@ -32,6 +35,7 @@ class BackgroundWorker(Generic[_Task]):
     ) -> None:
         self._handler = handler
         self._on_error = on_error
+        self._closed = False
         self._queue: queue.Queue[_Task | object] = queue.Queue(maxsize=maxsize)
         self._thread = threading.Thread(
             target=self._run,
@@ -41,11 +45,20 @@ class BackgroundWorker(Generic[_Task]):
         self._thread.start()
 
     def submit(self, task: _Task) -> bool:
+        if self._closed:
+            return False
         try:
             self._queue.put_nowait(task)
         except queue.Full:
             return False
         return True
+
+    def pending(self) -> int:
+        """Best-effort count of accepted tasks not yet fully handled."""
+        unfinished = self._queue.qsize()
+        if self._closed and unfinished:
+            unfinished -= 1  # the stop marker itself is not a task
+        return unfinished
 
     def _run(self) -> None:
         while True:
@@ -60,13 +73,15 @@ class BackgroundWorker(Generic[_Task]):
             finally:
                 self._queue.task_done()
 
-    def close(self, timeout: float = 10.0) -> bool:
+    def close(self, timeout: float = 30.0) -> bool:
+        """Stop the worker and drain the queue; returns whether it drained in time."""
+        self._closed = True
         try:
             self._queue.put_nowait(_STOP_TASK)
         except queue.Full:
             return False
         self._thread.join(timeout=timeout)
-        return True
+        return not self._thread.is_alive()
 
 
 @contextmanager
@@ -227,6 +242,13 @@ class EventNotifier:
 
             send_sheet_signal(self.engine, self.sheet_strategy, event)
 
-    def close(self, timeout: float = 10.0) -> None:
+    def close(self, timeout: float = 30.0) -> bool:
+        """Flush queued notifications; return False when the timeout cut them short."""
         if not self.worker.close(timeout):
-            print("通知队列未清空，退出时无法等待全部通知", file=sys.stderr, flush=True)
+            print(
+                f"通知未排空（剩余 {self.worker.pending()} 条），退出将丢弃未投递渠道",
+                file=sys.stderr,
+                flush=True,
+            )
+            return False
+        return True

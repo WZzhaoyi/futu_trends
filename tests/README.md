@@ -75,3 +75,17 @@ conda run --no-capture-output -n futu_trends \
 `live.json` 包含线上单元格原文，应留在本地。验证不修改配置，不发送其他通知渠道。
 
 写入锁位于 `.cache/sheet-locks/`，按平台和工作簿区分，覆盖建月表、读取、去重、追加和回读。所有写入进程必须运行新版代码、使用同一仓库路径；独立主机、独立 checkout、旧版进程和人工编辑不参与此锁。更新后重启常驻策略进程，运行期间保留锁文件目录。通知按完整文本去重；投递失败只记录日志，没有持久化补发队列。
+
+## 改策略文件前，先停对应的 live 进程
+
+常驻 live 策略每秒校验脚本 sha256，内容一变就抛 `RuntimeError` 退出、由 PM2 拉起新代码：
+中断十余秒，并推出一条全渠道 ERROR 告警。受影响范围：
+
+| 改这个文件 | 先停 |
+|---|---|
+| `market_analysis/csi_flow_timing_m3.py`、`market_analysis/csi_flow_timing.py` | csi-flow |
+| `market_analysis/etf_premium_rate.py` | etf-premium |
+| `market_analysis/momentum_rotation_strategy.py` | 无守卫；避开 CN 15:30 / US 05:30 触发窗口 |
+
+`live_runtime.py`、`sheet_notifications.py`、`notification_engine/engine.py` 不被守卫拦截，
+但改动同样要重启进程才生效。启停命令见 `cli/SKILL.md` 的 `pm2` 小节。

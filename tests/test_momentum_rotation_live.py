@@ -379,8 +379,9 @@ class RecordingNotifier:
     def notify(self, event):
         self.events.append(event)
 
-    def close(self):
+    def close(self, timeout=None):
         self.closed = True
+        return True
 
 
 class CompletingBarQuoteContext:
