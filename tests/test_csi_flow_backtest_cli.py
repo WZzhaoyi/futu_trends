@@ -2,10 +2,11 @@
 
 Checks:
 * 指数净值与 ETF 账本由原始行情和导出成交重建（下一根开盘、成本、按目标仓位×净值调整份额、当日买入份额不卖出）；
+  ETF 成交价与净值是由原始价和复权事件直接算出的等比复权价（分红再投资），排名用面板中的前复权价；
 * 每次加仓都在 M 成立的入场时点；从空仓进场是空仓后第一根入场根，ETF 用 polyfit 独立重算排名；
   持仓中加减仓不换 ETF；成交前后仓位首尾相接；
 * 只给指数时信号相同；截短快照复现此前信号；
-* ETF 缺根、阈值缺失或训练窗泄露、指数缺根或非法时拒绝。
+* ETF 缺根、面板缺复权事件、阈值缺失或训练窗泄露、指数缺根或非法时拒绝。
 输入为 csi_flow_fixture 的合成快照，写在临时目录；不需要本地行情。设置 FUTU_TEST_ARTIFACT_DIR 时保留核对记录。
 """
 import hashlib
@@ -54,15 +55,28 @@ def verify(OUT: Path) -> dict:
     sig = pd.read_csv(out / 'signals.csv', index_col=0, parse_dates=True)
     index_frame = pd.DataFrame(json.loads(BARS.read_text())['bars']).set_index('time_key')
     panel = json.loads(PANEL.read_text())['panel']
-    frames = {s: pd.DataFrame(rows).set_index('time_key') for s, rows in panel.items()}
+    frames = {s: pd.DataFrame(rows).set_index('time_key') for s, rows in panel.items()}       # 前复权：排名
+    _, raw_panel = fixture.generate()
+
+    def ratio_adjusted(rows, events):
+        """等比复权 = 原始价 × Π(A + B / 除权前一日原始收盘)，乘积取在该根之后的除权事件。"""
+        raw = pd.DataFrame(rows).set_index('time_key')
+        day = raw.index.str[:10]
+        factor = np.ones(len(raw))
+        for ex_date, a, b in events:
+            prev_close = raw.close[day < ex_date].iloc[-1]
+            factor *= np.where(day < ex_date, a + b / prev_close, 1.0)
+        return raw[['open', 'close']].mul(factor, axis=0)
+    fill_frames = {s: ratio_adjusted(raw_panel[s], fixture.ADJUSTMENT_EVENTS[s]) for s in raw_panel}
+
     ix = curve.index
     sessions = pd.factorize(ix.normalize())[0]
     gate = sig.loc[ix]; gate = (gate.M.astype(bool) & ix.strftime('%H:%M').isin(['10:30', '14:00'])).to_numpy()
     fee = 1 - stats['cost_bps_per_side'] / 10000
     books = {'etf': [1., 0.], 'index': [1., 0.]}          # cash, units
     fresh = {'etf': 0., 'index': 0.}
-    held, position, flat_from, j, session = None, 0., 0, 0, -1
-    nav, index_nav, target = [], [], []
+    held, held_before, position, flat_from, j, session = None, None, 0., 0, 0, -1
+    nav, index_nav, target, crossed = [], [], [], set()
 
     def trade(book, price, after):
         cash, units = books[book]
@@ -86,7 +100,7 @@ def verify(OUT: Path) -> dict:
             src = ix.get_loc(pd.Timestamp(fill.signal))
             assert i >= src + stats['lag_bars'] and fill.execution_time == str(ts - pd.Timedelta(minutes=15))
             assert np.isclose(fill.position_before, position) and fill.position_after != position
-            assert np.isclose(fill.price, frames[fill.symbol].loc[str(ts), 'open'])
+            assert np.isclose(fill.price, fill_frames[fill.symbol].loc[str(ts), 'open'])
             assert np.isclose(fill.index_price, index_frame.loc[str(ts), 'open'])
             if fill.side == 'BUY':
                 assert fill.position_after > position and fill.signal[11:16] in ('10:30', '14:00') and sig.loc[fill.signal].M
@@ -109,11 +123,16 @@ def verify(OUT: Path) -> dict:
                 flat_from = i                                               # 清仓成交根收盘即可再判定入场
             j += 1
         cash, units = books['etf']
-        nav.append(cash + (units * frames[held].loc[str(ts), 'close'] if units > 1e-12 else 0.))
+        if units > 1e-12 and i and held == held_before:
+            crossed |= {(held, e) for e, _, _ in fixture.ADJUSTMENT_EVENTS[held] if str(ix[i - 1])[:10] < e <= str(ts)[:10]}
+        held_before = held if units > 1e-12 else None
+        nav.append(cash + (units * fill_frames[held].loc[str(ts), 'close'] if units > 1e-12 else 0.))
         cash, units = books['index']
         index_nav.append(cash + units * index_frame.loc[str(ts), 'close'])
         target.append(position)
     assert j == len(fills) and len(fills) > 0
+    # 合成持仓跨过现金分红与拆分的除权日
+    assert {('SH.510050', '2026-03-13'), ('SH.512100', '2026-02-24'), ('SH.512100', '2026-03-25')} <= crossed, crossed
     np.testing.assert_allclose(target, curve.target, atol=1e-12)
     np.testing.assert_allclose(nav, curve.etf_equity, rtol=1e-11)
     assert np.isclose(nav[-1] - 1, etf_stats['total_return'])
@@ -142,6 +161,9 @@ def verify(OUT: Path) -> dict:
     missing = json.loads(PANEL.read_text()); missing['panel']['SH.510300'].pop(-100)
     bad_panel = OUT / 'missing-etf.json'; bad_panel.write_text(json.dumps(missing))
     run('missing_etf', '--etf-panel', str(bad_panel), success=False, reason='不完整或非法交易时段')
+    unadjusted = json.loads(PANEL.read_text()); unadjusted.pop('adjustment_events')
+    bad_panel.write_text(json.dumps(unadjusted))
+    run('missing_events', '--etf-panel', str(bad_panel), success=False, reason='缺少前复权口径或复权事件')
     months = OUT / 'future-threshold'; months.mkdir(exist_ok=True)
     meta = json.loads((THRESHOLDS / 'threshold_2026-02.json').read_text())
     meta['window_end'] = meta['data_audit']['last_training_bar'] = '2026-02-27'   # 训练窗含生效月
@@ -163,7 +185,8 @@ def verify(OUT: Path) -> dict:
     checks = ['independent_index_NAV', 'independent_ETF_cash_units_NAV', 'target_chain',
               'index_only_same_signals', 'all_fill_prices', 'all_rankings', 'same_etf_within_episode',
               'signal_gates', 'next_bar_execution', 'T+1', 'first_entry_after_flat',
-              'prefix_causality', 'missing_ETF_rejection', 'future_training_rejection',
+              'prefix_causality', 'missing_ETF_rejection', 'missing_adjustment_events_rejection',
+              'ratio_adjusted_fills', 'future_training_rejection',
               'missing_threshold_rejection', 'invalid_index_rejection', 'missing_bar_rejection']
     evidence = dict(status='PASS', checks=checks, fills=len(fills), bars=len(curve),
                     inputs=manifest['inputs'], total_return=stats['total_return'], etf_total_return=etf_stats['total_return'])

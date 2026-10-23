@@ -284,7 +284,13 @@ def convert_to_Nhour(
 
 
 def fetch_futu_data(code: str, ktype: str, max_count: int, config: configparser.ConfigParser) -> pd.DataFrame | None:
-    """获取Futu最近数据"""
+    """获取Futu最近数据（前复权）。
+
+    复权口径：富途 A 股与场内 ETF 的前复权是加法复权，除权日之前的价格减去每份分红
+    （美股为乘法，与等比复权相同）。KD/MACD/RSI 等基于价差的指标不受影响；但高分红品种
+    （如 510880）越早的价格被压得越低，涨跌幅和回撤会被放大。计算收益或回撤的回测
+    请用 market_analysis/price_adjust.py 按复权事件转为等比复权。
+    """
     with _futu_lock:
         host = config.get("CONFIG", "FUTU_HOST")
         port = int(config.get("CONFIG", "FUTU_PORT"))

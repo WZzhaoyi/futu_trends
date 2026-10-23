@@ -2,8 +2,11 @@ import importlib.util
 import json
 import os
 import sys
+import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -85,7 +88,7 @@ class MomentumOpenFillTest(unittest.TestCase):
         config = momentum.BacktestConfig(
             symbols=["A", "B"], start="2026-01-01", end="2026-03-01", window=10,
         )
-        frame, trades = momentum._simulate_config(config, histories)
+        frame, trades = momentum._simulate_config(config, momentum.HistorySet(histories, histories))
         # 跳空建仓后目标股数会变化；同标的持仓仍只应成交一次。
         self.assertEqual(grid["rotDays"], 1)
         self.assertEqual(frame["trade_count"].sum(), 1)
@@ -163,6 +166,54 @@ class MomentumOpenFillTest(unittest.TestCase):
         value = cash + sum(v * histories[s].loc[last, "Close"] for s, v in positions.items())
         self.assertAlmostEqual(frame["balance"].iloc[-1], value, places=4)
 
+
+class AdjustedHistoryTest(unittest.TestCase):
+    """回测口径：动量打分用富途前复权（与 live 一致），成交与净值用等比复权（分红再投资）。"""
+
+    def test_prepare_history_converts_cached_forward_adjusted_bars(self):
+        idx = pd.bdate_range("2026-01-01", periods=60)
+        raw = 3.0 + 0.01 * np.arange(60)                      # 原始价
+        ex_date, dividend = str(idx[20].date()), 0.1
+        future = ("2026-04-15", 1.0, -0.1)                     # 拉取日之后的除权：缓存行情里尚未体现
+        qfq = np.where(idx < pd.Timestamp(ex_date), raw - dividend, raw)
+        fetched = datetime(2026, 3, 31, 16, 0, tzinfo=momentum.CN_TZ)
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(momentum, "HISTORY_CACHE_DIR", Path(tmp)), \
+                patch.object(momentum, "OUTPUT_ROOT", Path(tmp) / "out"):
+            for symbol, close, events in (("SH.510880", qfq, [[ex_date, 1.0, -dividend], list(future)]),
+                                          ("SH.518880", raw, []), ("US.SPY", raw * 100, [])):
+                frame = pd.DataFrame({"time_key": idx, "open": close, "high": close, "low": close,
+                                      "close": close, "volume": 1e6})
+                frame.to_csv(Path(tmp) / f"data_{symbol.replace('.', '_')}_K_DAY_{int(fetched.timestamp())}.csv",
+                             index=False)
+                (Path(tmp) / f"rehab_{symbol.replace('.', '_')}.json").write_text(json.dumps(
+                    {"symbol": symbol, "fetched_on": "2026-04-20", "events": events}))
+            config = momentum.BacktestConfig(symbols=["SH.510880", "SH.518880"],
+                                             start="2026-01-01", end="2026-03-31", window=10)
+            histories = momentum.prepare_history(config)
+        np.testing.assert_allclose(histories.rank["SH.510880"]["Close"], qfq)
+        # 等比复权 = 原始价 × (1 − 分红 / 除权前一日原始收盘)，只对除权日之前生效
+        expected = raw * np.where(idx < pd.Timestamp(ex_date), 1 - dividend / raw[19], 1.0)
+        np.testing.assert_allclose(histories.fill["SH.510880"]["Close"], expected)
+        np.testing.assert_allclose(histories.fill["SH.518880"]["Close"], raw)
+
+    def test_backtest_scores_on_rank_and_trades_on_fill(self):
+        idx = pd.bdate_range("2026-01-01", periods=40)
+        up, flat = 100 * 1.01 ** np.arange(40), np.full(40, 50.0)
+
+        def frames(a, b):
+            return {name: pd.DataFrame({"Open": c, "High": c, "Low": c, "Close": c, "Volume": 1e6}, index=idx)
+                    for name, c in (("A", a), ("B", b), ("US.SPY", np.full(40, 400.0)))}
+        rank = frames(up, flat)                                  # 前复权：A 动量第一
+        fill = frames(np.full(40, 80.0), 50 * 1.01 ** np.arange(40))   # 若按等比复权打分会选 B
+        config = momentum.BacktestConfig(symbols=["A", "B"], start="2026-01-01", end="2026-03-01", window=10)
+        frame, trades = momentum._simulate_config(config, momentum.HistorySet(rank, fill))
+        self.assertEqual([t["vt_symbol"] for t in trades], ["A"])
+        trade = trades[0]
+        self.assertEqual(trade["price"], fill["A"].loc[trade["datetime"], "Open"])
+        params = momentum.SimParams()
+        cash = params.capital - trade["volume"] * (trade["price"] * (1 + params.rate) + params.slippage)
+        self.assertAlmostEqual(frame["balance"].iloc[-1], cash + trade["volume"] * 80.0, places=4)
 
 
 if __name__ == "__main__":

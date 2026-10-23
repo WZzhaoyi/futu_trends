@@ -82,7 +82,7 @@ class ScheduleProvider:
 def run_engine(preset, start_index, stop_index, state_path, events, panel=None):
     """以 rows[start_index] 为正在形成的 K 线预热，再逐根推送到 rows[stop_index-1]；ETF 与指数同节奏推送。"""
     weights, tag = m3.resolve_weights(preset)
-    panel = PANEL if panel is None else panel
+    panel = PANEL.rank if panel is None else panel
     engine = m3.LiveEngine(ScheduleProvider(SCHEDULE), m3.LiveState(state_path, weights), events.append, tag=tag)
     first = ROWS[start_index]['time_key']
     by_key = {s: {r['time_key']: r for r in panel[s]} for s in m3.STRENGTH_SYMBOLS}
@@ -193,7 +193,7 @@ class FailClosedTest(unittest.TestCase):
         self.assertEqual([ls['position'] for ls in state.layers.values()], [0, 0, 1])
 
     def test_entry_without_strength_ranking_is_not_published(self):
-        empty = {s: PANEL[s][:m3.STRENGTH_N] for s in m3.STRENGTH_SYMBOLS}       # 只有最早的几根，排名必然失败
+        empty = {s: PANEL.rank[s][:m3.STRENGTH_N] for s in m3.STRENGTH_SYMBOLS}       # 只有最早的几根，排名必然失败
         first = KEYS.index(replay(m3.PRESETS['m3'])[1].signal.iloc[0])
         events = []
         engine = run_engine('m3', KEYS.index(START), first + 3, self.path, events, empty)

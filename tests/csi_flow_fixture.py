@@ -1,5 +1,7 @@
 """中证流通择时（M3）测试用合成输入：指数 15 分钟快照、四只 ETF 面板与逐月阈值发布，固定种子、无需本地行情。
 
+generate() 给出的 ETF 行情视为原始价；写出的面板与 fetch-bars 同口径：富途前复权加复权事件。
+
 日历：2026-01-05 起的工作日，2026-02-16 至 02-20 整周休市；预热约 28 个交易日后进入 START。
 阈值逐月不同，测试区间跨 2 月、3 月，覆盖换月与长假前后的 T+1。
 """
@@ -24,6 +26,14 @@ THRESHOLDS = {           # month: (entry_z30, entry_z60)
 PUBLISHED_AT = '2026-04-01T00:00:00+08:00'   # 与实际发布一致：各月阈值事后统一回溯发布
 ETF_LEVELS = {'SH.510300': 4.0, 'SH.510500': 6.0, 'SH.510050': 3.0, 'SH.512100': 1.5}
 ETF_BETAS = {'SH.510300': 0.9, 'SH.510500': 1.2, 'SH.510050': 0.7, 'SH.512100': 1.5}
+# 复权事件 (除权日, A, B)：富途前复权对除权日之前的价格做 p → p·A + B。现金分红 B=−每份分红，拆合 A=比例。
+# 510300 在预热期；其余在测试区间内且有持仓跨过除权日（含一次拆分）。
+ADJUSTMENT_EVENTS = {
+    'SH.510300': [('2026-01-20', 1.0, -0.06)],
+    'SH.510500': [],
+    'SH.510050': [('2026-03-13', 1.0, -0.05)],
+    'SH.512100': [('2026-02-24', 0.5, 0.0), ('2026-03-25', 1.0, -0.01)],
+}
 
 
 def sessions():
@@ -62,6 +72,17 @@ def generate(seed=SEED):
     return index_rows, panel
 
 
+def forward_adjust(rows, events):
+    """原始价 → 富途口径前复权（按除权日从早到晚逐个变换除权日之前的价格）。"""
+    out = [dict(r) for r in rows]
+    for ex_date, a, b in events:
+        for r in out:
+            if r['time_key'][:10] < ex_date:
+                for f in ('open', 'high', 'low', 'close'):
+                    r[f] = r[f] * a + b
+    return out
+
+
 def _threshold(month, entry, bars):
     available = date.fromisoformat(month + '-01')
     window_end = available - timedelta(days=1)
@@ -77,13 +98,16 @@ def _threshold(month, entry, bars):
 
 
 def write(directory: Path, seed=SEED) -> dict:
-    """写出 bars.json、panel.json 与 thresholds/，返回三者路径。"""
+    """写出 bars.json、panel.json（前复权 + 复权事件，同 fetch-bars）与 thresholds/，返回三者路径。"""
     directory.mkdir(parents=True, exist_ok=True)
     index_rows, panel = generate(seed)
     bars = directory / 'bars.json'
     bars.write_text(json.dumps(dict(symbol=m3.SYMBOL, bar_time_convention='end', autype='NONE', bars=index_rows)))
     etf = directory / 'panel.json'
-    etf.write_text(json.dumps(dict(symbols=list(m3.STRENGTH_SYMBOLS), panel=panel)))
+    etf.write_text(json.dumps(dict(
+        symbols=list(m3.STRENGTH_SYMBOLS), autype='QFQ',
+        panel={s: forward_adjust(rows, ADJUSTMENT_EVENTS[s]) for s, rows in panel.items()},
+        adjustment_events={s: [list(e) for e in ADJUSTMENT_EVENTS[s]] for s in m3.STRENGTH_SYMBOLS})))
     thresholds = directory / 'thresholds'; thresholds.mkdir(exist_ok=True)
     parsed = m1.load_bars(bars, symbol=m3.SYMBOL)
     for month, entry in THRESHOLDS.items():

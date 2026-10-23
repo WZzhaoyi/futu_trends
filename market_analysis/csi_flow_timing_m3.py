@@ -23,6 +23,7 @@ from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from fractions import Fraction
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -30,6 +31,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import csi_flow_timing as m1  # z30/z60 特征、月度阈值校准与维护
 from live_runtime import EventNotifier, graceful_stop_event, managed_futu_context, runtime_file_lock, write_json_atomic
+import price_adjust
 
 ROOT = Path(__file__).resolve().parents[1]
 STRATEGY = 'm3'
@@ -366,7 +368,7 @@ def metrics(eq, held, trades, index, cost_bps=COST_BPS, lag=LAG_BARS) -> dict:
 
 def replay(bars_path, start=BACKTEST_START, end=None, thresholds=None, weights=PRESETS['m3'],
            cost_bps=COST_BPS, lag=LAG_BARS, etf_panel=None):
-    """指数口径回放；给出 etf_panel 时另算 ETF 执行账本（目标仓位、成交时点与 T+1 完全相同）。"""
+    """指数口径回放；给出 etf_panel（load_etf_panel 的结果）时另算 ETF 执行账本（目标仓位、成交时点与 T+1 完全相同）。"""
     bars = load_data(bars_path)
     end = str(bars.index[-1]) if end is None else end
     if pd.Timestamp(end) > bars.index[-1]:
@@ -408,12 +410,13 @@ def _fill_fields(test, t) -> dict:
                 index_price=t['price'])
 
 
-def etf_ledger(test, sessions, trades, panel, cost_bps=COST_BPS):
+def etf_ledger(test, sessions, trades, panel: 'EtfPanel', cost_bps=COST_BPS):
     """ETF 执行账本：从空仓进场时用 etf_leader 选头名，此后加减仓都用这只，直到回到空仓。
 
+    排名用前复权（panel.rank，与在线一致）；成交价与净值用等比复权（panel.fill，分红再投资）。
     份额规则与指数账户相同；持有或成交的 ETF 缺根时报错，不补值、不回退指数。
     """
-    frames = {s: frame_from_rows(panel[s], require_turnover=False) for s in STRENGTH_SYMBOLS}
+    frames = {s: frame_from_rows(panel.fill[s], require_turnover=False) for s in STRENGTH_SYMBOLS}
 
     def bar_of(symbol, ts):
         if ts not in frames[symbol].index:
@@ -429,7 +432,7 @@ def etf_ledger(test, sessions, trades, panel, cost_bps=COST_BPS):
         if i in by_bar:
             t = by_bar[i]; observation_end = None
             if held is None:
-                rank = etf_leader(panel, test.index[t['signal']])
+                rank = etf_leader(panel.rank, test.index[t['signal']])
                 held, observation_end = rank['ranking'][0]['symbol'], rank['observation_end']
             price = float(bar_of(held, ts)['open'])
             want = t['after'] * (cash + units * price) / price
@@ -474,11 +477,23 @@ def etf_leader(panel: dict, signal_time) -> dict:
                                                    for i, s in enumerate(ranked)])
 
 
-def load_etf_panel(path) -> dict:
+class EtfPanel(NamedTuple):
+    rank: dict      # 富途前复权 15 分钟线：强度排名（与在线 get_cur_kline 同口径）
+    fill: dict      # 等比复权 15 分钟线：成交价与净值
+
+
+def load_etf_panel(path) -> EtfPanel:
+    """读取 fetch-bars 写出的 ETF 面板；须含拉取时记录的复权事件，用于把前复权转为等比复权。"""
     obj = json.loads(Path(path).read_text())
     if set(obj['symbols']) != set(STRENGTH_SYMBOLS):
         raise ValueError('需要固定四只ETF面板')
-    return {s: obj['panel'][s] for s in STRENGTH_SYMBOLS}
+    events = obj.get('adjustment_events')
+    if obj.get('autype') != 'QFQ' or not isinstance(events, dict) or set(events) != set(STRENGTH_SYMBOLS):
+        raise ValueError(f'{path}: ETF 面板缺少前复权口径或复权事件（adjustment_events），请用 fetch-bars 重新获取')
+    rank = {s: obj['panel'][s] for s in STRENGTH_SYMBOLS}
+    fill = {s: price_adjust.ratio_adjust_rows(rank[s], price_adjust.validate_events(s, events[s]), s)
+            for s in STRENGTH_SYMBOLS}
+    return EtfPanel(rank, fill)
 
 
 def input_manifest(bars_path, panel_path, thresholds):
@@ -502,7 +517,8 @@ def input_manifest(bars_path, panel_path, thresholds):
         numpy_version=np.__version__, pandas_version=pd.__version__,
         threshold_publication_is_retrospective=any(
             m['published_at'][:10] > m['available_from'] for m in metas),
-        calendar_verified=False, etf_adjustment='vendor forward-adjusted snapshot',
+        calendar_verified=False,
+        etf_adjustment='ranking: Futu forward-adjusted (additive); fills and NAV: ratio-adjusted from recorded rehab events',
         limitations=['Historical rolling reconstruction; not independent out-of-sample',
             'Calendar completeness and independent vendor data not verified',
             'Fractional shares; no capacity, limit-lock, suspension or actual fill model'])
@@ -511,7 +527,7 @@ def input_manifest(bars_path, panel_path, thresholds):
 # ============================ Futu 接入 ============================
 def fetch_bars(out_index: Path, out_panel: Path | None = None, start='2021-11-01',
                end=None, host='127.0.0.1', port=11111) -> dict:
-    """拉指数（不复权）与四只 ETF（前复权）的 15 分钟历史。"""
+    """拉指数（不复权）与四只 ETF（前复权）的 15 分钟历史；ETF 同时记录复权事件，回测据此换算等比复权。"""
     try:
         from futu import AuType, KLType, OpenQuoteContext, RET_OK
     except ImportError as exc:                                   # pragma: no cover
@@ -519,10 +535,11 @@ def fetch_bars(out_index: Path, out_panel: Path | None = None, start='2021-11-01
     end = end or datetime.now(MARKET_TZ).strftime('%Y-%m-%d')
     with managed_futu_context(OpenQuoteContext, host=host, port=port) as ctx:
         index_rows = m1.pull_history(ctx, SYMBOL, start, end, AuType.NONE, KLType, RET_OK)
-        panel = {}
+        panel, events = {}, {}
         if out_panel is not None:
             for s in STRENGTH_SYMBOLS:
                 panel[s] = m1.pull_history(ctx, s, start, end, AuType.QFQ, KLType, RET_OK)
+                events[s] = price_adjust.rehab_events(ctx, s, datetime.now(MARKET_TZ).date())
     out_index.parent.mkdir(parents=True, exist_ok=True)
     out_index.write_text(json.dumps(dict(
         schema_version=1, source='futu.request_history_kline', symbol=SYMBOL,
@@ -531,8 +548,9 @@ def fetch_bars(out_index: Path, out_panel: Path | None = None, start='2021-11-01
     print(f'指数快照：{len(index_rows)} 根 → {out_index}')
     if out_panel is not None:
         out_panel.write_text(json.dumps(dict(
-            source='futu.request_history_kline 15m forward-adjusted',
-            symbols=list(STRENGTH_SYMBOLS), panel=panel), ensure_ascii=False))
+            source='futu.request_history_kline 15m forward-adjusted', autype='QFQ',
+            fetched_at=datetime.now(MARKET_TZ).isoformat(), symbols=list(STRENGTH_SYMBOLS), panel=panel,
+            adjustment_events={s: [list(e) for e in events[s]] for s in STRENGTH_SYMBOLS}), ensure_ascii=False))
         print(f'ETF 面板：{ {k: len(v) for k, v in panel.items()} } → {out_panel}')
     return {'index': index_rows, 'panel': panel}
 

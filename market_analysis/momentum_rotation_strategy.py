@@ -27,7 +27,7 @@ from datetime import date, datetime, time as datetime_time
 from itertools import combinations
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, NamedTuple, Optional
 from zoneinfo import ZoneInfo
 
 from sheet_notifications import queued_sheet_event, send_sheet_signal
@@ -39,6 +39,7 @@ from live_runtime import (
     write_json_atomic,
 )
 from trading_calendar import is_trading_day, latest_closed_date, now_in
+import price_adjust
 
 import pandas as pd
 
@@ -217,11 +218,56 @@ def _futu_config(path: Optional[str], symbol: str) -> configparser.ConfigParser:
     raise FileNotFoundError(f"Cannot find config file from: {candidates}")
 
 
-def prepare_history(config: BacktestConfig) -> dict[str, pd.DataFrame]:
+class HistorySet(NamedTuple):
+    """回测行情：rank 为富途前复权（动量打分，与 live 的 get_cur_kline 同口径）；
+    fill 为等比复权（成交与净值，分红再投资）。"""
+    rank: dict[str, pd.DataFrame]
+    fill: dict[str, pd.DataFrame]
+
+
+CN_TZ = ZoneInfo("Asia/Shanghai")   # 缓存文件时间戳与复权拉取日按北京日期
+
+
+def _rehab_cache_path(symbol: str) -> Path:
+    return HISTORY_CACHE_DIR / f"rehab_{symbol.replace('.', '_')}.json"
+
+
+def load_adjustment_events(
+    symbol: str,
+    as_of: date,
+    config_path: Optional[str] = None,
+) -> list[price_adjust.Event]:
+    """返回除权日不晚于 as_of（行情拉取日）的复权事件。
+
+    缓存于 HISTORY_CACHE_DIR/rehab_*.json；缓存拉取日早于 as_of 时才经 Futu 重新获取。
+    """
+    path = _rehab_cache_path(symbol)
+    cached = json.loads(path.read_text()) if path.exists() else None
+    if cached is None or cached["fetched_on"] < as_of.isoformat():
+        from futu import OpenQuoteContext
+
+        config = _futu_config(config_path, symbol)
+        context = OpenQuoteContext(
+            host=config.get("CONFIG", "FUTU_HOST"), port=config.getint("CONFIG", "FUTU_PORT")
+        )
+        try:
+            today = datetime.now(CN_TZ).date()
+            events = price_adjust.rehab_events(context, symbol, today)
+        finally:
+            close_futu_context(context)
+        cached = {"symbol": symbol, "fetched_on": today.isoformat(), "events": [list(e) for e in events]}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(cached, ensure_ascii=False))
+    events = price_adjust.validate_events(symbol, cached["events"])
+    return [e for e in events if e[0] <= as_of.isoformat()]
+
+
+def prepare_history(config: BacktestConfig) -> HistorySet:
     """准备回测历史：优先使用共享缓存（可复现），缺失/覆盖不足时经 Futu 拉取。
 
     缓存优先语义保证回测结果可复现；仅当某标的缓存缺失或未覆盖
-    [config.start, config.end] 时才走 get_kline_data 拉取。
+    [config.start, config.end] 时才走 get_kline_data 拉取。前复权行情按拉取日之前的
+    复权事件换算出等比复权（fill）。
     """
     from data import get_kline_data
 
@@ -229,12 +275,14 @@ def prepare_history(config: BacktestConfig) -> dict[str, pd.DataFrame]:
     start, end = pd.Timestamp(config.start), pd.Timestamp(config.end)
     symbols = list(dict.fromkeys(config.symbols + [DEFAULT_BENCHMARK_SYMBOL]))
     histories: dict[str, pd.DataFrame] = {}
+    fetched_on: dict[str, date] = {}
     try:
         cached = load_cached_histories(symbols, start=config.start, end=config.end)
         for symbol in symbols:
             frame = cached[symbol]
             if len(frame) >= max(config.window + 10, 30):
                 histories[symbol] = frame
+                fetched_on[symbol] = _cache_fetch_date(_latest_cache_file(symbol))
     except (FileNotFoundError, ValueError):
         pass
     missing = [symbol for symbol in symbols if symbol not in histories]
@@ -252,7 +300,16 @@ def prepare_history(config: BacktestConfig) -> dict[str, pd.DataFrame]:
         if frame.empty:
             raise RuntimeError(f"No history data for {symbol} in {config.start} to {config.end}")
         histories[symbol] = frame
-    return histories
+        fetched_on[symbol] = datetime.now(CN_TZ).date()
+    fill = {
+        symbol: price_adjust.ratio_adjust_frame(
+            frame,
+            load_adjustment_events(symbol, fetched_on[symbol], config.config_path),
+            symbol,
+        )
+        for symbol, frame in histories.items()
+    }
+    return HistorySet(rank=histories, fill=fill)
 
 
 @dataclass(frozen=True)
@@ -349,22 +406,29 @@ def decide_rotation(
     )
 
 
+def _latest_cache_file(symbol: str, cache_dir: Optional[Path] = None) -> Path:
+    """最新的 Futu 日K缓存文件：data_{symbol.replace('.', '_')}_K_DAY_{拉取时间戳}.csv。"""
+    cache_dir = cache_dir or HISTORY_CACHE_DIR
+    files = sorted(cache_dir.glob(f"data_{symbol.replace('.', '_')}_K_DAY_*.csv"))
+    if not files:
+        raise FileNotFoundError(f"缓存缺失: {symbol} in {cache_dir}")
+    return files[-1]
+
+
+def _cache_fetch_date(path: Path) -> date:
+    return datetime.fromtimestamp(int(path.stem.rsplit("_", 1)[1]), CN_TZ).date()
+
+
 def load_cached_histories(
     symbols: list[str],
-    cache_dir: Path = HISTORY_CACHE_DIR,
+    cache_dir: Optional[Path] = None,
     start: Optional[str] = None,
     end: Optional[str] = None,
 ) -> dict[str, pd.DataFrame]:
-    """从 Futu K线文件缓存加载并规范化 OHLCV 历史。
-
-    缓存文件命名: data_{symbol.replace('.', '_')}_K_DAY_*.csv
-    """
+    """从 Futu K线文件缓存（前复权）加载并规范化 OHLCV 历史。"""
     frames: dict[str, pd.DataFrame] = {}
     for symbol in symbols:
-        files = sorted(cache_dir.glob(f"data_{symbol.replace('.', '_')}_K_DAY_*.csv"))
-        if not files:
-            raise FileNotFoundError(f"缓存缺失: {symbol} in {cache_dir}")
-        raw = pd.read_csv(files[-1], parse_dates=["time_key"], index_col="time_key")
+        raw = pd.read_csv(_latest_cache_file(symbol, cache_dir), parse_dates=["time_key"], index_col="time_key")
         frame = _normalize_ohlcv(raw)
         if start:
             frame = frame.loc[pd.Timestamp(start):]
@@ -469,6 +533,7 @@ def simulate(
     params: SimParams = SimParams(),
     benchmark_symbol: str = DEFAULT_BENCHMARK_SYMBOL,
     rebalance: bool = True,
+    score_histories: Optional[dict[str, pd.DataFrame]] = None,
 ) -> tuple[pd.DataFrame, list[dict], dict[str, Any]]:
     """向量化模拟：全仓持有当日分数第一的标的（现金符号登顶时持现金），
     支持冷静期 N / 分差阈值 ε 防抖（互斥，不可同时设定）。
@@ -482,6 +547,8 @@ def simulate(
 
     histories: {symbol: OHLCV DataFrame}，须含 benchmark_symbol（基准可为全文
     历史、无需参与对齐，_statistics 会自行 reindex 到策略日期）。
+    score_histories: 动量打分用的行情（与 histories 同日历）；缺省时用 histories 打分。
+    正式回测传前复权打分、等比复权成交（见 HistorySet）。
     返回 (daily_frame, trades, statistics)。
     """
     if params.gap_eps > 0 and params.cooldown > 0:
@@ -491,7 +558,13 @@ def simulate(
     k = len(symbols)
     close = np.column_stack([histories[s]["Close"].to_numpy(float) for s in symbols])
     open_ = np.column_stack([histories[s]["Open"].to_numpy(float) for s in symbols])
-    scores = vectorized_momentum_scores(close, params.window)
+    if score_histories is None:
+        score_close = close
+    else:
+        if any(not score_histories[s].index.equals(dates) for s in symbols):
+            raise ValueError("score_histories 与 histories 的交易日历不一致")
+        score_close = np.column_stack([score_histories[s]["Close"].to_numpy(float) for s in symbols])
+    scores = vectorized_momentum_scores(score_close, params.window)
     decision_start = max(params.window + params.warmup_extra, 10) - 1
 
     positions = np.zeros(k, dtype=np.int64)
@@ -847,7 +920,7 @@ def benchmark_compare(
 
 def _simulate_config(
     config: BacktestConfig,
-    histories: Optional[dict[str, pd.DataFrame]] = None,
+    histories: Optional[HistorySet] = None,
 ) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
     """以 BacktestConfig 驱动向量化 simulate（CLI 回测/优化内部助手）。
 
@@ -857,8 +930,9 @@ def _simulate_config(
     """
     loaded = histories or prepare_history(config)
     symbols = list(config.symbols)
-    aligned = align_histories({symbol: loaded[symbol] for symbol in symbols})
-    full = {**aligned, DEFAULT_BENCHMARK_SYMBOL: loaded[DEFAULT_BENCHMARK_SYMBOL]}
+    aligned = align_histories({symbol: loaded.fill[symbol] for symbol in symbols})
+    ranked = align_histories({symbol: loaded.rank[symbol] for symbol in symbols})
+    full = {**aligned, DEFAULT_BENCHMARK_SYMBOL: loaded.fill[DEFAULT_BENCHMARK_SYMBOL]}
     params = SimParams(
         window=config.window,
         cooldown=config.cooldown,
@@ -876,6 +950,7 @@ def _simulate_config(
         params,
         DEFAULT_BENCHMARK_SYMBOL,
         rebalance=False,
+        score_histories=ranked,
     )
     return frame, trades
 
@@ -987,7 +1062,7 @@ def _print_results(rows: list[dict[str, Any]], title: str, limit: int = 3) -> No
 def run_momentum_backtest(config: BacktestConfig) -> dict[str, Any]:
     histories = prepare_history(config)
     frame, trades = _simulate_config(config, histories)
-    frame, statistics = _statistics(frame, config, histories)
+    frame, statistics = _statistics(frame, config, histories.fill)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     daily_path = OUTPUT_ROOT / f"momentumrotationstrategy_daily_{stamp}.csv"
     trades_path = OUTPUT_ROOT / f"momentumrotationstrategy_trades_{stamp}.csv"
@@ -1000,7 +1075,7 @@ def run_momentum_backtest(config: BacktestConfig) -> dict[str, Any]:
 
 def run_momentum_optimization(
     config: BacktestConfig,
-    histories: Optional[dict[str, pd.DataFrame]] = None,
+    histories: Optional[HistorySet] = None,
 ) -> list[dict[str, Any]]:
     histories = histories or prepare_history(config)
     started = perf_counter()
@@ -1008,7 +1083,7 @@ def run_momentum_optimization(
     for window in OPTIMIZATION_WINDOWS:
         trial = replace(config, window=window)
         frame, _ = _simulate_config(trial, histories)
-        _, statistics = _statistics(frame, trial, histories)
+        _, statistics = _statistics(frame, trial, histories.fill)
         rows.append(_result_row(trial, statistics))
     rows.sort(key=lambda row: row["target"], reverse=True)
     path = OUTPUT_ROOT / f"momentumrotationstrategy_optimization_{datetime.now():%Y%m%d_%H%M%S_%f}.csv"
