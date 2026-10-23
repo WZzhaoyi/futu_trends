@@ -525,7 +525,8 @@ def simulate(
                     filled.append(order)
                     continue
                 positions[i] += sign * vol
-                cash -= sign * vol * op * params.size
+                fill_cost = vol * op * params.size * params.rate + vol * params.slippage * params.size
+                cash -= sign * vol * op * params.size + fill_cost
                 trade_count += 1
                 trading_pnl += sign * vol * (close[t, i] - op) * params.size
                 turnover += vol * op * params.size
@@ -576,9 +577,14 @@ def simulate(
             if decision.target_symbol is not None:
                 selected = symbols.index(decision.target_symbol)
                 value = cash + np.dot(positions, last_price) * params.size
-                new_targets[selected] = max(
-                    int(max(value, 0) / (last_price[selected] * params.size)), 0
-                )
+                # 预留卖出旧仓与买入新仓的佣金和滑点，成本从可投资金中扣除并随净值复利
+                sold = positions.copy()
+                sold[selected] = 0
+                value -= np.dot(sold, last_price * params.rate + params.slippage) * params.size
+                unit_cost = (
+                    last_price[selected] * (1 + params.rate) + params.slippage
+                ) * params.size
+                new_targets[selected] = max(int(max(value, 0) / unit_cost), 0)
             changed = not np.array_equal(new_targets, targets)
             if changed and not decision.blocked:
                 new_hold = (

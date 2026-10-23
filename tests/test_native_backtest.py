@@ -45,6 +45,32 @@ def _fake_histories(n_days: int = 40) -> dict[str, pd.DataFrame]:
     return frames
 
 
+def _cost_aware_volume(price: float, params=None) -> int:
+    """建仓份数：预留佣金与滑点后全仓买入。"""
+    params = params or momentum.SimParams()
+    return int(params.capital / (price * (1 + params.rate) + params.slippage))
+
+
+def _gapless_rotation_histories(n_days: int = 60) -> dict[str, pd.DataFrame]:
+    """A 先涨后跌、B 后段上涨，触发 A->B 轮动；open[t] = close[t-1]，无跳空。"""
+    idx = pd.bdate_range("2026-01-01", periods=n_days)
+    t = np.arange(n_days)
+    closes = {
+        "A": np.where(t < 25, 100 * 1.01 ** t, 100 * 1.01 ** 24 * 0.99 ** (t - 24)),
+        "B": np.where(t < 25, 50.0, 50 * 1.012 ** (t - 24)),
+        "US.SPY": np.full(n_days, 400.0),
+    }
+    frames = {}
+    for name, close in closes.items():
+        open_ = np.concatenate([[close[0]], close[:-1]])
+        frames[name] = pd.DataFrame(
+            {"Open": open_, "High": np.maximum(open_, close), "Low": np.minimum(open_, close),
+             "Close": close, "Volume": 1e6},
+            index=idx,
+        )
+    return frames
+
+
 class MomentumOpenFillTest(unittest.TestCase):
     def test_grid_and_formal_backtest_do_not_rebalance_unchanged_symbol(self):
         histories = _fake_histories()
@@ -94,7 +120,7 @@ class MomentumOpenFillTest(unittest.TestCase):
         self.assertEqual(pd.Timestamp(first["datetime"]), expected_date)
         self.assertEqual(first["price"], histories["A"].loc[expected_date, "Open"])
         self.assertNotEqual(first["price"], histories["A"].loc[expected_date, "Close"])
-        self.assertEqual(first["volume"], int(1_000_000 / histories["A"].iloc[14]["Close"]))
+        self.assertEqual(first["volume"], _cost_aware_volume(histories["A"].iloc[14]["Close"]))
 
     def test_market_open_suspension_carries_over(self):
         histories = _fake_histories()
@@ -116,7 +142,28 @@ class MomentumOpenFillTest(unittest.TestCase):
         self.assertEqual(pd.Timestamp(first["datetime"]), expected_date)
         self.assertEqual(first["price"], histories["A"].loc[expected_date, "Open"])
         # 未建仓时仍按停牌日收盘重新计算目标数量，恢复后执行该目标。
-        self.assertEqual(first["volume"], int(1_000_000 / histories["A"].iloc[15]["Close"]))
+        self.assertEqual(first["volume"], _cost_aware_volume(histories["A"].iloc[15]["Close"]))
+
+    def test_costs_are_paid_from_cash_and_compound(self):
+        """佣金与滑点必须从现金扣除：每次成交后现金不为负，净值与重放一致。"""
+        histories = _gapless_rotation_histories()
+        params = momentum.SimParams(window=5, rate=0.01, slippage=0.05)
+        frame, trades, _ = momentum.simulate(
+            histories, ["A", "B"], params, benchmark_symbol="US.SPY", rebalance=False,
+        )
+        self.assertGreaterEqual(len({t["vt_symbol"] for t in trades}), 2)
+        cash, positions = float(params.capital), {"A": 0, "B": 0}
+        for trade in trades:
+            sign = 1 if trade["direction"] == "long" else -1
+            gross = trade["volume"] * trade["price"]
+            cash -= sign * gross + gross * params.rate + trade["volume"] * params.slippage
+            positions[trade["vt_symbol"]] += sign * trade["volume"]
+            self.assertGreaterEqual(cash, -1e-6, f"成本未预留，现金透支: {trade}")
+        last = frame.index[-1]
+        value = cash + sum(v * histories[s].loc[last, "Close"] for s, v in positions.items())
+        self.assertAlmostEqual(frame["balance"].iloc[-1], value, places=4)
+
+
 
 if __name__ == "__main__":
     unittest.main()
